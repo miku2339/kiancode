@@ -1,0 +1,45 @@
+{
+  "mode": "production",
+  "host": "127.0.0.1",
+  "port": 8768,
+  "stateDirectory": "/var/lib/kiancode",
+  "checkpointDirectory": "/var/lib/kiancode/checkpoints",
+  "database": {
+    "urlEnv": "DATABASE_URL",
+    "sqlitePath": "/var/lib/kiancode/kiancode.sqlite"
+  },
+  "auth": {
+    "mode": "account",
+    "issuer": "https://account.example.com",
+    "accountApiUrl": "http://127.0.0.1:8787",
+    "audience": "kiancode",
+    "ownerSubjectEnv": "KIANCODE_OWNER_SUBJECT",
+    "serviceTokenEnv": "KIANCODE_ACCOUNT_SERVICE_TOKEN"
+  },
+  "attachments": {
+    "url": "https://storage.example.com",
+    "tokenEnv": "KIANCODE_BLOB_TOKEN",
+    "localDirectory": "/var/lib/kiancode/attachments"
+  },
+  "providers": [],
+  "models": [],
+  "providerManagement": {
+    "credentialKeyEnv": "KIANCODE_PROVIDER_KEY"
+  },
+  "automations": {
+    "eventTriggersEnabled": false,
+    "schedulerEnabled": false
+  },
+  "serverWorkspaceRoots": [],
+  "terminal": {
+    "environmentEnv": {},
+    "isolation": "bubblewrap",
+    "binary": "/usr/local/libexec/kiancode-bwrap",
+    "readOnlyPaths": ["/usr"],
+    "allowNetwork": false
+  },
+  "plugins": {
+    "allowedOrigins": [],
+    "commandProfiles": []
+  }
+}

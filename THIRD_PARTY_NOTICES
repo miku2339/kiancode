@@ -1,0 +1,13 @@
+OpenAI Codex apply-patch
+Copyright 2025 OpenAI
+
+Source: https://github.com/openai/codex/tree/8f195c93d7e7acfef95acf273f0e49cce917e291/codex-rs/apply-patch
+
+KianCode's src/tools/workspace-patch.ts is a modified derivative. The original
+Rust update-hunk parser and matching behavior were translated to TypeScript,
+limited to one existing file per call, bounded by input and target size, and
+combined with required SHA-256 conflict checks, unique-match rejection,
+workspace path enforcement, atomic replacement, and restore checkpoints.
+
+Licensed under the Apache License, Version 2.0. A copy of the license and the
+upstream NOTICE are provided in third_party/openai-codex/.

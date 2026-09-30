@@ -1,0 +1,59 @@
+{
+  "name": "@kiancode/core",
+  "version": "0.1.0",
+  "description": "A self-hosted agent runtime with persistent tasks and scoped device execution.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "kiancode": "dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./runtime": "./dist/runtime/index.js",
+    "./connectors": "./dist/connectors/index.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES",
+    "README.md",
+    "deploy",
+    "third_party"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli.ts serve",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@fastify/multipart": "10.1.2",
+    "@fastify/static": "10.1.5",
+    "@fastify/websocket": "11.3.1",
+    "@modelcontextprotocol/sdk": "1.30.1",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "cron-parser": "5.10.1",
+    "fastify": "5.12.5",
+    "jose": "6.2.12",
+    "mammoth": "1.13.0",
+    "pdfjs-dist": "6.3.289",
+    "pg": "8.23.0",
+    "playwright": "1.63.0",
+    "ws": "8.22.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.0",
+    "@types/pg": "8.23.1",
+    "@types/ws": "8.18.1",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}

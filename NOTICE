@@ -1,0 +1,9 @@
+KianCode includes a modified TypeScript implementation of update-hunk parsing
+and matching derived from OpenAI Codex apply-patch at commit
+8f195c93d7e7acfef95acf273f0e49cce917e291.
+
+OpenAI Codex
+Copyright 2025 OpenAI
+
+The derived code is licensed under the Apache License, Version 2.0. The
+original license and notice are reproduced under third_party/openai-codex/.
