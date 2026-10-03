@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { bootstrap } from './bootstrap.js';
-import { loadConfig } from './config.js';
+import { loadConfig, requireOwnerSubject } from './config.js';
 import { createBlobServer } from './http/blob-server.js';
 import { runConnector } from './connector-cli.js';
 
@@ -93,7 +93,7 @@ async function main() {
     }
     return;
   }
-  if (command === 'config-check') { await loadConfig(configFile); process.stdout.write('Configuration valid\n'); return; }
+  if (command === 'config-check') { requireOwnerSubject(await loadConfig(configFile)); process.stdout.write('Configuration valid\n'); return; }
   if (command === 'version') { const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }; process.stdout.write(`${pkg.version}\n`); return; }
   process.stdout.write('kiancode init | serve [--config path] | chat --message text [--conversation id] [--model-policy cloud|local|auto] | config-check | version\n');
 }

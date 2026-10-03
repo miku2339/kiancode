@@ -1,9 +1,35 @@
-import { requireScope, secureAccountApiOrigin } from './auth.js';
+import { requireOwner, requireScope, scopeAllows, secureAccountApiOrigin } from './auth.js';
 import { DomainError, type Principal } from './contracts.js';
 import type { Store } from './storage/store.js';
 
 export interface AccessGrant { scopes: string[]; enabled: boolean }
-const defaultScopes = ['chat:read', 'chat:write', 'task:read', 'task:write', 'memory:read', 'memory:write', 'agent:read', 'agent:write', 'schedule:read', 'schedule:write', 'model:read', 'notification:read', 'notification:write', 'artifact:read', 'artifact:write', 'workspace:read', 'device:read', 'approval:write'];
+
+export type LevelCeilings = Partial<Record<2 | 3 | 4 | 5, readonly string[]>>;
+
+const conversationalCeiling: readonly string[] = [
+  'chat:read', 'chat:write', 'task:read', 'task:write', 'memory:read', 'memory:write',
+  'agent:read', 'agent:write', 'artifact:read', 'artifact:write', 'notification:read', 'notification:write',
+  'model:read', 'workspace:read', 'device:read', 'approval:write', 'schedule:read',
+];
+const builtInCeilings: Record<2 | 3 | 4 | 5, readonly string[]> = {
+  2: conversationalCeiling,
+  3: conversationalCeiling,
+  4: conversationalCeiling,
+  5: [],
+};
+const principalIdPattern = /^[0-9a-f]{64}$/;
+const scopePattern = /^[\x21-\x7e]{1,100}$/;
+
+function accessRequired(): DomainError {
+  return new DomainError('access_required', 'Kian access has not been granted', 403);
+}
+
+function intersectScopes(record: readonly string[], ceiling: readonly string[]): string[] {
+  return [...new Set([
+    ...record.filter((scope) => scopeAllows(ceiling, scope)),
+    ...ceiling.filter((scope) => scopeAllows(record, scope)),
+  ])];
+}
 
 export class AccessService {
   private accountApiOrigin?: string;
@@ -15,19 +41,40 @@ export class AccessService {
     private identityMode: 'account' | 'oidc' | 'development' = 'account',
     accountApiUrl?: string,
     private fetcher: typeof fetch = fetch,
+    private levelCeilings: LevelCeilings = {},
   ) {
     if (ownerSubject && (ownerSubject.length > 255 || ownerSubject.includes('\0'))) throw new Error('The Kian owner subject is invalid');
     this.accountApiOrigin = accountApiUrl ? secureAccountApiOrigin(accountApiUrl) : undefined;
   }
   async authorize(identity: Principal): Promise<Principal> {
-    if (!identity.issuer || !identity.subject) return identity;
+    if (this.identityMode === 'development') return identity;
+    if (!identity.issuer || !identity.subject) throw accessRequired();
+    if (identity.subject === this.ownerSubject) return { ...identity, level: 1, scopes: ['*'] };
     const grant = await this.store.get<AccessGrant>('access', identity.id, identity.id);
     if (grant && !grant.data.enabled) throw new DomainError('access_revoked', 'Kian access has been revoked', 403);
-    const scopes = identity.subject === this.ownerSubject ? ['*'] : grant?.data.scopes ?? defaultScopes;
-    return { ...identity, ...(identity.subject === this.ownerSubject ? { level: 1 as const } : {}), scopes };
+    if (!grant) throw accessRequired();
+    const level = Math.max(identity.level, 2) as 2 | 3 | 4 | 5;
+    const scopes = intersectScopes(grant.data.scopes, this.levelCeilings[level] ?? builtInCeilings[level]);
+    if (scopes.length === 0) throw accessRequired();
+    return { ...identity, level, scopes };
   }
   async grant(actor: Principal, principalId: string, grant: AccessGrant) {
+    requireOwner(actor);
     requireScope(actor, 'admin:grant');
+    if (principalId === actor.id) {
+      throw new DomainError('invalid_principal', 'The owner does not need an access record', 400);
+    }
+    if (this.identityMode !== 'development' && !principalIdPattern.test(principalId)) {
+      throw new DomainError('invalid_principal', 'Access records are addressed by a 64-character lowercase hex principal id', 400);
+    }
+    for (const scope of grant.scopes) {
+      if (!scopePattern.test(scope)) {
+        throw new DomainError('invalid_scope', 'Scopes must be 1 to 100 printable ASCII characters without spaces', 400);
+      }
+      if (scopeAllows([scope], 'admin:grant')) {
+        throw new DomainError('invalid_scope', `Scope cannot be granted: ${scope}`, 400);
+      }
+    }
     const existing = await this.store.get<AccessGrant>('access', principalId, principalId);
     return existing ? this.store.put('access', principalId, principalId, grant, existing.revision) : this.store.create('access', principalId, grant, principalId);
   }
@@ -36,7 +83,7 @@ export class AccessService {
     if ((this.identityMode === 'oidc' && expiresAt === undefined)
       || (expiresAt !== undefined && (!Number.isFinite(expiresAt) || expiresAt <= Date.now()))) return false;
     const fresh = await this.authorize(principal);
-    if (!principal.scopes.every((scope) => fresh.scopes.includes('*') || fresh.scopes.includes(scope))) return false;
+    if (!principal.scopes.every((scope) => scopeAllows(fresh.scopes, scope))) return false;
     if (!principal.issuer || this.identityMode === 'development') return true;
     if (this.identityMode === 'oidc') return true;
     if (!this.serviceToken || !principal.subject || !principal.applicationId || principal.credentialVersion === undefined) return false;

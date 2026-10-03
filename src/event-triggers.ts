@@ -172,6 +172,7 @@ const safeId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const safeFilterPath = /^[A-Za-z][A-Za-z0-9_]{0,63}(?:\.[A-Za-z][A-Za-z0-9_]{0,63}){0,4}$/;
 const safePermission = /^[a-z][a-z0-9._-]*:[a-z0-9._-]+$/;
 const permanentAuthorizationCodes = new Set([
+  'access_required',
   'access_revoked',
   'actor_expired',
   'authorization_revalidation_required',

@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { AccessService } from '../src/access.js';
-import { accountAuth, oidcAuth } from '../src/auth.js';
+import { accountAuth, oidcAuth, requireScope, scopeAllows } from '../src/auth.js';
+import { DomainError, type Principal } from '../src/contracts.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
 
 test('account authentication rejects expired/revoked credentials and never merges by email', async () => {
@@ -163,4 +164,24 @@ test('OIDC authentication verifies issuer, audience, JWKS signature, expiry, and
     .setExpirationTime('1m')
     .sign(privateKey);
   await assert.rejects(authenticate(`Bearer ${wrongAudience}`), /invalid|expired/i);
+});
+
+test('scopeAllows matches the established global, prefixed, exact, and namespace grant forms', () => {
+  for (const grant of ['*', 'kiancode:*', 'chat:read', 'kiancode:chat:read', 'chat:*']) {
+    assert.equal(scopeAllows([grant], 'chat:read'), true, grant);
+  }
+  for (const grant of ['chat', 'chat:write', 'chatty:*', 'Chat:read', 'chat:read ', 'kiancode:chat:*']) {
+    assert.equal(scopeAllows([grant], 'chat:read'), false, grant);
+  }
+});
+
+test('requireScope shares scopeAllows semantics and preserves its error contract', () => {
+  const principal: Principal = { id: 'member', level: 2, scopes: ['kiancode:chat:read', 'task:*'] };
+  assert.equal(requireScope(principal, 'chat:read'), undefined);
+  assert.equal(requireScope(principal, 'task:write'), undefined);
+  assert.throws(
+    () => requireScope(principal, 'memory:read'),
+    (error: unknown) => error instanceof DomainError && error.code === 'forbidden'
+      && error.statusCode === 403 && error.message === 'Missing capability: memory:read',
+  );
 });

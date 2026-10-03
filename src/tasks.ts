@@ -954,6 +954,7 @@ export class TaskService {
 }
 
 const authorizationPauseCodes = new Set([
+  'access_required',
   'access_revoked',
   'authorization_revalidation_required',
   'grant_expired',

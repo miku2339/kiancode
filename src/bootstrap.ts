@@ -4,7 +4,7 @@ import path from 'node:path';
 import { accountAuth, developmentAuth, oidcAuth } from './auth.js';
 import { AccessService } from './access.js';
 import { ArtifactService } from './artifacts.js';
-import { type Configuration } from './config.js';
+import { requireOwnerSubject, type Configuration } from './config.js';
 import { DomainError, type ToolDefinition } from './contracts.js';
 import { DeviceService } from './devices.js';
 import { createServer } from './http/server.js';
@@ -30,6 +30,7 @@ export interface BootstrapOptions {
 }
 
 export async function bootstrap(config: Configuration, options: BootstrapOptions = {}) {
+  const ownerSubject = requireOwnerSubject(config);
   const databaseUrl = process.env[config.database.urlEnv];
   if (config.mode === 'production' && !databaseUrl) throw new Error('Production requires PostgreSQL on the primary storage host');
   let store: Store;
@@ -67,10 +68,12 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
     }
     const access = new AccessService(
       store,
-      process.env[config.auth.ownerSubjectEnv],
+      ownerSubject,
       process.env[config.auth.serviceTokenEnv],
       authMode,
       config.auth.accountApiUrl,
+      fetch,
+      config.auth.levelCeilings,
     );
     const authenticate = async (authorization: string | undefined) => access.authorize(await identityAuth(authorization));
     const notifications = new NotificationService(store, {

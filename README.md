@@ -81,6 +81,8 @@ Production startup fails closed when that PostgreSQL environment variable is abs
 
 For Account authentication, keep `auth.issuer` set to the public canonical issuer. Set `auth.accountApiUrl` only when Core should call Account through a separate HTTPS or loopback HTTP service endpoint; identity IDs continue to derive from `auth.issuer`.
 
+Production authentication requires the raw owner subject in the variable named by `auth.ownerSubjectEnv` (`KIANCODE_OWNER_SUBJECT` by default). Account subjects use `acct_` followed by 32 lowercase hex characters; OIDC uses the provider's original subject. The configured owner has full access, including when an old self-grant was disabled. Other accounts require an enabled access grant addressed by their 64-character principal ID. Grants are limited by `auth.levelCeilings` for levels 2–5; level 5 denies access by default. Access grants cannot delegate owner administration.
+
 Terminal commands receive only PATH, locale and terminal metadata by default. Map any required command credential explicitly through `terminal.environmentEnv`. Production server workspaces require `terminal.isolation: "bubblewrap"`; the sandbox mounts only the assigned workspace as writable, keeps networking isolated unless both the operator and workspace grant it, and fails closed when user namespaces are unavailable. Add a Node installation outside `/usr` through the restricted `terminal.readOnlyPaths` allowlist. Device connectors execute under the device account and their declared workspace grants.
 
 On Ubuntu hosts that restrict unprivileged user namespaces, install the dedicated executable and its AppArmor profile as root after creating the `kiancode` service account:

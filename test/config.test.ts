@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
-import { configSchema } from '../src/config.js';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+import { ZodError } from 'zod';
+import { bootstrap } from '../src/bootstrap.js';
+import { configSchema, requireOwnerSubject } from '../src/config.js';
+import { PostgresStore } from '../src/storage/postgres.js';
 
 test('runtime state paths default to writable deployment locations', () => {
   const development = configSchema.parse({});
@@ -126,4 +135,147 @@ test('plugin subprocesses require fixed operator command profiles', () => {
       ],
     },
   }), /must be unique/);
+});
+
+test('auth.levelCeilings defaults to no overrides and accepts non-owner levels', () => {
+  assert.deepEqual(configSchema.parse({}).auth.levelCeilings, {});
+  const config = configSchema.parse({
+    auth: { levelCeilings: { 2: [], 3: ['chat:*'], 5: ['chat:read', 'mcp:MyPlugin'] } },
+  });
+  assert.deepEqual(config.auth.levelCeilings, {
+    2: [], 3: ['chat:*'], 5: ['chat:read', 'mcp:MyPlugin'],
+  });
+});
+
+test('auth.levelCeilings rejects unknown levels and malformed scope lists', () => {
+  const rejected: unknown[] = [
+    { 1: ['chat:read'] },
+    { 6: ['chat:read'] },
+    { 2: 'chat:read' },
+    { 2: [''] },
+    { 2: ['chat: read'] },
+    { 2: [7] },
+    { 2: ['x'.repeat(101)] },
+    { 2: Array.from({ length: 101 }, (_, index) => `chat:${index}`) },
+  ];
+  for (const levelCeilings of rejected) {
+    assert.throws(
+      () => configSchema.parse({ auth: { levelCeilings } }),
+      (error: unknown) => error instanceof ZodError,
+    );
+  }
+});
+
+function productionConfig(
+  mode: 'account' | 'oidc',
+  ownerSubjectEnv = 'CUSTOM_OWNER_SUBJECT',
+  databaseUrlEnv = 'DATABASE_URL',
+) {
+  return configSchema.parse({
+    mode: 'production',
+    database: { urlEnv: databaseUrlEnv },
+    auth: {
+      mode,
+      issuer: 'https://account.example.com',
+      ...(mode === 'oidc' ? { jwksUri: 'https://account.example.com/jwks' } : {}),
+      ownerSubjectEnv,
+    },
+    attachments: { url: 'https://storage.example.com' },
+  });
+}
+
+test('production Account requires the raw acct subject rather than a principal hash', () => {
+  const config = productionConfig('account');
+  const valid = `acct_${'0'.repeat(32)}`;
+  assert.equal(requireOwnerSubject(config, { CUSTOM_OWNER_SUBJECT: valid }), valid);
+  for (const value of [
+    undefined, '', '   ', ` ${valid}`, `${valid}\n`, '0'.repeat(64), `acct_${'A'.repeat(32)}`, 'opaque-user',
+  ]) {
+    assert.throws(
+      () => requireOwnerSubject(config, value === undefined ? {} : { CUSTOM_OWNER_SUBJECT: value }),
+      (error: unknown) => error instanceof Error
+        && error.message === 'Production requires the owner subject in CUSTOM_OWNER_SUBJECT',
+    );
+  }
+});
+
+test('production OIDC preserves a valid raw sub and rejects empty, padded, or controlled values', () => {
+  const config = productionConfig('oidc');
+  for (const value of ['opaque-user-42', 'tenant user']) {
+    assert.equal(requireOwnerSubject(config, { CUSTOM_OWNER_SUBJECT: value }), value);
+  }
+  for (const value of ['', ' ', ' padded', 'padded ', 'opaque\0user', 'opaque\nuser', 'x'.repeat(256)]) {
+    assert.throws(() => requireOwnerSubject(config, { CUSTOM_OWNER_SUBJECT: value }), /CUSTOM_OWNER_SUBJECT$/);
+  }
+});
+
+test('owner subject remains optional and verbatim outside production', () => {
+  const config = configSchema.parse({ auth: { mode: 'account', issuer: 'https://account.example.com' } });
+  assert.equal(requireOwnerSubject(config, {}), undefined);
+  assert.equal(requireOwnerSubject(config, { KIANCODE_OWNER_SUBJECT: ' raw value ' }), ' raw value ');
+});
+
+test('bootstrap validates the production owner before touching PostgreSQL', async (context) => {
+  const ownerEnv = 'KIANCODE_CONFIG_TEST_OWNER_SUBJECT';
+  const databaseEnv = 'KIANCODE_CONFIG_TEST_DATABASE_URL';
+  const previousOwner = process.env[ownerEnv];
+  const previousDatabase = process.env[databaseEnv];
+  const connect = context.mock.method(PostgresStore, 'connect', async () => {
+    throw new Error('database connection attempted');
+  });
+  try {
+    delete process.env[ownerEnv];
+    process.env[databaseEnv] = 'postgres://unused';
+    await assert.rejects(
+      bootstrap(productionConfig('account', ownerEnv, databaseEnv)),
+      { message: `Production requires the owner subject in ${ownerEnv}` },
+    );
+    assert.equal(connect.mock.callCount(), 0);
+
+    process.env[ownerEnv] = `acct_${'0'.repeat(32)}`;
+    await assert.rejects(bootstrap(productionConfig('account', ownerEnv, databaseEnv)), {
+      message: 'database connection attempted',
+    });
+    assert.equal(connect.mock.callCount(), 1);
+  } finally {
+    if (previousOwner === undefined) delete process.env[ownerEnv];
+    else process.env[ownerEnv] = previousOwner;
+    if (previousDatabase === undefined) delete process.env[databaseEnv];
+    else process.env[databaseEnv] = previousDatabase;
+  }
+});
+
+test('config-check enforces the same production owner validation', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'kiancode-config-check-'));
+  const ownerEnv = 'KIANCODE_CONFIG_CHECK_OWNER_SUBJECT';
+  const file = path.join(directory, 'production.json');
+  const repositoryRoot = fileURLToPath(new URL('..', import.meta.url));
+  const run = promisify(execFile);
+  const env = { ...process.env };
+  delete env[ownerEnv];
+  try {
+    await writeFile(file, JSON.stringify({
+      mode: 'production',
+      auth: { mode: 'account', issuer: 'https://account.example.com', ownerSubjectEnv: ownerEnv },
+      attachments: { url: 'https://storage.example.com' },
+    }));
+    await assert.rejects(
+      run(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'config-check', '--config', file], {
+        cwd: repositoryRoot,
+        env,
+      }),
+      (error: unknown) => {
+        const failure = error as { code?: unknown; stdout?: string; stderr?: string };
+        return failure.code === 1 && failure.stdout === ''
+          && (failure.stderr ?? '').trim() === `Production requires the owner subject in ${ownerEnv}`;
+      },
+    );
+    const passed = await run(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'config-check', '--config', file], {
+      cwd: repositoryRoot,
+      env: { ...env, [ownerEnv]: `acct_${'0'.repeat(32)}` },
+    });
+    assert.equal(passed.stdout, 'Configuration valid\n');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

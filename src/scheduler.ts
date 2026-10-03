@@ -83,6 +83,7 @@ interface ScheduleTombstone {
 }
 
 const permanentAuthorizationCodes = new Set([
+  'access_required',
   'access_revoked',
   'actor_expired',
   'authorization_revalidation_required',

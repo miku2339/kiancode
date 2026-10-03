@@ -215,8 +215,14 @@ async function requireActiveToken(
   }
 }
 
+export function scopeAllows(grants: readonly string[], scope: string): boolean {
+  const namespace = scope.split(':')[0];
+  return grants.some((grant) => grant === '*' || grant === 'kiancode:*' || grant === scope
+    || grant === `kiancode:${scope}` || grant === `${namespace}:*`);
+}
+
 export function requireScope(principal: Principal, scope: string): void {
-  if (principal.scopes.some((grant) => grant === '*' || grant === 'kiancode:*' || grant === scope || grant === `kiancode:${scope}` || grant === `${scope.split(':')[0]}:*`)) return;
+  if (scopeAllows(principal.scopes, scope)) return;
   throw new DomainError('forbidden', `Missing capability: ${scope}`, 403);
 }
 

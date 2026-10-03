@@ -5,6 +5,7 @@ import { z } from 'zod';
 const modelSchema = z.object({ id: z.string().min(1), providerId: z.string().min(1), model: z.string().optional(), locality: z.enum(['cloud', 'local']), deviceId: z.string().optional(), capabilities: z.array(z.string()).min(1), enabled: z.boolean().default(true), priority: z.number().default(0) }).strict();
 const providerSchema = z.object({ id: z.string().min(1), type: z.enum(['openai-compatible', 'ollama', 'device']), locality: z.enum(['cloud', 'local']), baseUrl: z.url().optional(), apiKeyEnv: z.string().regex(/^[A-Z][A-Z0-9_]*$/).optional() }).strict();
 const defaultTerminalReadOnlyPaths = ['/usr'];
+const levelCeilingSchema = z.array(z.string().regex(/^[\x21-\x7e]{1,100}$/)).max(100);
 const pluginCommandProfileSchema = z.object({
   id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/),
   command: z.string().startsWith('/'),
@@ -37,6 +38,12 @@ export const configSchema = z.object({
     ownerSubjectEnv: z.string().default('KIANCODE_OWNER_SUBJECT'),
     serviceTokenEnv: z.string().default('KIANCODE_ACCOUNT_SERVICE_TOKEN'),
     developmentTokenEnv: z.string().default('KIANCODE_DEV_TOKEN'),
+    levelCeilings: z.object({
+      2: levelCeilingSchema.optional(),
+      3: levelCeilingSchema.optional(),
+      4: levelCeilingSchema.optional(),
+      5: levelCeilingSchema.optional(),
+    }).strict().default({}),
   }).strict().default({
     audience: 'kiancode',
     introspectionClientIdEnv: 'KIANCODE_OIDC_CLIENT_ID',
@@ -44,6 +51,7 @@ export const configSchema = z.object({
     ownerSubjectEnv: 'KIANCODE_OWNER_SUBJECT',
     serviceTokenEnv: 'KIANCODE_ACCOUNT_SERVICE_TOKEN',
     developmentTokenEnv: 'KIANCODE_DEV_TOKEN',
+    levelCeilings: {},
   }),
   providers: z.array(providerSchema).default([]), models: z.array(modelSchema).default([]),
   providerManagement: z.object({
@@ -161,3 +169,18 @@ export const configSchema = z.object({
 });
 export type Configuration = z.infer<typeof configSchema>;
 export async function loadConfig(file: string): Promise<Configuration> { return configSchema.parse(JSON.parse(await readFile(file, 'utf8'))); }
+
+export function requireOwnerSubject(
+  config: Configuration,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const value = env[config.auth.ownerSubjectEnv];
+  const authMode = config.auth.mode ?? (config.auth.issuer ? 'account' : 'development');
+  if (config.mode !== 'production' || authMode === 'development') return value;
+  const valid = authMode === 'account'
+    ? typeof value === 'string' && /^acct_[0-9a-f]{32}$/.test(value)
+    : typeof value === 'string' && value.length > 0 && value.length <= 255
+      && value === value.trim() && !/[\x00-\x1f\x7f]/.test(value);
+  if (!valid) throw new Error(`Production requires the owner subject in ${config.auth.ownerSubjectEnv}`);
+  return value;
+}
