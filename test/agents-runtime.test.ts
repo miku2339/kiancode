@@ -5,7 +5,7 @@ import { createTaskRunner, reconcileAgentTasks } from '../src/runtime-adapter.js
 import { AgentRuntime, type ModelProvider } from '../src/runtime/index.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
 import { TaskService } from '../src/tasks.js';
-import type { Conversation, Task } from '../src/domain.js';
+import type { Conversation, Task, TaskEvent } from '../src/domain.js';
 import { DomainError } from '../src/contracts.js';
 
 const principal = { id: 'owner', level: 1 as const, scopes: ['*'], expiresAt: new Date(Date.now() + 3_600_000).toISOString() };
@@ -191,8 +191,96 @@ test('a failed child blocks aggregation and reports the actual failed child', as
     const parent = (await store.get<Task>('task', root.id, principal.id))!;
     assert.equal(parent.data.state, 'failed');
     assert.match(parent.data.error!, /worker: failed/);
+    assert.match(parent.data.error!, /Provider unavailable/);
     assert.equal((await coordinator.results(principal.id, plan.id)).plan.data.aggregationClaimed, false);
   } finally { await tasks.close(); await store.close(); }
+});
+
+test('parent failure keeps bounded child budget details without splitting code points', async () => {
+  const store = new SqliteStore();
+  const coordinator = new AgentCoordinator(store);
+  const detail = `Task token budget exhausted: limit 100, used 99. ${'😀'.repeat(400)}`;
+  const tasks = new TaskService(store, async () => { throw new Error(detail); });
+  try {
+    const conversation = await store.create<Conversation>('conversation', principal.id, {
+      title: 'Budget failure', scope: 'private', modelPolicy: 'local', strategy: 'single', mode: 'ask', archived: false,
+    });
+    const root = await tasks.enqueue(principal, conversation.id, 'Delegate within budget');
+    await coordinator.prepare(principal.id, root.id, {
+      key: 'budget-child',
+      strategy: 'single',
+      budget: { maxCalls: 2, maxTokens: 100 },
+      children: [{ key: 'worker', prompt: 'Inspect' }],
+    });
+    await tasks.drain();
+    await reconcileAgentTasks(store, coordinator);
+
+    const error = (await store.get<Task>('task', root.id, principal.id))!.data.error!;
+    assert.match(error, /worker: failed/);
+    assert.match(error, /Task token budget exhausted: limit 100, used 99/);
+    const childDetail = error.slice(error.indexOf('(') + 1, error.lastIndexOf(')'));
+    assert.equal(Array.from(childDetail).length, 300);
+    assert.equal(childDetail.endsWith('\ud83d'), false);
+  } finally { await tasks.close(); await store.close(); }
+});
+
+test('ordinary legacy recovery retains an unreported reservation without calling the provider', async () => {
+  let providerCalls = 0;
+  const provider: ModelProvider = {
+    id: 'model', locality: 'local',
+    async chat() {
+      providerCalls += 1;
+      return { message: { role: 'assistant', content: 'must not run' }, usage: { inputTokens: 1, outputTokens: 1 } };
+    },
+  };
+  const runtime = new AgentRuntime({
+    providers: [provider],
+    models: [{ id: 'model', providerId: provider.id, locality: 'local', capabilities: [] }],
+  });
+  for (const initialState of ['queued', 'waiting_for_device'] as const) {
+    const store = new SqliteStore();
+    const setup = new TaskService(store, async () => ({ text: 'unused' }));
+    let tasks: TaskService | undefined;
+    try {
+      const conversation = await store.create<Conversation>('conversation', principal.id, {
+        title: 'Legacy recovery', scope: 'private', modelPolicy: 'local', strategy: 'single', mode: 'ask', archived: false,
+      });
+      let task = await setup.enqueue(principal, conversation.id, 'continue safely');
+      for (const [index, payload] of [
+        { type: 'model_call', taskId: task.id, modelId: 'model', call: 1, reservedTokens: 100_000 },
+        { type: 'usage', taskId: task.id, usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
+      ].entries()) {
+        await store.create<TaskEvent>('event', principal.id, {
+          taskId: task.id,
+          sequence: index + 2,
+          type: payload.type,
+          payload,
+          at: new Date().toISOString(),
+        }, `${task.id}:legacy-budget:${index + 1}`);
+      }
+      task = await store.put('task', task.id, task.ownerId, {
+        ...task.data,
+        state: initialState,
+        usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      }, task.revision);
+      await setup.close();
+
+      tasks = new TaskService(store, createTaskRunner(store, runtime, [], undefined, undefined, undefined, {
+        task: { maxCalls: 20, maxTokens: 100_000 },
+      }));
+      await tasks.drain();
+      const failed = (await store.get<Task>('task', task.id, principal.id))!;
+      assert.equal(providerCalls, 0);
+      assert.equal(failed.data.state, 'failed');
+      assert.match(failed.data.error!, /Task token budget exhausted: limit 100000, used 100000/);
+      const events = (await store.scan<TaskEvent>('event', principal.id)).filter((event) => event.data.taskId === task.id);
+      assert.equal(events.filter((event) => event.data.type === 'model_call').length, 1);
+    } finally {
+      await setup.close();
+      await tasks?.close();
+      await store.close();
+    }
+  }
 });
 
 test('an unknown child outcome propagates to the parent without blind retry', async () => {

@@ -56,6 +56,35 @@ test('DeviceModelProvider dispatches model generation without workspace access',
   assert.equal(received?.input.modelId, 'qwen-local');
 });
 
+test('DeviceModelProvider keeps a valid answer when usage is missing or partial', async () => {
+  for (const usage of [
+    undefined,
+    { inputTokens: 3 },
+    { outputTokens: 3 },
+    { inputTokens: 0, outputTokens: 0 },
+    { inputTokens: -1, outputTokens: 2 },
+    { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 2 },
+  ]) {
+    const provider = new DeviceModelProvider({
+      id: 'device-models',
+      dispatcher: {
+        async executeModel() {
+          return { content: JSON.stringify({ message: { role: 'assistant', content: 'device answer' }, usage }) };
+        },
+      },
+    });
+    const response = await provider.chat({
+      model: { id: 'local', providerId: provider.id, locality: 'local', deviceId: 'device', capabilities: [] },
+      messages: [{ role: 'user', content: 'answer' }],
+      tools: [],
+      signal: new AbortController().signal,
+      context: { principal, taskId: 'partial-usage' },
+    });
+    assert.equal(response.message.content, 'device answer');
+    assert.equal(response.usage, undefined);
+  }
+});
+
 test('local model tool only uses allowlisted models and loopback providers', async () => {
   const fetchImpl: typeof fetch = async () => new Response([
     'data: {"choices":[{"delta":{"content":"local"}}]}\n\n',

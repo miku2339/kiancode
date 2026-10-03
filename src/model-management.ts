@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { requireOwner, requireScope } from './auth.js';
 import { DomainError, type Principal, type ToolDefinition } from './contracts.js';
 import type { Store } from './storage/store.js';
-import { AgentRuntime, type ChatRequest, type ChatResponse, type ModelConfig, type ModelProvider } from './runtime/index.js';
+import { AgentRuntime, estimateTokens, type ChatRequest, type ChatResponse, type ModelConfig, type ModelProvider } from './runtime/index.js';
 
 const identifier = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/);
 export const providerSettingsSchema = z.object({
@@ -268,7 +268,9 @@ export class ModelManagement {
   private async meteredChat(ownerId: string, provider: ModelProvider, request: ChatRequest, limit?: number): Promise<ChatResponse> {
     const day = new Date(this.now()).toISOString().slice(0, 10);
     const modelId = request.model.id;
-    const reserved = Buffer.byteLength(JSON.stringify(request.messages), 'utf8') + Buffer.byteLength(JSON.stringify(request.tools.map((tool) => tool.inputSchema))) + (request.maxOutputTokens ?? 4096);
+    const reserved = estimateTokens(JSON.stringify(request.messages))
+      + estimateTokens(JSON.stringify(request.tools.map((tool) => tool.inputSchema)))
+      + (request.maxOutputTokens ?? 4096);
     await this.changeUsage(ownerId, modelId, day, (row) => {
       if (limit && row.reservedTokens + row.confirmedInputTokens + row.confirmedOutputTokens + reserved > limit) throw new DomainError('model_quota_exceeded', 'Daily model token allowance is exhausted', 429);
       return { ...row, reservedTokens: row.reservedTokens + reserved, calls: row.calls + 1 };
@@ -279,10 +281,16 @@ export class ModelManagement {
       await this.changeUsage(ownerId, modelId, day, (row) => ({ ...row, failedCalls: row.failedCalls + 1 })).catch(() => undefined);
       throw error;
     }
-    const { inputTokens, outputTokens } = response.usage;
-    const reported = [inputTokens, outputTokens].every((count) => Number.isSafeInteger(count) && count >= 0) && inputTokens + outputTokens > 0;
+    const inputTokens = response.usage?.inputTokens;
+    const outputTokens = response.usage?.outputTokens;
+    const totalTokens = typeof inputTokens === 'number' && typeof outputTokens === 'number'
+      ? inputTokens + outputTokens
+      : Number.NaN;
+    const reported = Number.isSafeInteger(inputTokens) && inputTokens! >= 0
+      && Number.isSafeInteger(outputTokens) && outputTokens! >= 0
+      && Number.isSafeInteger(totalTokens) && totalTokens > 0;
     await this.changeUsage(ownerId, modelId, day, (row) => reported
-      ? { ...row, reservedTokens: Math.max(0, row.reservedTokens - reserved), confirmedInputTokens: row.confirmedInputTokens + inputTokens, confirmedOutputTokens: row.confirmedOutputTokens + outputTokens }
+      ? { ...row, reservedTokens: Math.max(0, row.reservedTokens - reserved), confirmedInputTokens: row.confirmedInputTokens + inputTokens!, confirmedOutputTokens: row.confirmedOutputTokens + outputTokens! }
       : { ...row, unreportedCalls: (row.unreportedCalls ?? 0) + 1 });
     return response;
   }

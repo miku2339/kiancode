@@ -41,5 +41,11 @@
   "plugins": {
     "allowedOrigins": [],
     "commandProfiles": []
+  },
+  "runtime": {
+    "budgets": {
+      "task": { "maxCalls": 20, "maxTokens": 100000 },
+      "delegation": { "maxCalls": 24, "maxTokens": 128000 }
+    }
   }
 }

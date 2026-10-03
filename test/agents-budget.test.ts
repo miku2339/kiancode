@@ -132,3 +132,111 @@ test('one-call shared budget admits only one parallel model dispatch', async () 
     await store.close();
   }
 });
+
+test('an unreported call keeps its full shared reservation while the next actual usage settles once', async () => {
+  const store = new SqliteStore();
+  const ledger = new BudgetLedger(store);
+  try {
+    await ledger.create('owner', 'unreported-budget', 'root', { maxCalls: 3, maxTokens: 100 });
+    await ledger.reserveModelCall('owner', 'unreported-budget', 'task', 1, 20);
+    const unreported = await ledger.chargeModelUsage('owner', 'unreported-budget', 'task', {
+      calls: 1, totalTokens: 0, accountedTokens: 20,
+    });
+    assert.deepEqual(unreported.used, { calls: 0, tokens: 0 });
+    assert.deepEqual(unreported.reserved, { calls: 1, tokens: 20 });
+
+    await ledger.reserveModelCall('owner', 'unreported-budget', 'task', 2, 20);
+    const reported = await ledger.chargeModelUsage('owner', 'unreported-budget', 'task', {
+      calls: 2, totalTokens: 7, accountedTokens: 27,
+    });
+    assert.deepEqual(reported.used, { calls: 1, tokens: 7 });
+    assert.deepEqual(reported.reserved, { calls: 1, tokens: 20 });
+    assert.deepEqual(reported.remaining, { calls: 1, tokens: 73 });
+    assert.deepEqual(
+      (await ledger.chargeModelUsage('owner', 'unreported-budget', 'task', {
+        calls: 2, totalTokens: 7, accountedTokens: 27,
+      })).used,
+      { calls: 1, tokens: 7 },
+    );
+  } finally { await store.close(); }
+});
+
+test('reconciliation restores a missing reservation and later replaces it with actual usage', async () => {
+  const store = new SqliteStore();
+  const ledger = new BudgetLedger(store);
+  try {
+    await ledger.create('owner', 'recovery-budget', 'root', { maxCalls: 2, maxTokens: 100 });
+    const reserved = await ledger.reconcileModelUsage('owner', 'recovery-budget', 'task', {
+      calls: 1, totalTokens: 0, accountedTokens: 30,
+    });
+    assert.deepEqual(reserved.used, { calls: 0, tokens: 0 });
+    assert.deepEqual(reserved.reserved, { calls: 1, tokens: 30 });
+    assert.deepEqual(
+      (await ledger.reconcileModelUsage('owner', 'recovery-budget', 'task', {
+        calls: 1, totalTokens: 0, accountedTokens: 30,
+      })).reserved,
+      { calls: 1, tokens: 30 },
+    );
+
+    const settled = await ledger.reconcileModelUsage('owner', 'recovery-budget', 'task', {
+      calls: 1, totalTokens: 11,
+    });
+    assert.deepEqual(settled.used, { calls: 1, tokens: 11 });
+    assert.deepEqual(settled.reserved, { calls: 0, tokens: 0 });
+    assert.deepEqual(
+      (await ledger.reconcileModelUsage('owner', 'recovery-budget', 'task', {
+        calls: 1, totalTokens: 11,
+      })).used,
+      { calls: 1, tokens: 11 },
+    );
+  } finally { await store.close(); }
+});
+
+test('reconciliation rejects accounting that does not match retained reservations', async () => {
+  const store = new SqliteStore();
+  const ledger = new BudgetLedger(store);
+  try {
+    await ledger.create('owner', 'accounting-budget', 'root', { maxCalls: 2, maxTokens: 100 });
+    await ledger.reserveModelCall('owner', 'accounting-budget', 'task', 1, 20);
+    await assert.rejects(
+      ledger.reconcileModelUsage('owner', 'accounting-budget', 'task', {
+        calls: 1, totalTokens: 0, accountedTokens: 19,
+      }),
+      (error: unknown) => error instanceof Error && 'code' in error && error.code === 'invalid_usage_sequence',
+    );
+    await ledger.reconcileModelUsage('owner', 'accounting-budget', 'task', {
+      calls: 1, totalTokens: 0, accountedTokens: 20,
+    });
+    await assert.rejects(
+      ledger.reconcileModelUsage('owner', 'accounting-budget', 'task', {
+        calls: 1, totalTokens: 7, accountedTokens: 8,
+      }),
+      (error: unknown) => error instanceof Error && 'code' in error && error.code === 'invalid_usage_sequence',
+    );
+    assert.deepEqual((await ledger.get('owner', 'accounting-budget')).used, { calls: 0, tokens: 0 });
+  } finally { await store.close(); }
+});
+
+test('actual usage above one reservation is accepted unless the shared cumulative budget is exceeded', async () => {
+  const store = new SqliteStore();
+  const ledger = new BudgetLedger(store);
+  try {
+    await ledger.create('owner', 'elastic-budget', 'root', { maxCalls: 3, maxTokens: 100 });
+    await ledger.reserveModelCall('owner', 'elastic-budget', 'other', 1, 20);
+    await ledger.reserveModelCall('owner', 'elastic-budget', 'task', 1, 10);
+    const accepted = await ledger.chargeModelUsage('owner', 'elastic-budget', 'task', {
+      calls: 1, totalTokens: 50,
+    });
+    assert.deepEqual(accepted.used, { calls: 1, tokens: 50 });
+    assert.deepEqual(accepted.reserved, { calls: 1, tokens: 20 });
+
+    await ledger.reserveModelCall('owner', 'elastic-budget', 'task', 2, 10);
+    await assert.rejects(
+      ledger.chargeModelUsage('owner', 'elastic-budget', 'task', { calls: 2, totalTokens: 90 }),
+      (error: unknown) => error instanceof Error && 'code' in error && error.code === 'budget_violation',
+    );
+    const violated = await ledger.get('owner', 'elastic-budget');
+    assert.deepEqual(violated.used, { calls: 2, tokens: 90 });
+    assert.deepEqual(violated.reserved, { calls: 1, tokens: 20 });
+  } finally { await store.close(); }
+});

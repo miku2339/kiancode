@@ -66,6 +66,35 @@ function reserved(record: BudgetLedgerRecord, except?: string): BudgetUnits {
   }, zero());
 }
 
+function taskReservedTokens(record: BudgetLedgerRecord, taskId: string, except?: string): number {
+  const prefix = `${taskId}:model:`;
+  return Object.entries(record.reservations).reduce((tokens, [id, reservation]) => (
+    id !== except && id.startsWith(prefix) && reservation.state === 'reserved'
+      ? tokens + reservation.requested.tokens
+      : tokens
+  ), 0);
+}
+
+function delegationExceeded(
+  record: BudgetLedgerRecord,
+  held: BudgetUnits,
+  requested: BudgetUnits,
+  code: 'budget_exceeded' | 'budget_violation',
+): DomainError {
+  if (record.used.calls + held.calls + requested.calls > record.limits.maxCalls) {
+    return new DomainError(
+      code,
+      `Delegation model call budget exhausted: limit ${record.limits.maxCalls}, used ${record.used.calls}, reserved ${held.calls}, requested ${requested.calls}.`,
+      409,
+    );
+  }
+  return new DomainError(
+    code,
+    `Delegation token budget exhausted: limit ${record.limits.maxTokens}, used ${record.used.tokens}, reserved ${held.tokens}, requested ${requested.tokens}.`,
+    409,
+  );
+}
+
 export class BudgetLedger {
   public constructor(private readonly store: Store) {}
 
@@ -119,7 +148,7 @@ export class BudgetLedger {
       const held = reserved(record);
       if (record.used.calls + held.calls + requested.calls > record.limits.maxCalls
         || record.used.tokens + held.tokens + requested.tokens > record.limits.maxTokens) {
-        throw new DomainError('budget_exceeded', 'Shared orchestration budget is exhausted', 409);
+        throw delegationExceeded(record, held, requested, 'budget_exceeded');
       }
       return {
         ...record,
@@ -203,9 +232,15 @@ export class BudgetLedger {
     ownerId: string,
     id: string,
     taskId: string,
-    usage: { calls: number; totalTokens: number },
+    usage: { calls: number; totalTokens: number; accountedTokens?: number },
   ): Promise<BudgetSnapshot> {
     validateUnits({ calls: usage.calls, tokens: usage.totalTokens });
+    if (usage.accountedTokens !== undefined) {
+      validateUnits({ calls: 0, tokens: usage.accountedTokens });
+      if (usage.accountedTokens < usage.totalTokens) {
+        throw new DomainError('invalid_usage', 'Accounted tokens cannot be below reported tokens');
+      }
+    }
     if (usage.calls < 1) throw new DomainError('invalid_usage', 'Runtime usage must include a model call');
     for (let attempt = 0; attempt < 16; attempt += 1) {
       const row = await this.store.get<BudgetLedgerRecord>('agent_budget', id, ownerId);
@@ -213,12 +248,20 @@ export class BudgetLedger {
       const record = row.data;
       const cursors = record.runtimeUsage ?? {};
       const previousUsage = cursors[taskId] ?? zero();
-      if (sameUnits(previousUsage, { calls: usage.calls, tokens: usage.totalTokens })) {
-        const settled = record.reservations[`${taskId}:model:${usage.calls}`];
-        if (settled?.violation) throw new DomainError('budget_violation', 'Provider usage exceeded its reserved shared budget', 409);
+      if (usage.calls < previousUsage.calls && usage.totalTokens <= previousUsage.tokens) {
+        const historical = record.reservations[`${taskId}:model:${usage.calls}`];
+        if (historical?.violation) throw delegationExceeded(record, reserved(record), zero(), 'budget_violation');
         return this.snapshot(row);
       }
-      if (usage.calls !== previousUsage.calls + 1 || usage.totalTokens < previousUsage.tokens) {
+      if (usage.calls === previousUsage.calls && usage.totalTokens === previousUsage.tokens) {
+        const settled = record.reservations[`${taskId}:model:${usage.calls}`];
+        if (settled?.violation) throw delegationExceeded(record, reserved(record), zero(), 'budget_violation');
+        return this.snapshot(row);
+      }
+      const currentCall = usage.calls === previousUsage.calls;
+      if ((!currentCall && usage.calls !== previousUsage.calls + 1)
+        || usage.totalTokens < previousUsage.tokens
+        || (currentCall && usage.totalTokens === previousUsage.tokens)) {
         throw new DomainError('invalid_usage_sequence', 'Runtime usage events must be charged in order', 409);
       }
       const reservationId = `${taskId}:model:${usage.calls}`;
@@ -228,9 +271,25 @@ export class BudgetLedger {
         throw new DomainError('idempotency_conflict', 'Model call reservation was already settled with different usage', 409);
       }
       const charged = { calls: 1, tokens: usage.totalTokens - previousUsage.tokens };
+      if (charged.tokens === 0) {
+        const next: BudgetLedgerRecord = {
+          ...record,
+          runtimeUsage: {
+            ...cursors,
+            [taskId]: { calls: usage.calls, tokens: usage.totalTokens },
+          },
+        };
+        try {
+          const saved = await this.store.put('agent_budget', id, ownerId, next, row.revision);
+          if (reservation.violation) throw delegationExceeded(next, reserved(next), zero(), 'budget_violation');
+          return this.snapshot(saved);
+        } catch (error) {
+          if (error instanceof DomainError && error.code === 'conflict') continue;
+          throw error;
+        }
+      }
       const held = reserved(record, reservationId);
       const violation = charged.calls > reservation.requested.calls
-        || charged.tokens > reservation.requested.tokens
         || record.used.calls + held.calls + charged.calls > record.limits.maxCalls
         || record.used.tokens + held.tokens + charged.tokens > record.limits.maxTokens;
       const next: BudgetLedgerRecord = {
@@ -250,7 +309,107 @@ export class BudgetLedger {
       };
       try {
         const saved = await this.store.put('agent_budget', id, ownerId, next, row.revision);
-        if (violation) throw new DomainError('budget_violation', 'Provider usage exceeded its reserved shared budget', 409);
+        if (violation) throw delegationExceeded(next, reserved(next), zero(), 'budget_violation');
+        return this.snapshot(saved);
+      } catch (error) {
+        if (!(error instanceof DomainError && error.code === 'conflict')) throw error;
+      }
+    }
+    throw new DomainError('busy', 'Budget ledger is busy; retry', 409);
+  }
+
+  public async reconcileModelUsage(
+    ownerId: string,
+    id: string,
+    taskId: string,
+    usage: { calls: number; totalTokens: number; accountedTokens?: number },
+  ): Promise<BudgetSnapshot> {
+    validateUnits({ calls: usage.calls, tokens: usage.totalTokens });
+    const accountedTokens = usage.accountedTokens ?? usage.totalTokens;
+    validateUnits({ calls: 0, tokens: accountedTokens });
+    if (usage.calls < 1 || accountedTokens < usage.totalTokens) {
+      throw new DomainError('invalid_usage', 'Runtime usage is invalid');
+    }
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      const row = await this.store.get<BudgetLedgerRecord>('agent_budget', id, ownerId);
+      if (!row) throw new DomainError('not_found', 'Budget ledger not found', 404);
+      const record = row.data;
+      const cursors = record.runtimeUsage ?? {};
+      const previous = cursors[taskId] ?? zero();
+      if (usage.calls < previous.calls && usage.totalTokens <= previous.tokens) {
+        const historical = record.reservations[`${taskId}:model:${usage.calls}`];
+        if (historical?.violation) throw delegationExceeded(record, reserved(record), zero(), 'budget_violation');
+        return this.snapshot(row);
+      }
+      if (usage.calls === previous.calls && usage.totalTokens < previous.tokens
+        && record.reservations[`${taskId}:model:${usage.calls}`]) {
+        return this.snapshot(row);
+      }
+      if (usage.calls < previous.calls || usage.totalTokens < previous.tokens
+        || usage.calls > previous.calls + 1) {
+        throw new DomainError('invalid_usage_sequence', 'Runtime usage cannot be uniquely reconciled', 409);
+      }
+      if (usage.calls === previous.calls) {
+        const reservationId = `${taskId}:model:${usage.calls}`;
+        const reservation = record.reservations[reservationId];
+        if (usage.totalTokens === previous.tokens) {
+          if (accountedTokens - usage.totalTokens !== taskReservedTokens(record, taskId)) {
+            throw new DomainError('invalid_usage_sequence', 'Accounted tokens do not match retained model reservations', 409);
+          }
+          if (reservation?.violation) throw delegationExceeded(record, reserved(record), zero(), 'budget_violation');
+          return this.snapshot(row);
+        }
+        if (!reservation || reservation.state !== 'reserved'
+          || accountedTokens - usage.totalTokens !== taskReservedTokens(record, taskId, reservationId)) {
+          throw new DomainError('invalid_usage_sequence', 'Reported usage does not match retained model reservations', 409);
+        }
+        return this.chargeModelUsage(ownerId, id, taskId, usage);
+      }
+
+      const reservationId = `${taskId}:model:${usage.calls}`;
+      let reservation = record.reservations[reservationId];
+      let next = record;
+      let violation = reservation?.violation === 'budget_violation';
+      if (!reservation) {
+        const taskHeld = taskReservedTokens(record, taskId);
+        const requestedTokens = accountedTokens - usage.totalTokens - taskHeld;
+        if (!Number.isSafeInteger(requestedTokens) || requestedTokens < 1) {
+          throw new DomainError('invalid_usage_sequence', 'Missing model reservation cannot be reconstructed', 409);
+        }
+        const held = reserved(record);
+        violation = record.used.calls + held.calls + 1 > record.limits.maxCalls
+          || record.used.tokens + held.tokens + requestedTokens > record.limits.maxTokens;
+        reservation = {
+          requested: { calls: 1, tokens: requestedTokens },
+          state: 'reserved',
+          ...(violation ? { violation: 'budget_violation' as const } : {}),
+        };
+        next = {
+          ...record,
+          reservations: { ...record.reservations, [reservationId]: reservation },
+        };
+      } else if (reservation.state !== 'reserved') {
+        throw new DomainError('idempotency_conflict', 'Model call reservation was already settled with different usage', 409);
+      }
+      const expectedHeld = usage.totalTokens > previous.tokens
+        ? taskReservedTokens(next, taskId, reservationId)
+        : taskReservedTokens(next, taskId);
+      if (accountedTokens - usage.totalTokens !== expectedHeld) {
+        throw new DomainError('invalid_usage_sequence', 'Accounted tokens do not match retained model reservations', 409);
+      }
+      next = {
+        ...next,
+        runtimeUsage: {
+          ...(next.runtimeUsage ?? {}),
+          [taskId]: { calls: usage.calls, tokens: previous.tokens },
+        },
+      };
+      try {
+        const saved = await this.store.put('agent_budget', id, ownerId, next, row.revision);
+        if (violation) throw delegationExceeded(next, reserved(next), zero(), 'budget_violation');
+        if (usage.totalTokens > previous.tokens) {
+          return this.chargeModelUsage(ownerId, id, taskId, usage);
+        }
         return this.snapshot(saved);
       } catch (error) {
         if (!(error instanceof DomainError && error.code === 'conflict')) throw error;

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { DomainError, type ExecutionStrategy, type Principal } from '../contracts.js';
 import type { Conversation, Message, Task, TaskEvent, TaskOrchestration, TaskState } from '../domain.js';
-import type { AgentProfile } from '../runtime/index.js';
+import type { AgentProfile, RunUsage } from '../runtime/index.js';
 import type { Entity, Store } from '../storage/store.js';
 import { BudgetLedger, type BudgetLimits } from './budget-ledger.js';
 
@@ -46,7 +46,7 @@ export interface OrchestrationPlan {
 
 export interface PrepareChildrenOptions {
   parentTransition?: 'coordinator' | 'runner';
-  parentRuntimeUsage?: { calls: number; totalTokens: number };
+  parentRuntimeUsage?: RunUsage | { calls: number; totalTokens: number; accountedTokens?: number };
 }
 
 export interface ChildResult {
@@ -791,7 +791,142 @@ export class AgentCoordinator {
     usage: PrepareChildrenOptions['parentRuntimeUsage'],
   ): Promise<void> {
     if (!usage) return;
-    await this.budgets.adoptRuntimeUsage(ownerId, budgetId, parentTaskId, usage);
+    await this.reconcileTaskBudget(ownerId, budgetId, parentTaskId, usage);
+  }
+
+  public async reconcileTaskBudget(
+    ownerId: string,
+    budgetId: string,
+    taskId: string,
+    finalUsage: { calls: number; totalTokens: number; accountedTokens?: number },
+  ): Promise<void> {
+    const validateUsage = (usage: { calls: number; totalTokens: number; accountedTokens?: number }): number => {
+      const accounted = usage.accountedTokens ?? usage.totalTokens;
+      if (!Number.isSafeInteger(usage.calls) || usage.calls < 1
+        || !Number.isSafeInteger(usage.totalTokens) || usage.totalTokens < 0
+        || !Number.isSafeInteger(accounted) || accounted < usage.totalTokens) {
+        throw new DomainError('invalid_usage_sequence', 'Runtime usage snapshot is invalid', 409);
+      }
+      return accounted;
+    };
+    const events = (await this.store.scan<TaskEvent>('event', ownerId))
+      .filter((event) => event.data.taskId === taskId)
+      .sort((left, right) => left.data.sequence - right.data.sequence);
+    const modelEvents = events.filter((event) => event.data.type === 'model_call');
+    if (modelEvents.length === 0) {
+      validateUsage(finalUsage);
+      if ((finalUsage.accountedTokens ?? finalUsage.totalTokens) === finalUsage.totalTokens) {
+        await this.budgets.adoptRuntimeUsage(ownerId, budgetId, taskId, finalUsage);
+      } else {
+        await this.budgets.reconcileModelUsage(ownerId, budgetId, taskId, finalUsage);
+      }
+      return;
+    }
+
+    let replayed: { calls: number; totalTokens: number; accountedTokens?: number } = {
+      calls: 0,
+      totalTokens: 0,
+    };
+    let lastReservedTokens = 0;
+    for (const event of events) {
+      const payload = event.data.payload as {
+        call?: number;
+        reservedTokens?: number;
+        usage?: RunUsage;
+      };
+      if (event.data.type === 'model_call') {
+        if (payload.usage) {
+          const currentAccounted = validateUsage(payload.usage);
+          if (payload.call !== payload.usage.calls
+            || !Number.isSafeInteger(payload.reservedTokens) || payload.reservedTokens! < 1) {
+            throw new DomainError('invalid_usage_sequence', 'Model call usage snapshot is inconsistent', 409);
+          }
+          if (payload.usage.calls === replayed.calls + 2) {
+            const priorAccounted = currentAccounted - payload.reservedTokens!;
+            if (!Number.isSafeInteger(priorAccounted) || priorAccounted < payload.usage.totalTokens
+              || payload.usage.totalTokens < replayed.totalTokens) {
+              throw new DomainError('invalid_usage_sequence', 'Lost model reservation cannot be reconstructed', 409);
+            }
+            replayed = {
+              calls: payload.usage.calls - 1,
+              totalTokens: payload.usage.totalTokens,
+              ...(priorAccounted === payload.usage.totalTokens ? {} : { accountedTokens: priorAccounted }),
+            };
+            if (replayed.calls > 0) {
+              await this.budgets.reconcileModelUsage(ownerId, budgetId, taskId, replayed);
+            }
+          } else if (payload.usage.calls !== replayed.calls + 1) {
+            throw new DomainError('invalid_usage_sequence', 'Runtime event gap cannot be uniquely reconstructed', 409);
+          }
+          const priorAccounted = currentAccounted - payload.reservedTokens!;
+          if (payload.usage.totalTokens < replayed.totalTokens
+            || priorAccounted < payload.usage.totalTokens) {
+            throw new DomainError('invalid_usage_sequence', 'Model call usage snapshot is not monotonic', 409);
+          }
+          if (payload.usage.totalTokens > replayed.totalTokens) {
+            if (replayed.calls < 1) {
+              throw new DomainError('invalid_usage_sequence', 'Provider usage cannot precede the first model call', 409);
+            }
+            replayed = {
+              calls: replayed.calls,
+              totalTokens: payload.usage.totalTokens,
+              ...(priorAccounted === payload.usage.totalTokens ? {} : { accountedTokens: priorAccounted }),
+            };
+            await this.budgets.reconcileModelUsage(ownerId, budgetId, taskId, replayed);
+          } else if (priorAccounted !== (replayed.accountedTokens ?? replayed.totalTokens)) {
+            throw new DomainError('invalid_usage_sequence', 'Model call accounting snapshot is inconsistent', 409);
+          }
+          replayed = payload.usage;
+          lastReservedTokens = payload.reservedTokens!;
+        } else {
+          if (!Number.isSafeInteger(payload.call) || payload.call !== replayed.calls + 1
+            || !Number.isSafeInteger(payload.reservedTokens) || payload.reservedTokens! < 1) {
+            throw new DomainError('invalid_usage_sequence', 'Legacy model call event cannot be uniquely reconstructed', 409);
+          }
+          replayed = {
+            calls: payload.call!,
+            totalTokens: replayed.totalTokens,
+            accountedTokens: (replayed.accountedTokens ?? replayed.totalTokens) + payload.reservedTokens!,
+          };
+          lastReservedTokens = payload.reservedTokens!;
+        }
+        await this.budgets.reconcileModelUsage(ownerId, budgetId, taskId, replayed);
+      } else if (event.data.type === 'usage' && payload.usage) {
+        const totalDelta = payload.usage.totalTokens - replayed.totalTokens;
+        const accounted = payload.usage.accountedTokens ?? (totalDelta === 0
+          ? replayed.accountedTokens ?? replayed.totalTokens
+          : (replayed.accountedTokens ?? replayed.totalTokens) - lastReservedTokens + totalDelta);
+        const normalized = {
+          ...payload.usage,
+          ...(accounted === payload.usage.totalTokens ? { accountedTokens: undefined } : { accountedTokens: accounted }),
+        };
+        validateUsage(normalized);
+        if (normalized.calls !== replayed.calls
+          || normalized.totalTokens < replayed.totalTokens) {
+          throw new DomainError('invalid_usage_sequence', 'Runtime usage event is not monotonic', 409);
+        }
+        replayed = normalized;
+        await this.budgets.reconcileModelUsage(ownerId, budgetId, taskId, replayed);
+      }
+    }
+    if (finalUsage.calls > 0) {
+      const totalDelta = finalUsage.totalTokens - replayed.totalTokens;
+      const accounted = finalUsage.accountedTokens ?? (finalUsage.calls === replayed.calls
+        ? totalDelta === 0
+          ? replayed.accountedTokens ?? replayed.totalTokens
+          : (replayed.accountedTokens ?? replayed.totalTokens) - lastReservedTokens + totalDelta
+        : finalUsage.totalTokens);
+      const normalized = {
+        ...finalUsage,
+        ...(accounted === finalUsage.totalTokens ? { accountedTokens: undefined } : { accountedTokens: accounted }),
+      };
+      validateUsage(normalized);
+      if (normalized.calls < replayed.calls || normalized.calls > replayed.calls + 1
+        || (normalized.calls === replayed.calls && normalized.totalTokens < replayed.totalTokens)) {
+        throw new DomainError('invalid_usage_sequence', 'Final runtime usage is not monotonic', 409);
+      }
+      await this.budgets.reconcileModelUsage(ownerId, budgetId, taskId, normalized);
+    }
   }
 
   private async claimParentPlan(

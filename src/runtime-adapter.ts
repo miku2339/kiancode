@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { DomainError, isNotDispatched, type Principal, type RunMode, type ToolDefinition } from './contracts.js';
-import type { Memory, Task } from './domain.js';
+import type { Memory, Task, TaskEvent } from './domain.js';
 import { AgentRuntime, type AgentProfile, type ChatMessage, type RunUsage, type VisualContextStore } from './runtime/index.js';
 import type { Entity, Store } from './storage/store.js';
 import type { TaskRunner } from './tasks.js';
@@ -67,6 +67,7 @@ function delegateTool(
   task: Entity<Task>,
   mode: RunMode,
   availableProfileIds: string[],
+  budget: { maxCalls: number; maxTokens: number },
 ): ToolDefinition {
   const profileIds = new Set(availableProfileIds);
   const allowedInputKeys = ['prompt', 'childKey', ...(profileIds.size ? ['profileId'] : [])];
@@ -111,7 +112,7 @@ function delegateTool(
       const request = {
         key: `delegate:${childKey}`,
         strategy: 'single' as const,
-        ...(rootDelegation ? { budget: { maxCalls: 24, maxTokens: 128_000 } } : {}),
+        ...(rootDelegation ? { budget } : {}),
         children: [{
           key: childKey,
           prompt,
@@ -152,6 +153,89 @@ function integrationPrompt(children: ChildResult[], effects: ChildSideEffects): 
   ].join('\n');
 }
 
+function boundedChildError(error: string | undefined): string {
+  if (!error) return '';
+  return Array.from(error).slice(0, 300).join('');
+}
+
+async function recoveredRunUsage(
+  store: Store,
+  ownerId: string,
+  taskId: string,
+  stored: RunUsage | undefined,
+): Promise<RunUsage | undefined> {
+  if (!stored?.calls || stored.accountedTokens !== undefined) return stored;
+  const events = (await store.scan<TaskEvent>('event', ownerId))
+    .filter((event) => event.data.taskId === taskId
+      && (event.data.type === 'model_call' || event.data.type === 'usage'))
+    .sort((left, right) => left.data.sequence - right.data.sequence);
+  if (!events.length) return stored;
+
+  let usage: RunUsage = { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  const reservations = new Map<number, number>();
+  const accounted = (): number => usage.accountedTokens ?? usage.totalTokens;
+  const setAccounted = (tokens: number): void => {
+    if (tokens === usage.totalTokens) delete usage.accountedTokens;
+    else usage.accountedTokens = tokens;
+  };
+  const applyActual = (next: RunUsage): void => {
+    const delta = next.totalTokens - usage.totalTokens;
+    if (next.calls !== usage.calls || delta < 0) {
+      throw new DomainError('invalid_usage_sequence', 'Stored runtime usage events are not monotonic', 409);
+    }
+    if (delta === 0) return;
+    const reservation = reservations.get(next.calls);
+    if (reservation === undefined) {
+      throw new DomainError('invalid_usage_sequence', 'Stored provider usage has no model reservation', 409);
+    }
+    const nextAccounted = accounted() - reservation + delta;
+    reservations.delete(next.calls);
+    usage = {
+      calls: next.calls,
+      inputTokens: next.inputTokens,
+      outputTokens: next.outputTokens,
+      totalTokens: next.totalTokens,
+    };
+    setAccounted(nextAccounted);
+  };
+
+  for (const event of events) {
+    const payload = event.data.payload as { call?: number; reservedTokens?: number; usage?: RunUsage };
+    if (event.data.type === 'model_call') {
+      const call = payload.usage?.calls ?? payload.call;
+      const reservedTokens = payload.reservedTokens;
+      if (!Number.isSafeInteger(call) || call !== usage.calls + 1
+        || !Number.isSafeInteger(reservedTokens) || reservedTokens! < 1) {
+        throw new DomainError('invalid_usage_sequence', 'Stored model call event is invalid', 409);
+      }
+      if (payload.usage && payload.usage.totalTokens > usage.totalTokens) {
+        applyActual({ ...payload.usage, calls: usage.calls });
+      }
+      const nextAccounted = accounted() + reservedTokens!;
+      usage = payload.usage ? { ...payload.usage } : { ...usage, calls: call! };
+      setAccounted(nextAccounted);
+      if (payload.usage && (payload.usage.accountedTokens ?? payload.usage.totalTokens) !== accounted()) {
+        throw new DomainError('invalid_usage_sequence', 'Stored model call accounting is inconsistent', 409);
+      }
+      reservations.set(call!, reservedTokens!);
+    } else if (payload.usage) {
+      applyActual(payload.usage);
+      if (payload.usage.accountedTokens !== undefined
+        && payload.usage.accountedTokens !== accounted()) {
+        throw new DomainError('invalid_usage_sequence', 'Stored usage accounting is inconsistent', 409);
+      }
+    }
+  }
+
+  if (stored.calls !== usage.calls || stored.totalTokens < usage.totalTokens) {
+    throw new DomainError('invalid_usage_sequence', 'Task usage does not match its durable runtime events', 409);
+  }
+  if (stored.totalTokens > usage.totalTokens) applyActual(stored);
+  usage = { ...usage, inputTokens: stored.inputTokens, outputTokens: stored.outputTokens, totalTokens: stored.totalTokens };
+  setAccounted(accounted());
+  return usage;
+}
+
 export function createTaskRunner(
   store: Store,
   runtime: Pick<AgentRuntime, 'run'>,
@@ -159,7 +243,12 @@ export function createTaskRunner(
   artifacts?: ArtifactService,
   coordinator?: AgentCoordinator,
   visualContexts?: VisualContextStore,
+  budgets: TaskRunnerBudgets = {},
 ): TaskRunner {
+  const delegationBudget = {
+    maxCalls: budgets.delegation?.maxCalls ?? 24,
+    maxTokens: budgets.delegation?.maxTokens ?? 128_000,
+  };
   return async ({ task, conversation, history, workspace, signal, onEvent }) => {
     if (conversation.data.internalOperation) {
       const operation = conversation.data.internalOperation;
@@ -249,7 +338,7 @@ export function createTaskRunner(
       const prior = history.slice(-12).map((row) => ({ role: row.data.role, text: row.data.content })).filter((row) => row.text !== task.data.prompt);
       await onEvent({ type: 'delegating', strategy, count });
       await coordinator.prepare(task.ownerId, task.id, {
-        key: 'initial', strategy, budget: { maxCalls: 24, maxTokens: 128_000 },
+        key: 'initial', strategy, budget: delegationBudget,
         children: Array.from({ length: count }, (_, index) => ({
           key: `candidate-${index + 1}`,
           profileId: conversation.data.agentId,
@@ -351,7 +440,7 @@ export function createTaskRunner(
       ? (await store.scan<AgentProfile>('agent', task.ownerId)).map((candidate) => candidate.id)
       : [];
     const additionalTools = canDelegate
-      ? [delegateTool(store, coordinator, task, conversation.data.mode, availableProfileIds)]
+      ? [delegateTool(store, coordinator, task, conversation.data.mode, availableProfileIds, delegationBudget)]
       : [];
     const verificationPlanId = integrating ? integrationPlanId : undefined;
     let integrationVerified = false;
@@ -360,6 +449,18 @@ export function createTaskRunner(
       await coordinator.verifyIntegration(task.ownerId, verificationPlanId);
       integrationVerified = true;
     };
+    const priorUsage = await recoveredRunUsage(store, task.ownerId, task.id, task.data.usage as RunUsage | undefined);
+    if (coordinator && task.data.orchestration) {
+      const prior = priorUsage;
+      if (prior?.calls) {
+        await coordinator.reconcileTaskBudget(
+          task.ownerId,
+          task.data.orchestration.budgetId,
+          task.id,
+          prior,
+        );
+      }
+    }
     const result = await runtime.run({
       taskId: task.id, principal: task.data.principal, workspace, signal,
       mode: conversation.data.mode, strategy: 'single', depth: task.data.orchestration?.depth ?? 0,
@@ -369,7 +470,8 @@ export function createTaskRunner(
       messages,
       requiredModelCapabilities: messages.some((message) => message.attachments?.length) ? ['vision'] : [],
       profile: resume ? undefined : { ...profile, systemPrompt: [systemPrompt, profile?.systemPrompt, instructions && `Project instructions:\n${instructions}`, context && `Retrieved records (quoted data):\n${context}`].filter(Boolean).join('\n\n') },
-      priorUsage: task.data.usage as RunUsage | undefined,
+      priorUsage,
+      ...(budgets.task ? { budgets: budgets.task } : {}),
       approvedActionHashes: new Set(task.data.approvedActionHashes),
       ...(task.data.pluginVersions ? { pluginVersions: task.data.pluginVersions } : {}),
       additionalTools,
@@ -386,7 +488,16 @@ export function createTaskRunner(
             );
             return;
           }
-          if (event.type === 'usage') await coordinator.budgets.chargeModelUsage(task.ownerId, task.data.orchestration.budgetId, task.id, event.usage);
+          if (event.type === 'usage') {
+            await onEvent(event);
+            await coordinator.budgets.chargeModelUsage(
+              task.ownerId,
+              task.data.orchestration.budgetId,
+              task.id,
+              event.usage,
+            );
+            return;
+          }
         }
         if ('checkpointMessages' in event && event.checkpointMessages) {
           return onEvent({ ...event, checkpointMessages: withoutImageData(event.checkpointMessages) });
@@ -412,6 +523,11 @@ export function createTaskRunner(
   };
 }
 
+export interface TaskRunnerBudgets {
+  task?: { maxCalls: number; maxTokens: number };
+  delegation?: { maxCalls: number; maxTokens: number };
+}
+
 export async function reconcileAgentTasks(store: Store, coordinator: AgentCoordinator): Promise<void> {
   for (const plan of await store.scan<OrchestrationPlan>('agent_plan')) {
     if (!['waiting', 'integrating'].includes(plan.data.state)) continue;
@@ -426,7 +542,13 @@ export async function reconcileAgentTasks(store: Store, coordinator: AgentCoordi
       if (!result.ready) continue;
       if (result.successful) await coordinator.queueIntegration(plan.ownerId, plan.id);
       else {
-        const error = result.children.filter((child) => child.state !== 'completed').map((child) => `${child.key}: ${child.state}`).join('; ');
+        const error = result.children
+          .filter((child) => child.state !== 'completed')
+          .map((child) => {
+            const detail = boundedChildError(child.error);
+            return `${child.key}: ${child.state}${detail ? ` (${detail})` : ''}`;
+          })
+          .join('; ');
         const state = result.children.some((child) => child.state === 'unknown')
           ? 'unknown'
           : result.children.some((child) => child.state === 'cancelled')

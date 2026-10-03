@@ -227,7 +227,7 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
       store,
       (ownerId, taskId, action, actor) => taskControl(ownerId, taskId, action, actor),
     );
-    const baseRunner = createTaskRunner(store, runtime, runtimeTools, artifacts, coordinator, visualContexts);
+    const baseRunner = createTaskRunner(store, runtime, runtimeTools, artifacts, coordinator, visualContexts, config.runtime.budgets);
     const runner = options.wrapTaskRunner?.(baseRunner, store) ?? baseRunner;
     const server = await createServer({
       store,

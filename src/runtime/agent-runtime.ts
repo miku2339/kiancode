@@ -14,6 +14,7 @@ import type {
   RuntimeOptions,
   ToolCall,
 } from './types.js';
+import { estimateTokens } from './token-estimate.js';
 
 const DEFAULT_MAX_CALLS = 20;
 const DEFAULT_MAX_TOKENS = 100_000;
@@ -257,19 +258,19 @@ export class AgentRuntime {
 
     while (true) {
       this.assertNotAborted(signal);
-      const inputReservation = messages.reduce((sum, message) => sum + Buffer.byteLength(message.content, 'utf8') + (message.attachments?.length ?? 0) * 16_384, 0)
-        + Buffer.byteLength(JSON.stringify(modelTools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))));
+      const inputReservation = messages.reduce((sum, message) => sum + estimateTokens(message.content) + (message.attachments?.length ?? 0) * 16_384, 0)
+        + estimateTokens(JSON.stringify(modelTools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))));
       const maxOutputTokens = Math.min(
         Math.max(1, Math.min(input.maxOutputTokens ?? 4096, 16_384)),
         options.budget.availableTokens() - inputReservation,
       );
       if (maxOutputTokens < 1) {
-        throw new DomainError('token_budget_exceeded', 'No token budget remains for this model request.', 429);
+        throw options.budget.tokensExhausted(inputReservation + 1);
       }
       const reservedTokens = inputReservation + maxOutputTokens;
       options.budget.reserveCall(reservedTokens);
       usage = options.budget.snapshot();
-      await input.onEvent?.({ type: 'model_call', taskId: input.taskId, modelId: model.id, call: usage.calls, reservedTokens });
+      await input.onEvent?.({ type: 'model_call', taskId: input.taskId, modelId: model.id, call: usage.calls, reservedTokens, usage: { ...usage } });
       const request = {
         model,
         messages: [...messages],
@@ -286,11 +287,16 @@ export class AgentRuntime {
       const response = model.locality === 'local'
         ? await this.localProviderLimiter.use(provider.id, signal, () => provider.chat(request))
         : await provider.chat(request);
-      const budgetViolation = options.budget.addTokens(response.usage, reservedTokens);
+      const settled = options.budget.settleCall(response.usage, reservedTokens);
       usage = options.budget.snapshot();
-      await input.onEvent?.({ type: 'usage', taskId: input.taskId, usage: { ...usage } });
-      if (budgetViolation) {
-        throw new DomainError('budget_violation', 'Provider reported usage beyond the reserved token budget.', 409);
+      await input.onEvent?.({
+        type: 'usage',
+        taskId: input.taskId,
+        usage: { ...usage },
+        ...(settled.providerTokenUsage ? { providerTokenUsage: settled.providerTokenUsage } : {}),
+      });
+      if (settled.violation) {
+        throw options.budget.tokensExceeded();
       }
       const responseMessage = normalizeProviderMessage(response.message);
       messages.push(responseMessage);
@@ -645,39 +651,88 @@ class BudgetLedger {
       outputTokens: 0,
       totalTokens: 0,
     };
-    if (this.usage.calls > this.maxCalls || this.usage.totalTokens > this.maxTokens) {
+    const accounted = this.accountedTokens();
+    if (!Number.isSafeInteger(this.usage.calls) || this.usage.calls < 0
+      || !Number.isSafeInteger(this.usage.inputTokens) || this.usage.inputTokens < 0
+      || !Number.isSafeInteger(this.usage.outputTokens) || this.usage.outputTokens < 0
+      || this.usage.totalTokens !== this.usage.inputTokens + this.usage.outputTokens
+      || !Number.isSafeInteger(accounted) || accounted < this.usage.totalTokens) {
+      throw new DomainError('invalid_usage', 'Prior runtime usage is invalid.', 409);
+    }
+    if (this.usage.calls > this.maxCalls || accounted > this.maxTokens) {
       throw new DomainError('budget_violation', 'Prior usage already exceeds the runtime budget.', 409);
     }
   }
 
   public availableTokens(): number {
-    return Math.max(0, this.maxTokens - this.usage.totalTokens);
+    return Math.max(0, this.maxTokens - this.accountedTokens());
   }
 
   public reserveCall(tokens: number): void {
     if (this.usage.calls >= this.maxCalls) {
       throw new DomainError(
         'call_budget_exceeded',
-        `Model call budget of ${this.maxCalls} was exhausted.`,
+        `Task model call budget exhausted: limit ${this.maxCalls}, used ${this.usage.calls}.`,
         429,
       );
     }
     if (!Number.isSafeInteger(tokens) || tokens < 1 || tokens > this.availableTokens()) {
-      throw new DomainError('token_budget_exceeded', 'The model request does not fit the remaining token budget.', 429);
+      throw this.tokensExhausted(tokens);
     }
     this.usage.calls += 1;
+    this.setAccountedTokens(this.accountedTokens() + tokens);
   }
 
-  public addTokens(tokens: { inputTokens: number; outputTokens: number }, reservedTokens: number): boolean {
-    this.usage.inputTokens += tokens.inputTokens;
-    this.usage.outputTokens += tokens.outputTokens;
-    this.usage.totalTokens = this.usage.inputTokens + this.usage.outputTokens;
-    return tokens.inputTokens + tokens.outputTokens > reservedTokens
-      || this.usage.totalTokens > this.maxTokens;
+  public settleCall(
+    tokens: { inputTokens?: number; outputTokens?: number } | undefined,
+    reservedTokens: number,
+  ): { violation: boolean; providerTokenUsage?: { inputTokens: number; outputTokens: number } } {
+    const inputTokens = tokens?.inputTokens;
+    const outputTokens = tokens?.outputTokens;
+    const total = typeof inputTokens === 'number' && typeof outputTokens === 'number'
+      ? inputTokens + outputTokens
+      : Number.NaN;
+    const reported = Number.isSafeInteger(inputTokens) && inputTokens! >= 0
+      && Number.isSafeInteger(outputTokens) && outputTokens! >= 0
+      && Number.isSafeInteger(total) && total > 0;
+    if (!reported) return { violation: false };
+    this.usage.inputTokens += inputTokens!;
+    this.usage.outputTokens += outputTokens!;
+    this.usage.totalTokens += total;
+    this.setAccountedTokens(this.accountedTokens() - reservedTokens + total);
+    return {
+      violation: this.accountedTokens() > this.maxTokens,
+      providerTokenUsage: { inputTokens: inputTokens!, outputTokens: outputTokens! },
+    };
+  }
+
+  public tokensExceeded(): DomainError {
+    return new DomainError(
+      'budget_violation',
+      `Task token budget exceeded by reported provider usage: limit ${this.maxTokens}, used ${this.accountedTokens()}.`,
+      409,
+    );
+  }
+
+  public tokensExhausted(needed: number): DomainError {
+    return new DomainError(
+      'token_budget_exceeded',
+      `Task token budget exhausted: limit ${this.maxTokens}, used ${this.accountedTokens()}, next request needs at least ${needed}.`,
+      429,
+    );
   }
 
   public snapshot(): RunUsage {
     return { ...this.usage };
+  }
+
+  private accountedTokens(): number {
+    return this.usage.accountedTokens ?? this.usage.totalTokens;
+  }
+
+  private setAccountedTokens(tokens: number): void {
+    if (tokens === this.usage.totalTokens) delete this.usage.accountedTokens;
+    else this.usage.accountedTokens = tokens;
   }
 }
 

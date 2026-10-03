@@ -244,23 +244,27 @@ function parseChatResponse(content: string): ChatResponse {
     throw new DomainError('provider_protocol_error', 'Device model returned invalid JSON.', 502);
   }
   if (!isRecord(parsed) || !isRecord(parsed.message) || parsed.message.role !== 'assistant'
-    || typeof parsed.message.content !== 'string' || !isRecord(parsed.usage)
-    || !nonnegativeNumber(parsed.usage.inputTokens) || !nonnegativeNumber(parsed.usage.outputTokens)) {
+    || typeof parsed.message.content !== 'string') {
     throw new DomainError('provider_protocol_error', 'Device model returned an invalid response.', 502);
   }
   const toolCalls = parsed.message.toolCalls === undefined
     ? undefined
     : parseToolCalls(parsed.message.toolCalls);
+  const usageTotal = isRecord(parsed.usage)
+    && nonnegativeNumber(parsed.usage.inputTokens)
+    && nonnegativeNumber(parsed.usage.outputTokens)
+    ? parsed.usage.inputTokens + parsed.usage.outputTokens
+    : Number.NaN;
+  const usage = Number.isSafeInteger(usageTotal) && usageTotal > 0 && isRecord(parsed.usage)
+    ? { inputTokens: parsed.usage.inputTokens as number, outputTokens: parsed.usage.outputTokens as number }
+    : undefined;
   return {
     message: {
       role: 'assistant',
       content: parsed.message.content,
       ...(toolCalls ? { toolCalls } : {}),
     },
-    usage: {
-      inputTokens: parsed.usage.inputTokens,
-      outputTokens: parsed.usage.outputTokens,
-    },
+    ...(usage ? { usage } : {}),
   };
 }
 
@@ -344,7 +348,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function nonnegativeNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 function assertLoopbackProvider(value: string): void {

@@ -151,6 +151,22 @@ test('unreported or invalid provider usage retains a conservative reservation', 
   assert.equal(usage?.unreportedCalls, 1); assert.ok(usage!.reservedTokens > 4096); assert.equal(usage?.confirmedInputTokens, 44);
 });
 
+test('daily quota reservation estimates CJK tokens instead of UTF-8 bytes', async (t) => {
+  const { store, service } = setup();
+  t.after(() => store.close());
+  await prepare(service, owner, { dailyTokenLimit: 10_000 });
+  const prompt = '海'.repeat(3_000);
+  assert.equal(Buffer.byteLength(prompt, 'utf8'), 9_000);
+  const result = await (await service.runtime(owner.id)).run({
+    principal: owner,
+    taskId: 'cjk-quota',
+    mode: 'ask',
+    prompt,
+    modelId: 'model',
+  });
+  assert.equal(result.content, 'answer');
+});
+
 test('a persisted credential survives service restart and fails closed under the wrong encryption key', async (t) => {
   let actualKey: string | undefined;
   const { store, options, service } = setup({ createProvider: (provider) => { actualKey = provider.apiKey; return { ...provider, chat: verifiedResponse }; } });

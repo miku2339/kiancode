@@ -140,6 +140,30 @@ test('Ollama provider parses NDJSON streaming responses', async () => {
   assert.deepEqual(response.usage, { inputTokens: 5, outputTokens: 3 });
 });
 
+test('streaming providers preserve partial usage instead of coercing missing fields to zero', async () => {
+  const openai = new OpenAICompatibleProvider({
+    id: 'openai-partial', locality: 'local', baseUrl: 'http://127.0.0.1:11434/v1',
+    fetch: async () => new Response([
+      'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9}}\n\n',
+      'data: [DONE]\n\n',
+    ].join(''), { status: 200 }),
+  });
+  const request: ChatRequest = {
+    model: { id: 'model', providerId: openai.id, locality: 'local', capabilities: [] },
+    messages: [{ role: 'user', content: 'answer' }], tools: [], signal: new AbortController().signal,
+  };
+  assert.deepEqual((await openai.chat(request)).usage, { inputTokens: 9 });
+
+  const ollama = new OllamaProvider({
+    id: 'ollama-partial', baseUrl: 'http://127.0.0.1:11434',
+    fetch: async () => new Response('{"message":{"content":"answer"},"done":true,"done_reason":"stop","eval_count":3}\n'),
+  });
+  assert.deepEqual(await ollama.chat({
+    ...request,
+    model: { ...request.model, providerId: ollama.id },
+  }).then((response) => response.usage), { outputTokens: 3 });
+});
+
 test('OpenAI-compatible provider rejects truncated, empty, and unterminated streams', async () => {
   const request = (provider: OpenAICompatibleProvider): ChatRequest => ({
     model: { id: 'model', providerId: provider.id, locality: 'local', capabilities: [] },

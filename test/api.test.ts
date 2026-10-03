@@ -29,6 +29,27 @@ test('authenticated chat creates a durable task and returns stored history', asy
   } finally { await server.close(); }
 });
 
+test('HTTP callers cannot override operator task or delegation budgets', async () => {
+  const store = new SqliteStore();
+  const server = await createServer({ store, authenticate: developmentAuth(token), runner: async () => ({ text: 'unused' }) });
+  try {
+    const created = await server.app.inject({
+      method: 'POST', url: '/v1/conversations', headers,
+      payload: { title: 'Budget', budget: { maxCalls: 500 } },
+    });
+    assert.equal(created.statusCode, 400, created.body);
+
+    const conversation = await server.app.inject({
+      method: 'POST', url: '/v1/conversations', headers, payload: { title: 'Budget' },
+    });
+    const sent = await server.app.inject({
+      method: 'POST', url: `/v1/conversations/${conversation.json().data.id}/messages`, headers,
+      payload: { content: 'Run', budgets: { task: { maxCalls: 500 }, delegation: { maxCalls: 500 } } },
+    });
+    assert.equal(sent.statusCode, 400, sent.body);
+  } finally { await server.close(); }
+});
+
 test('conversation request IDs survive edits and reject reuse with different original input', async () => {
   const store = new SqliteStore();
   const server = await createServer({ store, authenticate: developmentAuth(token), runner: async () => ({ text: 'unused' }) });

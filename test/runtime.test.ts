@@ -6,6 +6,7 @@ import {
   type ChatRequest,
   type ChatResponse,
   type ModelProvider,
+  type RuntimeEvent,
 } from '../src/runtime/index.js';
 
 const principal: Principal = {
@@ -471,7 +472,7 @@ test('enforces model call and token budgets', async () => {
     (error: unknown) => error instanceof Error && 'code' in error
       && error.code === 'budget_violation',
   );
-  assert.equal(tokenProvider.calls[0]?.maxOutputTokens, 2);
+  assert.equal(tokenProvider.calls[0]?.maxOutputTokens, 7);
 });
 
 test('propagates cancellation to an in-flight provider request', async () => {
@@ -909,6 +910,7 @@ test('does not expose tools outside the principal scopes', async () => {
 
 test('experts uses the top two profiles and a parent aggregation pass', async () => {
   const requests: ChatRequest[] = [];
+  const events: RuntimeEvent[] = [];
   const provider: ModelProvider = {
     id: 'experts-provider',
     locality: 'cloud',
@@ -943,6 +945,7 @@ test('experts uses the top two profiles and a parent aggregation pass', async ()
         { name: 'extra', instruction: 'This expert must not run.' },
       ],
     },
+    onEvent: async (event) => { events.push(event); },
   });
 
   assert.equal(requests.length, 3);
@@ -951,6 +954,13 @@ test('experts uses the top two profiles and a parent aggregation pass', async ()
   assert.equal(result.degraded, false);
   assert.match(requests[2]?.messages.at(-1)?.content ?? '', /security answer/);
   assert.match(requests[2]?.messages.at(-1)?.content ?? '', /product answer/);
+  assert.deepEqual(events
+    .filter((event) => event.type === 'model_call' || event.type === 'usage')
+    .map((event) => [event.type, event.type === 'model_call' ? event.call : event.usage.calls]), [
+    ['model_call', 1], ['usage', 1],
+    ['model_call', 2], ['usage', 2],
+    ['model_call', 3], ['usage', 3],
+  ]);
 });
 
 test('honors an exact model id and workspace cloud prohibition', async () => {
@@ -1120,3 +1130,155 @@ async function waitForTest(predicate: () => boolean): Promise<void> {
   }
   throw new Error('Timed out waiting for condition');
 }
+
+test('model reservations are durable before dispatch and provider failures retain their accounting', async () => {
+  let durable = false;
+  const events: RuntimeEvent[] = [];
+  const provider: ModelProvider = {
+    id: 'failing-provider',
+    locality: 'local',
+    async chat() {
+      assert.equal(durable, true);
+      throw new Error('provider failed');
+    },
+  };
+  const runtime = new AgentRuntime({
+    providers: [provider],
+    models: [{ id: 'model', providerId: provider.id, locality: 'local', capabilities: [] }],
+  });
+
+  await assert.rejects(runtime.run({
+    principal,
+    taskId: 'failed-reservation',
+    prompt: 'abcd',
+    mode: 'ask',
+    budgets: { maxTokens: 100 },
+    maxOutputTokens: 5,
+    onEvent: async (event) => {
+      events.push(event);
+      if (event.type === 'model_call') durable = true;
+    },
+  }), /provider failed/);
+
+  assert.deepEqual(events.find((event) => event.type === 'model_call'), {
+    type: 'model_call',
+    taskId: 'failed-reservation',
+    modelId: 'model',
+    call: 1,
+    reservedTokens: 7,
+    usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 7 },
+  });
+  assert.equal(events.some((event) => event.type === 'usage'), false);
+});
+
+test('unreported or invalid provider usage keeps the full reservation separate from actual usage', async () => {
+  const invalid = [
+    {},
+    { inputTokens: 2 },
+    { outputTokens: 2 },
+    { inputTokens: 0, outputTokens: 0 },
+    { inputTokens: Number.NaN, outputTokens: 1 },
+    { inputTokens: -1, outputTokens: 1 },
+    { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 },
+  ];
+  for (const [index, usage] of invalid.entries()) {
+    const provider: ModelProvider = {
+      id: `invalid-${index}`,
+      locality: 'local',
+      async chat() { return { message: { role: 'assistant', content: 'answer' }, usage }; },
+    };
+    const runtime = new AgentRuntime({
+      providers: [provider],
+      models: [{ id: `model-${index}`, providerId: provider.id, locality: 'local', capabilities: [] }],
+    });
+    const result = await runtime.run({
+      principal,
+      taskId: `invalid-${index}`,
+      prompt: 'abcd',
+      mode: 'ask',
+      maxOutputTokens: 5,
+    });
+    assert.deepEqual(result.usage, {
+      calls: 1,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      accountedTokens: 7,
+    });
+  }
+});
+
+test('valid provider usage replaces its reservation and may exceed the estimate within the total budget', async () => {
+  const provider = new ScriptedProvider([{
+    message: { role: 'assistant', content: 'answer' },
+    usage: { inputTokens: 5, outputTokens: 2 },
+  }]);
+  const runtime = new AgentRuntime({
+    providers: [provider],
+    models: [{ id: 'model', providerId: provider.id, locality: 'local', capabilities: [] }],
+  });
+  const result = await runtime.run({
+    principal,
+    taskId: 'actual-over-estimate',
+    prompt: 'abcd',
+    mode: 'ask',
+    budgets: { maxTokens: 10 },
+    maxOutputTokens: 1,
+  });
+  assert.deepEqual(result.usage, { calls: 1, inputTokens: 5, outputTokens: 2, totalTokens: 7 });
+});
+
+test('provider usage with one zero component is still reported actual usage', async () => {
+  for (const [index, providerUsage] of [
+    { inputTokens: 0, outputTokens: 1 },
+    { inputTokens: 1, outputTokens: 0 },
+  ].entries()) {
+    const provider = new ScriptedProvider([{
+      message: { role: 'assistant', content: 'answer' },
+      usage: providerUsage,
+    }]);
+    const runtime = new AgentRuntime({
+      providers: [provider],
+      models: [{ id: `zero-component-${index}`, providerId: provider.id, locality: 'local', capabilities: [] }],
+    });
+    const result = await runtime.run({
+      principal,
+      taskId: `zero-component-${index}`,
+      prompt: 'abcd',
+      mode: 'ask',
+      maxOutputTokens: 5,
+    });
+    assert.deepEqual(result.usage, {
+      calls: 1,
+      inputTokens: providerUsage.inputTokens,
+      outputTokens: providerUsage.outputTokens,
+      totalTokens: 1,
+    });
+  }
+});
+
+test('actual usage beyond the task limit is persisted before the task fails', async () => {
+  const events: RuntimeEvent[] = [];
+  const provider = new ScriptedProvider([{
+    message: { role: 'assistant', content: 'answer' },
+    usage: { inputTokens: 7, outputTokens: 6 },
+  }]);
+  const runtime = new AgentRuntime({
+    providers: [provider],
+    models: [{ id: 'model', providerId: provider.id, locality: 'local', capabilities: [] }],
+  });
+  await assert.rejects(runtime.run({
+    principal,
+    taskId: 'actual-over-limit',
+    prompt: 'abcd',
+    mode: 'ask',
+    budgets: { maxTokens: 10 },
+    maxOutputTokens: 8,
+    onEvent: async (event) => { events.push(event); },
+  }), (error: unknown) => error instanceof DomainError && error.code === 'budget_violation');
+  const event = events.at(-1);
+  assert.equal(event?.type, 'usage');
+  assert.deepEqual(event?.type === 'usage' ? event.usage : undefined, {
+    calls: 1, inputTokens: 7, outputTokens: 6, totalTokens: 13,
+  });
+});

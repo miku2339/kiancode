@@ -5,6 +5,10 @@ import { z } from 'zod';
 const modelSchema = z.object({ id: z.string().min(1), providerId: z.string().min(1), model: z.string().optional(), locality: z.enum(['cloud', 'local']), deviceId: z.string().optional(), capabilities: z.array(z.string()).min(1), enabled: z.boolean().default(true), priority: z.number().default(0) }).strict();
 const providerSchema = z.object({ id: z.string().min(1), type: z.enum(['openai-compatible', 'ollama', 'device']), locality: z.enum(['cloud', 'local']), baseUrl: z.url().optional(), apiKeyEnv: z.string().regex(/^[A-Z][A-Z0-9_]*$/).optional() }).strict();
 const defaultTerminalReadOnlyPaths = ['/usr'];
+const budgetSchema = (maxCalls: number, maxTokens: number) => z.object({
+  maxCalls: z.number().int().min(1).max(500).default(maxCalls),
+  maxTokens: z.number().int().min(1).max(20_000_000).default(maxTokens),
+}).strict().prefault({});
 const levelCeilingSchema = z.array(z.string().regex(/^[\x21-\x7e]{1,100}$/)).max(100);
 const pluginCommandProfileSchema = z.object({
   id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/),
@@ -91,6 +95,12 @@ export const configSchema = z.object({
     allowedCommands: z.array(z.string().startsWith('/')).default([]),
     commandProfiles: z.array(pluginCommandProfileSchema).max(100).default([]),
   }).strict().default({ allowedOrigins: [], allowedCommands: [], commandProfiles: [] }),
+  runtime: z.object({
+    budgets: z.object({
+      task: budgetSchema(20, 100_000),
+      delegation: budgetSchema(24, 128_000),
+    }).strict().prefault({}),
+  }).strict().prefault({}),
 }).strict().superRefine((config, context) => {
   if (config.mode === 'development' && !['127.0.0.1', '::1', 'localhost'].includes(config.host)) context.addIssue({ code: 'custom', message: 'Development mode must bind to loopback' });
   const authMode = config.auth.mode ?? (config.auth.issuer ? 'account' : 'development');

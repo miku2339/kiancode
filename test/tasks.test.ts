@@ -198,6 +198,26 @@ test('runtime events receive unique ordered sequences and persist checkpoints', 
   } finally { await service.close(); await store.close(); }
 });
 
+test('a model call usage reservation is durable before execution continues', async () => {
+  const store = new SqliteStore();
+  let taskId = '';
+  const reserved = { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 99 };
+  const service = new TaskService(store, async ({ onEvent }) => {
+    await onEvent({ type: 'model_call', call: 1, modelId: 'model', reservedTokens: 99, usage: reserved });
+    assert.deepEqual((await store.get<Task>('task', taskId, principal.id))?.data.usage, reserved);
+    throw new Error('provider failed');
+  });
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'work');
+    taskId = task.id;
+    await service.drain();
+    const stored = await store.get<Task>('task', task.id, principal.id);
+    assert.equal(stored?.data.state, 'failed');
+    assert.deepEqual(stored?.data.usage, reserved);
+  } finally { await service.close(); await store.close(); }
+});
+
 test('streamed tokens are durably coalesced without changing their content', async () => {
   const store = new SlowEventStore(new SqliteStore(), 80);
   const parts = Array.from({ length: 500 }, (_, index) => `<${index}>`);

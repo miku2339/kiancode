@@ -41,8 +41,8 @@ export interface ChatMessage {
 }
 
 export interface TokenUsage {
-  inputTokens: number;
-  outputTokens: number;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 export interface ChatRequest {
@@ -57,7 +57,7 @@ export interface ChatRequest {
 
 export interface ChatResponse {
   message: ChatMessage;
-  usage: TokenUsage;
+  usage?: TokenUsage;
 }
 
 export interface ModelProvider {
@@ -97,13 +97,13 @@ export interface RunBudgets {
 
 export type RuntimeEvent =
   | { type: 'start'; taskId: string; strategy: ExecutionStrategy }
-  | { type: 'model_call'; taskId: string; modelId: string; call: number; reservedTokens?: number }
+  | { type: 'model_call'; taskId: string; modelId: string; call: number; reservedTokens?: number; usage: RunUsage }
   | { type: 'token'; taskId: string; content: string }
   | { type: 'tool_call'; taskId: string; toolCall: ToolCall; toolOccurrenceId?: string }
   | { type: 'approval_required'; taskId: string; toolCall: ToolCall; toolOccurrenceId?: string; actionHash?: string }
   | { type: 'tool_dispatched'; taskId: string; toolCall: ToolCall; toolOccurrenceId?: string; actionHash: string; sideEffect: ToolDefinition['sideEffect']; checkpointMessages?: ChatMessage[] }
   | { type: 'tool_result'; taskId: string; toolCallId: string; toolOccurrenceId?: string; isError: boolean; outcome: 'confirmed' | 'failed' | 'unknown' | 'not_replayed'; notDispatched?: true; actionHash?: string; sideEffect?: ToolDefinition['sideEffect']; result?: ToolResult; checkpointMessages?: ChatMessage[] }
-  | { type: 'usage'; taskId: string; usage: RunUsage }
+  | { type: 'usage'; taskId: string; usage: RunUsage; providerTokenUsage?: Required<TokenUsage> }
   | { type: 'candidate'; taskId: string; index: number; ok: boolean }
   | { type: 'final'; taskId: string; result: RunResult };
 
@@ -132,9 +132,12 @@ export interface RunInput {
   additionalTools?: ToolDefinition[];
 }
 
-export interface RunUsage extends TokenUsage {
+export interface RunUsage {
   calls: number;
+  inputTokens: number;
+  outputTokens: number;
   totalTokens: number;
+  accountedTokens?: number;
 }
 
 export interface RunResult {

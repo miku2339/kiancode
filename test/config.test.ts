@@ -29,6 +29,32 @@ test('runtime state paths default to writable deployment locations', () => {
   assert.equal(production.checkpointDirectory, '/var/lib/kiancode/checkpoints');
 });
 
+test('runtime budgets use strict bounded defaults and accept partial operator overrides', () => {
+  assert.deepEqual(configSchema.parse({}).runtime.budgets, {
+    task: { maxCalls: 20, maxTokens: 100_000 },
+    delegation: { maxCalls: 24, maxTokens: 128_000 },
+  });
+  assert.deepEqual(configSchema.parse({
+    runtime: { budgets: { task: { maxTokens: 400_000 } } },
+  }).runtime.budgets, {
+    task: { maxCalls: 20, maxTokens: 400_000 },
+    delegation: { maxCalls: 24, maxTokens: 128_000 },
+  });
+  for (const runtime of [
+    { budgets: { task: { maxCalls: 0 } } },
+    { budgets: { task: { maxCalls: 501 } } },
+    { budgets: { delegation: { maxTokens: 0 } } },
+    { budgets: { delegation: { maxTokens: 20_000_001 } } },
+    { budgets: { task: { maxCalls: 1.5 } } },
+    { budgets: { task: { maxTokens: '100000' } } },
+    { budgets: { task: { maxToken: 100_000 } } },
+    { budgets: { tasks: {} } },
+    { budget: {} },
+  ]) {
+    assert.throws(() => configSchema.parse({ runtime }), ZodError);
+  }
+});
+
 test('production rejects relative state paths', () => {
   assert.throws(() => configSchema.parse({
     mode: 'production',

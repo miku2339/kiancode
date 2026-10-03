@@ -3,6 +3,7 @@ export type { ToolCallReconciliation } from './agent-runtime.js';
 export { OllamaProvider, OpenAICompatibleProvider } from './providers.js';
 export { DeviceModelProvider, createLocalModelTool } from './device-provider.js';
 export { VisualContextStore } from './visual-context.js';
+export { estimateTokens } from './token-estimate.js';
 export type {
   AgentProfile,
   ChatAttachment,

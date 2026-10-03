@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { AgentCoordinator, type OrchestrationPlan } from '../src/agents/coordinator.js';
 import type { Principal, ToolDefinition } from '../src/contracts.js';
-import type { Conversation, Task } from '../src/domain.js';
+import type { Conversation, Task, TaskEvent } from '../src/domain.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
 import { TaskService, type TaskRunner } from '../src/tasks.js';
 import { createWorkspaceTools } from '../src/tools/workspace.js';
@@ -77,6 +77,153 @@ test('invalid delegation and over-budget adoption do not poison a corrected retr
     await service.close();
     await store.close();
   }
+});
+
+test('root delegation replays reported and unreported parent calls into the new shared ledger', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async () => ({ text: 'unused' }));
+  const coordinator = new AgentCoordinator(store);
+  try {
+    let parent = await rootTask(store, service);
+    const snapshots = [
+      { type: 'model_call', call: 1, reservedTokens: 20, usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 20 } },
+      { type: 'usage', usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 20 } },
+      { type: 'model_call', call: 2, reservedTokens: 20, usage: { calls: 2, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 40 } },
+      { type: 'usage', usage: { calls: 2, inputTokens: 5, outputTokens: 2, totalTokens: 7, accountedTokens: 27 } },
+    ];
+    for (const [index, payload] of snapshots.entries()) {
+      await store.create<TaskEvent>('event', principal.id, {
+        taskId: parent.id,
+        sequence: index + 1,
+        type: payload.type,
+        payload,
+        at: new Date().toISOString(),
+      }, `${parent.id}:budget:${index + 1}`);
+    }
+    const finalUsage = snapshots.at(-1)!.usage;
+    parent = await store.put('task', parent.id, parent.ownerId, { ...parent.data, usage: finalUsage }, parent.revision);
+
+    const request = {
+      key: 'mixed-parent-usage',
+      children: [{ key: 'worker', prompt: 'Inspect' }],
+      budget: { maxCalls: 3, maxTokens: 100 },
+    };
+    const plan = await coordinator.prepare(principal.id, parent.id, request, { parentRuntimeUsage: finalUsage });
+    const first = await coordinator.budgets.get(principal.id, plan.data.budgetId);
+    assert.deepEqual(first.used, { calls: 1, tokens: 7 });
+    assert.deepEqual(first.reserved, { calls: 1, tokens: 20 });
+    assert.deepEqual(first.remaining, { calls: 1, tokens: 73 });
+
+    await coordinator.prepare(principal.id, parent.id, request, { parentRuntimeUsage: finalUsage });
+    const replayed = await coordinator.budgets.get(principal.id, plan.data.budgetId);
+    assert.deepEqual(replayed.used, first.used);
+    assert.deepEqual(replayed.reserved, first.reserved);
+  } finally { await service.close(); await store.close(); }
+});
+
+test('reconciliation restores one lost reservation before a new call and never double counts it', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async () => ({ text: 'unused' }));
+  const coordinator = new AgentCoordinator(store);
+  try {
+    const parent = await rootTask(store, service);
+    const budgetId = 'singleton-recovery-budget';
+    await coordinator.budgets.create(principal.id, budgetId, parent.id, { maxCalls: 3, maxTokens: 100 });
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, {
+      calls: 1, totalTokens: 0, accountedTokens: 20,
+    });
+    assert.deepEqual((await coordinator.budgets.get(principal.id, budgetId)).reserved, { calls: 1, tokens: 20 });
+
+    await store.create<TaskEvent>('event', principal.id, {
+      taskId: parent.id,
+      sequence: 1,
+      type: 'model_call',
+      payload: {
+        type: 'model_call', taskId: parent.id, modelId: 'model', call: 2, reservedTokens: 20,
+        usage: { calls: 2, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 40 },
+      },
+      at: new Date().toISOString(),
+    }, `${parent.id}:call:2`);
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, {
+      calls: 2, totalTokens: 0, accountedTokens: 40,
+    });
+
+    await store.create<TaskEvent>('event', principal.id, {
+      taskId: parent.id,
+      sequence: 2,
+      type: 'usage',
+      payload: {
+        type: 'usage', taskId: parent.id,
+        usage: { calls: 2, inputTokens: 5, outputTokens: 2, totalTokens: 7, accountedTokens: 27 },
+        providerTokenUsage: { inputTokens: 5, outputTokens: 2 },
+      },
+      at: new Date().toISOString(),
+    }, `${parent.id}:usage:2`);
+    const finalUsage = { calls: 2, totalTokens: 7, accountedTokens: 27 };
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, finalUsage);
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, finalUsage);
+    const snapshot = await coordinator.budgets.get(principal.id, budgetId);
+    assert.deepEqual(snapshot.used, { calls: 1, tokens: 7 });
+    assert.deepEqual(snapshot.reserved, { calls: 1, tokens: 20 });
+    assert.deepEqual(snapshot.remaining, { calls: 1, tokens: 73 });
+  } finally { await service.close(); await store.close(); }
+});
+
+test('event replay rejects mismatched call identity before changing the shared ledger', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async () => ({ text: 'unused' }));
+  const coordinator = new AgentCoordinator(store);
+  try {
+    const parent = await rootTask(store, service);
+    const budgetId = 'mismatched-event-budget';
+    await coordinator.budgets.create(principal.id, budgetId, parent.id, { maxCalls: 2, maxTokens: 100 });
+    await store.create<TaskEvent>('event', principal.id, {
+      taskId: parent.id,
+      sequence: 1,
+      type: 'model_call',
+      payload: {
+        type: 'model_call', taskId: parent.id, modelId: 'model', call: 2, reservedTokens: 20,
+        usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 20 },
+      },
+      at: new Date().toISOString(),
+    }, `${parent.id}:mismatch`);
+    await assert.rejects(
+      coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, {
+        calls: 1, totalTokens: 0, accountedTokens: 20,
+      }),
+      (error: unknown) => error instanceof Error && 'code' in error && error.code === 'invalid_usage_sequence',
+    );
+    assert.deepEqual((await coordinator.budgets.get(principal.id, budgetId)).reserved, { calls: 0, tokens: 0 });
+  } finally { await service.close(); await store.close(); }
+});
+
+test('legacy zero-usage events retain their model reservation during replay', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async () => ({ text: 'unused' }));
+  const coordinator = new AgentCoordinator(store);
+  try {
+    const parent = await rootTask(store, service);
+    const budgetId = 'legacy-unreported-budget';
+    await coordinator.budgets.create(principal.id, budgetId, parent.id, { maxCalls: 2, maxTokens: 100 });
+    for (const [index, payload] of [
+      { type: 'model_call', call: 1, reservedTokens: 20 },
+      { type: 'usage', usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0 } },
+    ].entries()) {
+      await store.create<TaskEvent>('event', principal.id, {
+        taskId: parent.id,
+        sequence: index + 1,
+        type: payload.type,
+        payload,
+        at: new Date().toISOString(),
+      }, `${parent.id}:legacy:${index + 1}`);
+    }
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, {
+      calls: 1, totalTokens: 0,
+    });
+    const snapshot = await coordinator.budgets.get(principal.id, budgetId);
+    assert.deepEqual(snapshot.used, { calls: 0, tokens: 0 });
+    assert.deepEqual(snapshot.reserved, { calls: 1, tokens: 20 });
+  } finally { await service.close(); await store.close(); }
 });
 
 test('invalid budget preflight does not reserve a parent plan claim', async () => {

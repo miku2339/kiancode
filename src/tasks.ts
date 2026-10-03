@@ -945,7 +945,7 @@ export class TaskService {
           });
         }
       }
-      if (runtimeEvent.type === 'usage' && runtimeEvent.usage) {
+      if ((runtimeEvent.type === 'model_call' || runtimeEvent.type === 'usage') && runtimeEvent.usage) {
         await this.change(task.ownerId, task.id, (current) => ({
           ...current,
           usage: runtimeEvent.usage,

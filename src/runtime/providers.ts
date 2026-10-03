@@ -96,7 +96,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
       throw new DomainError('provider_protocol_error', `${this.id} returned an empty stream.`, 502);
     }
     let content = '';
-    let usage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
+    let usage: TokenUsage = {};
     const calls = new Map<number, { id: string; name: string; arguments: string }>();
     let sawDone = false;
     let finishReason: string | undefined;
@@ -128,8 +128,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
       }
       if (chunk.usage) {
         usage = {
-          inputTokens: chunk.usage.prompt_tokens ?? 0,
-          outputTokens: chunk.usage.completion_tokens ?? 0,
+          ...(chunk.usage.prompt_tokens !== undefined ? { inputTokens: chunk.usage.prompt_tokens } : {}),
+          ...(chunk.usage.completion_tokens !== undefined ? { outputTokens: chunk.usage.completion_tokens } : {}),
         };
       }
     }
@@ -206,7 +206,7 @@ export class OllamaProvider implements ModelProvider {
       throw new DomainError('provider_protocol_error', `${this.id} returned an empty stream.`, 502);
     }
     let content = '';
-    let usage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
+    let usage: TokenUsage = {};
     const toolCalls: ToolCall[] = [];
     let sawDone = false;
     let doneReason: string | undefined;
@@ -242,8 +242,8 @@ export class OllamaProvider implements ModelProvider {
       }
       if (chunk.prompt_eval_count !== undefined || chunk.eval_count !== undefined) {
         usage = {
-          inputTokens: chunk.prompt_eval_count ?? 0,
-          outputTokens: chunk.eval_count ?? 0,
+          ...(chunk.prompt_eval_count !== undefined ? { inputTokens: chunk.prompt_eval_count } : {}),
+          ...(chunk.eval_count !== undefined ? { outputTokens: chunk.eval_count } : {}),
         };
       }
     }
