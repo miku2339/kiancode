@@ -5,12 +5,18 @@ import { DatabaseSync } from 'node:sqlite';
 import { DomainError } from '../contracts.js';
 import type { Memory } from '../domain.js';
 import { listMemoryRows, relevantMemory, type MemoryQuery, type MemoryQueryPage } from '../memory-query.js';
+import { serializeData } from './json.js';
+import { validMemoryTimestamp } from './memory.js';
 import type { Entity, Store } from './store.js';
 
 type Row = { id: string; owner_id: string; revision: number; created_at: string; updated_at: string; data: string };
 
 function decode<T>(row: Row): Entity<T> {
   return { id: row.id, ownerId: row.owner_id, revision: Number(row.revision), createdAt: row.created_at, updatedAt: row.updated_at, data: JSON.parse(row.data) as T };
+}
+
+function validMemoryWindow(memory: Memory): boolean {
+  return validMemoryTimestamp(memory.validFrom) && validMemoryTimestamp(memory.validTo);
 }
 
 export class SqliteStore implements Store {
@@ -32,7 +38,7 @@ export class SqliteStore implements Store {
   async create<T>(kind: string, ownerId: string, data: T, id: string = randomUUID()): Promise<Entity<T>> {
     const now = new Date().toISOString();
     try {
-      this.db.prepare('INSERT INTO entities VALUES (?,?,?,?,?,?,?)').run(kind, id, ownerId, 1, now, now, JSON.stringify(data));
+      this.db.prepare('INSERT INTO entities VALUES (?,?,?,?,?,?,?)').run(kind, id, ownerId, 1, now, now, serializeData(data));
     } catch (error) {
       if (String(error).includes('UNIQUE')) throw new DomainError('conflict', 'Record already exists', 409);
       throw error;
@@ -55,15 +61,15 @@ export class SqliteStore implements Store {
   async queryMemory(query: MemoryQuery): Promise<MemoryQueryPage> {
     const rows = await this.scan<Memory>('memory', query.ownerId);
     if (query.purpose === 'relevant') {
-      return { rows: relevantMemory(rows, query.context, query.now, query.limit) };
+      return { rows: relevantMemory(rows.filter((row) => validMemoryWindow(row.data)), query.context, query.now, query.limit) };
     }
-    return listMemoryRows(rows, query);
+    return listMemoryRows(query.includeExpired ? rows : rows.filter((row) => validMemoryWindow(row.data)), query);
   }
 
   async put<T>(kind: string, id: string, ownerId: string, data: T, expectedRevision: number): Promise<Entity<T>> {
     const now = new Date().toISOString();
     const result = this.db.prepare('UPDATE entities SET data=?,updated_at=?,revision=revision+1 WHERE kind=? AND id=? AND owner_id=? AND revision=?')
-      .run(JSON.stringify(data), now, kind, id, ownerId, expectedRevision);
+      .run(serializeData(data), now, kind, id, ownerId, expectedRevision);
     if (Number(result.changes) === 0) {
       if (!await this.get(kind, id, ownerId)) throw new DomainError('not_found', 'Record not found', 404);
       throw new DomainError('conflict', 'Revision conflict', 409);

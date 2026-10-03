@@ -111,6 +111,10 @@ Account systems and product channels are adapters. Deployment-specific integrati
 
 `npm run check` runs TypeScript checking, behavior tests and the distributable build. Real deployment, PostgreSQL restore, provider capability, tool isolation, signed-device and external-adapter checks remain separate release gates.
 
+The store contract always covers SQLite. Set `KIANCODE_TEST_DATABASE_URL` to a disposable PostgreSQL database to run the same contract against production storage; without it, PostgreSQL cases are reported as skipped, while connection or permission failures fail the run.
+
+`npm run acceptance` is not part of `npm run check`. It requires the isolated PostgreSQL configuration in `KIANCODE_ACCEPTANCE_CONFIG`, an absolute Bubblewrap workspace in `KIANCODE_ACCEPTANCE_WORKSPACE`, and a configured real model. Set `KIANCODE_ACCEPTANCE_REPORT`, or pass `--report`, to an evidence path outside the workspace. The report is replaced atomically: it starts as `incomplete`, becomes `passed` only after every gate succeeds, and becomes `failed` with sanitized error text plus evidence verified before the failure. An `incomplete` report after exit means the process stopped before finalization.
+
 ## License
 
 Apache-2.0. Dependencies retain their own licenses.

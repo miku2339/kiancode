@@ -13,10 +13,22 @@ import {
   type MemoryQueryPage,
   type RelevantMemoryQuery,
 } from '../memory-query.js';
+import { serializeData } from './json.js';
+import { memoryLeapDayPattern, memoryTimestampPattern } from './memory.js';
 import type { Entity, Store } from './store.js';
 
 type Row = { id: string; owner_id: string; revision: number; created_at: Date; updated_at: Date; data: unknown };
 type ScoredRow = Row & { score: number | string };
+
+function validTimestampSql(value: string): string {
+  return `(${value} ~ '${memoryTimestampPattern}'
+    AND ${value} !~ '^0000-' AND (${value} !~ '^[0-9]{4}-02-29T' OR ${value} ~ '${memoryLeapDayPattern}'))`;
+}
+
+export interface PostgresStoreOptions {
+  schema?: string;
+}
+
 function decode<T>(row: Row): Entity<T> {
   return { id: row.id, ownerId: row.owner_id, revision: Number(row.revision), createdAt: row.created_at.toISOString(), updatedAt: row.updated_at.toISOString(), data: row.data as T };
 }
@@ -24,8 +36,16 @@ function decode<T>(row: Row): Entity<T> {
 export class PostgresStore implements Store {
   private constructor(private pool: Pool) {}
 
-  static async connect(connectionString: string): Promise<PostgresStore> {
-    const pool = new Pool({ connectionString, max: 8, connectionTimeoutMillis: 5000, query_timeout: 10000, statement_timeout: 10000 });
+  static async connect(connectionString: string, options: PostgresStoreOptions = {}): Promise<PostgresStore> {
+    if (options.schema && !/^[a-z_][a-z0-9_]*$/.test(options.schema)) throw new TypeError('Invalid PostgreSQL schema name');
+    const pool = new Pool({
+      connectionString,
+      max: 8,
+      connectionTimeoutMillis: 5000,
+      query_timeout: 10000,
+      statement_timeout: 10000,
+      ...(options.schema ? { options: `-c search_path=${options.schema}` } : {}),
+    });
     try {
       const schema = await pool.query<{ table_exists: boolean; index_exists: boolean }>(`
         SELECT to_regclass('kiancode_entities') IS NOT NULL AS table_exists,
@@ -46,7 +66,7 @@ export class PostgresStore implements Store {
 
   async create<T>(kind: string, ownerId: string, data: T, id: string = randomUUID()): Promise<Entity<T>> {
     try {
-      const result = await this.pool.query<Row>('INSERT INTO kiancode_entities VALUES ($1,$2,$3,1,NOW(),NOW(),$4) RETURNING *', [kind, id, ownerId, JSON.stringify(data)]);
+      const result = await this.pool.query<Row>('INSERT INTO kiancode_entities VALUES ($1,$2,$3,1,NOW(),NOW(),$4) RETURNING *', [kind, id, ownerId, serializeData(data)]);
       return decode<T>(result.rows[0]!);
     } catch (error) {
       if ((error as { code?: string }).code === '23505') throw new DomainError('conflict', 'Record already exists', 409);
@@ -91,10 +111,14 @@ export class PostgresStore implements Store {
       ))
       OR ($3 = 'group' AND ${alias}.data->>'scope' = 'group' AND ${alias}.data->>'scopeId' = $4)
     )`;
-    const active = (alias: string) => `(
-      coalesce(${alias}.data->>'validFrom', '') <= $2
-      AND (${alias}.data->>'validTo' IS NULL OR ${alias}.data->>'validTo' > $2)
-    )`;
+    const active = (alias: string) => `(CASE
+      WHEN ${alias}.data ? 'validFrom' AND jsonb_typeof(${alias}.data->'validFrom') <> 'string' THEN false
+      WHEN ${alias}.data ? 'validTo' AND jsonb_typeof(${alias}.data->'validTo') <> 'string' THEN false
+      WHEN ${alias}.data->>'validFrom' IS NOT NULL AND NOT ${validTimestampSql(`${alias}.data->>'validFrom'`)} THEN false
+      WHEN ${alias}.data->>'validTo' IS NOT NULL AND NOT ${validTimestampSql(`${alias}.data->>'validTo'`)} THEN false
+      ELSE (${alias}.data->>'validFrom' IS NULL OR (${alias}.data->>'validFrom')::timestamptz <= $2::timestamptz)
+        AND (${alias}.data->>'validTo' IS NULL OR (${alias}.data->>'validTo')::timestamptz > $2::timestamptz)
+    END)`;
     const result = await this.pool.query<ScoredRow>(`
       WITH scoped AS MATERIALIZED (
         SELECT e.*
@@ -141,10 +165,14 @@ export class PostgresStore implements Store {
           AND ($3::text IS NULL OR e.data->>'scope' = $3)
           AND ($4::text IS NULL OR e.data->>'scopeId' = $4)
           AND coalesce(e.data->>'reviewStatus', 'approved') = coalesce($12::text, 'approved')
-          AND ($5::boolean OR (
-            coalesce(e.data->>'validFrom', '') <= $2
-            AND (e.data->>'validTo' IS NULL OR e.data->>'validTo' > $2)
-          ))
+          AND ($5::boolean OR (CASE
+            WHEN e.data ? 'validFrom' AND jsonb_typeof(e.data->'validFrom') <> 'string' THEN false
+            WHEN e.data ? 'validTo' AND jsonb_typeof(e.data->'validTo') <> 'string' THEN false
+            WHEN e.data->>'validFrom' IS NOT NULL AND NOT ${validTimestampSql(`e.data->>'validFrom'`)} THEN false
+            WHEN e.data->>'validTo' IS NOT NULL AND NOT ${validTimestampSql(`e.data->>'validTo'`)} THEN false
+            ELSE (e.data->>'validFrom' IS NULL OR (e.data->>'validFrom')::timestamptz <= $2::timestamptz)
+              AND (e.data->>'validTo' IS NULL OR (e.data->>'validTo')::timestamptz > $2::timestamptz)
+          END))
       )
       SELECT * FROM ranked
       WHERE (NOT $7::boolean OR score > 0)
@@ -179,7 +207,7 @@ export class PostgresStore implements Store {
   }
 
   async put<T>(kind: string, id: string, ownerId: string, data: T, expectedRevision: number): Promise<Entity<T>> {
-    const result = await this.pool.query<Row>('UPDATE kiancode_entities SET data=$1,updated_at=NOW(),revision=revision+1 WHERE kind=$2 AND id=$3 AND owner_id=$4 AND revision=$5 RETURNING *', [JSON.stringify(data), kind, id, ownerId, expectedRevision]);
+    const result = await this.pool.query<Row>('UPDATE kiancode_entities SET data=$1,updated_at=NOW(),revision=revision+1 WHERE kind=$2 AND id=$3 AND owner_id=$4 AND revision=$5 RETURNING *', [serializeData(data), kind, id, ownerId, expectedRevision]);
     if (result.rows[0]) return decode<T>(result.rows[0]);
     if (!await this.get(kind, id, ownerId)) throw new DomainError('not_found', 'Record not found', 404);
     throw new DomainError('conflict', 'Revision conflict', 409);

@@ -4,11 +4,12 @@ import { mkdir, readFile, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { bootstrap } from '../src/bootstrap.js';
-import { loadConfig } from '../src/config.js';
+import { loadConfig, type Configuration } from '../src/config.js';
 import { MemoryConflictService } from '../src/memory-conflicts.js';
 import type { Principal } from '../src/contracts.js';
 import type { Conversation, PendingAction, Task, TaskEvent } from '../src/domain.js';
 import type { Entity } from '../src/storage/store.js';
+import { openAcceptanceReport, type AcceptanceReport } from './acceptance-report.js';
 
 type BootstrappedService = Awaited<ReturnType<typeof bootstrap>>;
 
@@ -185,17 +186,45 @@ async function driveDelegatedTask(
   assert.fail('Delegated task did not complete with verified integration');
 }
 
-const configPath = process.env.KIANCODE_ACCEPTANCE_CONFIG;
-if (!configPath) throw new Error('Set KIANCODE_ACCEPTANCE_CONFIG to an isolated PostgreSQL configuration');
-const config = await loadConfig(configPath);
-if (!process.env[config.database.urlEnv]) throw new Error('Independent acceptance requires PostgreSQL');
-const requestedRoot = process.env.KIANCODE_ACCEPTANCE_WORKSPACE;
-if (!requestedRoot || !path.isAbsolute(requestedRoot)) throw new Error('Set an absolute isolated KIANCODE_ACCEPTANCE_WORKSPACE');
-await mkdir(requestedRoot, { recursive: true, mode: 0o700 });
-const root = await realpath(requestedRoot);
-if (!config.serverWorkspaceRoots.includes(root) || config.terminal.isolation !== 'bubblewrap') {
-  throw new Error('Independent acceptance requires an explicitly configured Bubblewrap workspace');
+function reportTarget(
+  arguments_: string[] = process.argv,
+  environment: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const index = arguments_.indexOf('--report');
+  return index >= 0 ? arguments_[index + 1] : environment.KIANCODE_ACCEPTANCE_REPORT;
 }
+
+async function preflight(): Promise<{ config: Configuration; root: string }> {
+  const configPath = process.env.KIANCODE_ACCEPTANCE_CONFIG;
+  if (!configPath) throw new Error('Set KIANCODE_ACCEPTANCE_CONFIG to an isolated PostgreSQL configuration');
+  const config = await loadConfig(configPath);
+  if (!process.env[config.database.urlEnv]) throw new Error('Independent acceptance requires PostgreSQL');
+  const requestedRoot = process.env.KIANCODE_ACCEPTANCE_WORKSPACE;
+  if (!requestedRoot || !path.isAbsolute(requestedRoot)) throw new Error('Set an absolute isolated KIANCODE_ACCEPTANCE_WORKSPACE');
+  await mkdir(requestedRoot, { recursive: true, mode: 0o700 });
+  const root = await realpath(requestedRoot);
+  if (!config.serverWorkspaceRoots.includes(root) || config.terminal.isolation !== 'bubblewrap') {
+    throw new Error('Independent acceptance requires an explicitly configured Bubblewrap workspace');
+  }
+  return { config, root };
+}
+
+async function recordFailure(
+  acceptanceReport: AcceptanceReport,
+  error: unknown,
+  evidence: object,
+): Promise<never> {
+  try {
+    await acceptanceReport.failed(error, evidence);
+  } catch (reportError) {
+    throw new AggregateError([error, reportError], 'Acceptance failed and its report could not be finalized');
+  }
+  throw error;
+}
+
+const acceptanceReport = await openAcceptanceReport(reportTarget());
+const { config, root } = await preflight().catch((error: unknown) =>
+  recordFailure(acceptanceReport, error, {}));
 
 const resultPath = path.join(root, 'result.txt');
 const delegatedPath = path.join(root, 'delegated.txt');
@@ -543,8 +572,16 @@ try {
   assert.equal(eventKey(recoveryEvents[0]!), dispatchedId);
   report.restartUnknownNoReplay = true;
 
-  process.stdout.write(`${JSON.stringify({ status: 'passed', ...report })}\n`);
+} catch (error) {
+  await recordFailure(acceptanceReport, error, report);
 } finally {
-  await service?.close();
-  await Promise.all([rm(resultPath, { force: true }), rm(delegatedPath, { force: true })]);
+  try {
+    await service?.close();
+    await Promise.all([rm(resultPath, { force: true }), rm(delegatedPath, { force: true })]);
+  } catch (cleanupError) {
+    await recordFailure(acceptanceReport, cleanupError, report);
+  }
 }
+
+await acceptanceReport.passed(report);
+process.stdout.write(`${JSON.stringify({ status: 'passed', ...report })}\n`);

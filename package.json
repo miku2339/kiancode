@@ -30,6 +30,7 @@
     "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
+    "acceptance": "tsx test/standalone.acceptance.ts",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
