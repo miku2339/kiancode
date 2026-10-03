@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { DomainError, type Principal, type ToolDefinition } from '../src/contracts.js';
 import {
@@ -28,12 +27,6 @@ class ScriptedProvider implements ModelProvider {
     assert.ok(response, 'unexpected provider call');
     return response;
   }
-}
-
-function approvedActionHash(taskId: string, callId: string, tool: string, input: Record<string, unknown>): string {
-  return createHash('sha256')
-    .update(`${principal.id}\0${taskId}\0${callId}\0${tool}\0${JSON.stringify(input)}`)
-    .digest('hex');
 }
 
 test('runs model tool calls until the model returns a final answer', async () => {
@@ -131,15 +124,21 @@ test('act mode rejects completion after a failed terminal check and unrelated re
     ],
   });
 
-  await assert.rejects(runtime.run({
+  const waiting = await runtime.run({
     principal,
     taskId,
     prompt: 'Repair and verify the file',
     mode: 'act',
     strategy: 'single',
-    approvedActionHashes: new Set([
-      approvedActionHash(taskId, 'terminal-1', 'terminal.run', { command }),
-    ]),
+    approvedActionHashes: new Set(),
+  });
+  await assert.rejects(runtime.run({
+    principal,
+    taskId,
+    messages: waiting.messages,
+    mode: 'act',
+    strategy: 'single',
+    approvedActionHashes: new Set([waiting.pendingActions?.[0]?.actionHash ?? '']),
   }), (error: unknown) => error instanceof DomainError
     && error.code === 'verification_failed'
     && /terminal\.run/.test(error.message));
@@ -236,30 +235,46 @@ test('act mode rebuilds a failed check from checkpoint and completes after repai
     ],
   });
 
-  const failedCheckHash = approvedActionHash(taskId, 'terminal-1', 'terminal.run', { command });
-  const repairHash = approvedActionHash(taskId, 'write-1', 'workspace.write', { path: 'result.txt' });
-  const passingCheckHash = approvedActionHash(taskId, 'terminal-2', 'terminal.run', { command });
-  const waiting = await runtime.run({
+  const failedCheck = await runtime.run({
     principal,
     taskId,
     prompt: 'Repair and verify the file',
     mode: 'act',
     strategy: 'single',
-    approvedActionHashes: new Set([failedCheckHash]),
+    approvedActionHashes: new Set(),
+  });
+  const waiting = await runtime.run({
+    principal,
+    taskId,
+    messages: failedCheck.messages,
+    mode: 'act',
+    strategy: 'single',
+    priorUsage: failedCheck.usage,
+    approvedActionHashes: new Set([failedCheck.pendingActions?.[0]?.actionHash ?? '']),
   });
   assert.equal(waiting.status, 'waiting_for_approval');
   assert.equal(waiting.pendingActions?.[0]?.toolCallId, 'write-1');
   assert.equal(waiting.messages.some((message) => message.role === 'tool'
     && message.name === 'terminal.run' && message.toolOutcome === 'failed'), true);
 
-  const completed = await runtime.run({
+  const passingCheck = await runtime.run({
     principal,
     taskId,
     messages: waiting.messages,
     mode: 'act',
     strategy: 'single',
     priorUsage: waiting.usage,
-    approvedActionHashes: new Set([repairHash, passingCheckHash]),
+    approvedActionHashes: new Set([waiting.pendingActions?.[0]?.actionHash ?? '']),
+  });
+  assert.equal(passingCheck.pendingActions?.[0]?.toolCallId, 'terminal-2');
+  const completed = await runtime.run({
+    principal,
+    taskId,
+    messages: passingCheck.messages,
+    mode: 'act',
+    strategy: 'single',
+    priorUsage: passingCheck.usage,
+    approvedActionHashes: new Set([passingCheck.pendingActions?.[0]?.actionHash ?? '']),
   });
   assert.equal(completed.status, 'completed');
   assert.equal(completed.content, 'Repair verified.');
@@ -572,9 +587,6 @@ test('write and external tools require a matching approved action hash', async (
 });
 
 test('stops with outcome_unknown after an unconfirmed external dispatch', async () => {
-  const approvedHash = createHash('sha256')
-    .update('owner-1\0external-task\0send-1\0send\0{"message":"hello"}')
-    .digest('hex');
   const provider = new ScriptedProvider([
     {
       message: {
@@ -604,13 +616,21 @@ test('stops with outcome_unknown after an unconfirmed external dispatch', async 
     tools: [tool],
   });
 
-  await assert.rejects(runtime.run({
+  const waiting = await runtime.run({
     principal,
     taskId: 'external-task',
     prompt: 'send',
     mode: 'act',
     strategy: 'single',
-    approvedActionHashes: new Set([approvedHash]),
+    approvedActionHashes: new Set(),
+  });
+  await assert.rejects(runtime.run({
+    principal,
+    taskId: 'external-task',
+    messages: waiting.messages,
+    mode: 'act',
+    strategy: 'single',
+    approvedActionHashes: new Set([waiting.pendingActions?.[0]?.actionHash ?? '']),
     onEvent(event) { events.push(event); },
   }), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'outcome_unknown');
 
@@ -624,9 +644,6 @@ test('stops with outcome_unknown after an unconfirmed external dispatch', async 
 });
 
 test('preserves an unknown outcome reported by a dispatched write tool', async () => {
-  const approvedHash = createHash('sha256')
-    .update('owner-1\0unknown-write\0write-1\0write\0{}')
-    .digest('hex');
   const provider = new ScriptedProvider([{
     message: {
       role: 'assistant',
@@ -651,13 +668,21 @@ test('preserves an unknown outcome reported by a dispatched write tool', async (
     }],
   });
 
-  await assert.rejects(runtime.run({
+  const waiting = await runtime.run({
     principal,
     taskId: 'unknown-write',
     prompt: 'write',
     mode: 'act',
     strategy: 'single',
-    approvedActionHashes: new Set([approvedHash]),
+    approvedActionHashes: new Set(),
+  });
+  await assert.rejects(runtime.run({
+    principal,
+    taskId: 'unknown-write',
+    messages: waiting.messages,
+    mode: 'act',
+    strategy: 'single',
+    approvedActionHashes: new Set([waiting.pendingActions?.[0]?.actionHash ?? '']),
     onEvent(event) { events.push(event); },
   }), (error: unknown) => error instanceof DomainError && error.code === 'outcome_unknown');
   assert.equal(events.at(-1)?.outcome, 'unknown');
@@ -1063,18 +1088,24 @@ test('serializes workspace writes across tasks for the same workspace', async ()
     deviceId: 'server', capabilities: ['workspace:write'], allowCloud: true,
   };
   const writePrincipal = { ...principal, scopes: ['workspace:write'] };
-  const run = (taskId: string) => runtime.run({
+  const request = (taskId: string) => ({
     principal: writePrincipal,
     workspace,
     taskId,
     prompt: 'write',
     mode: 'act' as const,
     modelPolicy: 'cloud' as const,
-    approvedActionHashes: new Set([createHash('sha256')
-      .update(`owner-1\0${taskId}\0write-1\0workspace.write\0{"path":"a"}`)
-      .digest('hex')]),
   });
-  const runs = [run('write-task-1'), run('write-task-2')];
+  const waiting = await Promise.all([
+    runtime.run({ ...request('write-task-1'), approvedActionHashes: new Set() }),
+    runtime.run({ ...request('write-task-2'), approvedActionHashes: new Set() }),
+  ]);
+  const runs = waiting.map((result, index) => runtime.run({
+    ...request(`write-task-${index + 1}`),
+    prompt: undefined,
+    messages: result.messages,
+    approvedActionHashes: new Set([result.pendingActions?.[0]?.actionHash ?? '']),
+  }));
   await waitForTest(() => activeWrites === 1);
   assert.equal(maximumWrites, 1);
   release?.();

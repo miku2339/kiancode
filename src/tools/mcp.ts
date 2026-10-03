@@ -9,7 +9,7 @@ import { Ajv2020 } from 'ajv/dist/2020.js';
 import * as formatsModule from 'ajv-formats';
 import type { FormatsPlugin } from 'ajv-formats';
 import { requireScope } from '../auth.js';
-import { DomainError, type ToolDefinition } from '../contracts.js';
+import { DomainError, notDispatched, type ToolDefinition } from '../contracts.js';
 
 export interface McpEnvReference {
   envRef: string;
@@ -199,7 +199,7 @@ export class McpToolProvider {
         execute: async (input, context) => {
           requireScope(context.principal, `mcp:${this.config.id}`);
           if (!validateInput(input)) {
-            throw new DomainError('invalid_tool_input', 'MCP tool input does not match its declared schema');
+            throw notDispatched('invalid_tool_input', 'MCP tool input does not match its declared schema');
           }
           const progress: McpProgress[] = [];
           const progressToken = randomUUID();

@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import { access, chmod, lstat, mkdir, readFile, realpath, unlink } from 'node:fs/promises';
 import path from 'node:path';
-import { DomainError, type ToolContext, type ToolDefinition, type ToolResult, type ToolSpecification } from '../contracts.js';
+import { asNotDispatched, DomainError, notDispatched, type ToolContext, type ToolDefinition, type ToolResult, type ToolSpecification } from '../contracts.js';
 import { requireScope } from '../auth.js';
 
 export interface MacAppToolOptions {
@@ -35,6 +35,7 @@ interface HelperResponse {
   error?: string;
   code?: string;
   data?: unknown;
+  notDispatched?: boolean;
 }
 
 const bundlePattern = /^[A-Za-z0-9][A-Za-z0-9.-]{1,254}$/;
@@ -95,13 +96,13 @@ export const macAppToolSpecifications = [
 
 function stringInput(input: Record<string, unknown>, key: string): string {
   const value = input[key];
-  if (typeof value !== 'string' || !value) throw new DomainError('invalid_input', `${key} must be a non-empty string`);
+  if (typeof value !== 'string' || !value) throw notDispatched('invalid_input', `${key} must be a non-empty string`);
   return value;
 }
 
 function integerInput(input: Record<string, unknown>, key: string, fallback = 0): number {
   const value = input[key] ?? fallback;
-  if (!Number.isInteger(value) || (value as number) < 0) throw new DomainError('invalid_input', `${key} must be a non-negative integer`);
+  if (!Number.isInteger(value) || (value as number) < 0) throw notDispatched('invalid_input', `${key} must be a non-negative integer`);
   return value as number;
 }
 
@@ -186,7 +187,7 @@ export class MacAppToolProvider {
         ...macAppToolSpecifications[4],
         execute: async (input, context) => {
           const action = stringInput(input, 'action');
-          if (!['raise', 'minimize', 'unminimize'].includes(action)) throw new DomainError('invalid_input', 'Unsupported window action');
+          if (!['raise', 'minimize', 'unminimize'].includes(action)) throw notDispatched('invalid_input', 'Unsupported window action');
           return { content: JSON.stringify(await this.executeWrite(context, { operation: 'window', bundleId: this.allowedBundle(input), windowIndex: integerInput(input, 'windowIndex'), action })) };
         },
       },
@@ -194,14 +195,14 @@ export class MacAppToolProvider {
         ...macAppToolSpecifications[5],
         execute: async (input, context) => {
           const action = stringInput(input, 'action');
-          if (!this.actions.has(action)) throw new DomainError('desktop_action_forbidden', 'AX action is not explicitly configured', 403);
+          if (!this.actions.has(action)) throw notDispatched('desktop_action_forbidden', 'AX action is not explicitly configured', 403);
           return { content: JSON.stringify(await this.executeExternal(context, { operation: 'action', bundleId: this.allowedBundle(input), elementRef: stringInput(input, 'elementRef'), action })) };
         },
       },
       {
         ...macAppToolSpecifications[6],
         execute: async (input, context) => {
-          if (!Array.isArray(input.menuPath) || input.menuPath.some((item) => typeof item !== 'string' || !item)) throw new DomainError('invalid_input', 'menuPath must contain non-empty strings');
+          if (!Array.isArray(input.menuPath) || input.menuPath.some((item) => typeof item !== 'string' || !item)) throw notDispatched('invalid_input', 'menuPath must contain non-empty strings');
           return { content: JSON.stringify(await this.executeExternal(context, { operation: 'menu', bundleId: this.allowedBundle(input), menuPath: input.menuPath })) };
         },
       },
@@ -214,14 +215,14 @@ export class MacAppToolProvider {
 
   private allowedBundle(input: Record<string, unknown>): string {
     const bundleId = stringInput(input, 'bundleId');
-    if (!this.bundleIds.has(bundleId)) throw new DomainError('desktop_app_forbidden', 'App is outside the configured bundle identifier allowlist', 403);
+    if (!this.bundleIds.has(bundleId)) throw notDispatched('desktop_app_forbidden', 'App is outside the configured bundle identifier allowlist', 403);
     return bundleId;
   }
 
   private requireCapability(context: ToolContext, capability: string): void {
     requireScope(context.principal, capability);
     if (!context.workspace || !context.workspace.capabilities.includes(capability)) {
-      throw new DomainError('workspace_denied', `Workspace lacks ${capability}`, 403);
+      throw notDispatched('workspace_denied', `Workspace lacks ${capability}`, 403);
     }
   }
 
@@ -267,8 +268,16 @@ export class MacAppToolProvider {
     }
   }
 
+  private startHelper() {
+    try {
+      return spawn(this.helperPath, [], { detached: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (error) {
+      throw asNotDispatched(error, 'desktop_unavailable', 503);
+    }
+  }
+
   private async invoke(request: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
-    if (signal.aborted) throw new DOMException('Mac helper request was cancelled', 'AbortError');
+    if (signal.aborted) throw notDispatched('desktop_aborted', 'Mac helper request was cancelled before it started', 499);
     const payload = JSON.stringify({
       ...request,
       allowedBundleIds: [...this.bundleIds],
@@ -276,7 +285,7 @@ export class MacAppToolProvider {
       controlFile: this.options.controlFile,
     });
     return new Promise((resolve, reject) => {
-      const child = spawn(this.helperPath, [], { detached: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+      const child = this.startHelper();
       let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let exceeded = false;
@@ -292,7 +301,9 @@ export class MacAppToolProvider {
       signal.addEventListener('abort', abort, { once: true });
       child.stdout.on('data', (chunk: Buffer) => { stdout = capture(stdout, chunk); });
       child.stderr.on('data', (chunk: Buffer) => { stderr = capture(stderr, chunk); });
-      child.once('error', reject);
+      child.once('error', (error) => {
+        reject(child.pid === undefined ? notDispatched('desktop_unavailable', error.message, 503) : error);
+      });
       child.once('close', (code) => {
         clearTimeout(timer);
         signal.removeEventListener('abort', abort);
@@ -303,7 +314,12 @@ export class MacAppToolProvider {
         try { response = JSON.parse(stdout.toString('utf8')) as HelperResponse; }
         catch { reject(new DomainError('desktop_protocol_error', `Mac helper returned invalid JSON${stderr.length ? `: ${stderr.toString('utf8').slice(0, 500)}` : ''}`, 502)); return; }
         if (code !== 0 || !response.ok) {
-          reject(new DomainError(response.code ?? 'desktop_helper_failed', response.error ?? 'Mac helper failed', code === 0 ? 400 : 502));
+          reject(new DomainError(
+            response.code ?? 'desktop_helper_failed',
+            response.error ?? 'Mac helper failed',
+            code === 0 ? 400 : 502,
+            { notDispatched: response.notDispatched === true },
+          ));
           return;
         }
         resolve(response.data ?? {});

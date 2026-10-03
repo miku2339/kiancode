@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
-import type { Principal } from '../src/contracts.js';
+import { isNotDispatched, type Principal } from '../src/contracts.js';
 import { createServer } from '../src/http/server.js';
 import { PluginService } from '../src/plugins.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
@@ -266,3 +266,72 @@ test('tasks pin enabled plugin versions and rollback only affects later tasks', 
 function hasCode(code: string): (error: unknown) => boolean {
   return (error) => error instanceof Error && 'code' in error && error.code === code;
 }
+
+test('plugin.call marks failures before the MCP tool is selected', async () => {
+  const store = new SqliteStore();
+  const plugins = new PluginService(store, { allowedOrigins: [], commandProfiles: [] });
+  try {
+    const call = plugins.tools().find((tool) => tool.name === 'plugin.call')!;
+    const context = { principal, taskId: 'task', signal: new AbortController().signal, pluginVersions: {} };
+    await assert.rejects(call.execute({ pluginId: 'missing', tool: 'run', arguments: {} }, context), (error: unknown) => {
+      assert.ok(isNotDispatched(error));
+      assert.equal(error.code, 'plugin_not_pinned');
+      return true;
+    });
+  } finally {
+    await plugins.close();
+    await store.close();
+  }
+});
+
+test('plugin.call does not mark a transport loss after the MCP tool executes as not dispatched', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'kiancode-plugin-dispatch-'));
+  const serverFile = path.join(directory, 'server.mjs');
+  const markerFile = path.join(directory, 'executed');
+  const sdkRoot = path.resolve('node_modules/@modelcontextprotocol/sdk/dist/esm');
+  const serverUrl = pathToFileURL(path.join(sdkRoot, 'server/mcp.js')).href;
+  const transportUrl = pathToFileURL(path.join(sdkRoot, 'server/stdio.js')).href;
+  await writeFile(serverFile, `
+import { writeFileSync } from 'node:fs';
+import { McpServer } from ${JSON.stringify(serverUrl)};
+import { StdioServerTransport } from ${JSON.stringify(transportUrl)};
+const server = new McpServer({ name: 'dispatch-test', version: '1.0.0' });
+server.registerTool('mutate', { inputSchema: {} }, async () => {
+  writeFileSync(${JSON.stringify(markerFile)}, 'executed');
+  process.exit(17);
+});
+await server.connect(new StdioServerTransport());
+`);
+  const store = new SqliteStore();
+  const plugins = new PluginService(store, {
+    allowedOrigins: [],
+    commandProfiles: [{ id: 'dispatch-test', command: process.execPath, args: [serverFile] }],
+  });
+  try {
+    const installed = await plugins.install(principal, 'dispatch-test', 'Dispatch test', {
+      kind: 'mcp',
+      server: { id: 'dispatch-test', permission: 'configured', transport: 'stdio', profile: 'dispatch-test' },
+    });
+    const enabled = await plugins.configure(principal, 'dispatch-test', {
+      enabled: true,
+      revision: installed.revision,
+    });
+    const call = plugins.tools().find((tool) => tool.name === 'plugin.call')!;
+    await assert.rejects(call.execute({
+      pluginId: 'dispatch-test', version: enabled.data.activeVersion, tool: 'mutate', arguments: {},
+    }, {
+      principal: { ...principal, scopes: [...principal.scopes, 'mcp:dispatch-test'] },
+      taskId: 'task',
+      signal: new AbortController().signal,
+      pluginVersions: { 'dispatch-test': enabled.data.activeVersion },
+    }), (error: unknown) => {
+      assert.equal(isNotDispatched(error), false);
+      return true;
+    });
+    assert.equal(await readFile(markerFile, 'utf8'), 'executed');
+  } finally {
+    await plugins.close();
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

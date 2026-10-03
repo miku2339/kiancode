@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
-import { DomainError, type Principal } from './contracts.js';
+import { DomainError, notDispatched, type Principal } from './contracts.js';
 
 export interface Authenticator {
   (authorization: string | undefined): Promise<Principal>;
@@ -228,7 +228,7 @@ export function scopeAllows(grants: readonly string[], scope: string): boolean {
 
 export function requireScope(principal: Principal, scope: string): void {
   if (scopeAllows(principal.scopes, scope)) return;
-  throw new DomainError('forbidden', `Missing capability: ${scope}`, 403);
+  throw notDispatched('forbidden', `Missing capability: ${scope}`, 403);
 }
 
 export function requireOwner(principal: Principal): void {

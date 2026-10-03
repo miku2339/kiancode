@@ -7,7 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import { createWorkspaceTools } from '../src/tools/workspace.js';
-import type { ToolContext, Workspace } from '../src/contracts.js';
+import { isNotDispatched, type ToolContext, type Workspace } from '../src/contracts.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -41,7 +41,11 @@ test('workspace tools reject traversal and symlinks escaping the root', async ()
     assert.ok(read && write);
     await assert.rejects(read.execute({ path: '../secret.txt' }, context(root)), /outside workspace/i);
     await assert.rejects(read.execute({ path: 'escape/secret.txt' }, context(root)), /outside workspace/i);
-    await assert.rejects(write.execute({ path: 'escape/new.txt', content: 'no' }, context(root)), /outside workspace/i);
+    await assert.rejects(write.execute({ path: 'escape/new.txt', content: 'no' }, context(root)), (error: unknown) => {
+      assert.ok(isNotDispatched(error));
+      assert.equal(error.code, 'path_outside_workspace');
+      return true;
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });

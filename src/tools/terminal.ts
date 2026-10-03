@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { chmod, mkdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { DomainError, type ToolContext, type ToolDefinition } from '../contracts.js';
+import { asNotDispatched, notDispatched, type ToolContext, type ToolDefinition } from '../contracts.js';
 import { requireScope } from '../auth.js';
 
 export interface TerminalToolOptions {
@@ -124,20 +124,20 @@ function shellArguments(shell: string, command: string): string[] {
 
 async function resolveCwd(context: ToolContext, requested: unknown): Promise<{ root: string; cwd: string }> {
   const workspace = context.workspace;
-  if (!workspace) throw new DomainError('workspace_required', 'A workspace is required');
+  if (!workspace) throw notDispatched('workspace_required', 'A workspace is required');
   if (workspace.ownerId !== context.principal.id && !hasScope(context, `workspace:${workspace.id}`)) {
-    throw new DomainError('forbidden', 'Principal cannot access this workspace', 403);
+    throw notDispatched('forbidden', 'Principal cannot access this workspace', 403);
   }
   const root = await realpath(workspace.root).catch(() => {
-    throw new DomainError('workspace_unavailable', 'Workspace root is unavailable', 404);
+    throw notDispatched('workspace_unavailable', 'Workspace root is unavailable', 404);
   });
-  if (requested !== undefined && typeof requested !== 'string') throw new DomainError('invalid_input', 'cwd must be a string');
+  if (requested !== undefined && typeof requested !== 'string') throw notDispatched('invalid_input', 'cwd must be a string');
   const lexical = path.resolve(root, requested ?? '.');
-  if (!within(root, lexical)) throw new DomainError('path_outside_workspace', 'cwd is outside workspace', 403);
+  if (!within(root, lexical)) throw notDispatched('path_outside_workspace', 'cwd is outside workspace', 403);
   const resolved = await realpath(lexical).catch(() => {
-    throw new DomainError('path_not_found', 'cwd was not found', 404);
+    throw notDispatched('path_not_found', 'cwd was not found', 404);
   });
-  if (!within(root, resolved)) throw new DomainError('path_outside_workspace', 'cwd resolves outside workspace', 403);
+  if (!within(root, resolved)) throw notDispatched('path_outside_workspace', 'cwd resolves outside workspace', 403);
   return { root, cwd: resolved };
 }
 
@@ -207,6 +207,19 @@ function bubblewrapArguments(
   return { args, network: networkAllowed ? 'shared' : 'isolated' };
 }
 
+function startProcess(executable: string, arguments_: string[], cwd: string, environment: NodeJS.ProcessEnv) {
+  try {
+    return spawn(executable, arguments_, {
+      cwd,
+      detached: process.platform !== 'win32',
+      env: environment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    throw asNotDispatched(error, 'terminal_spawn_failed', 503);
+  }
+}
+
 function stopProcess(pid: number | undefined): void {
   if (!pid) return;
   try {
@@ -247,23 +260,25 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
     sideEffect: 'external',
     async execute(input, context) {
       if (options.requireSandbox) {
-        throw new DomainError('terminal_sandbox_required', 'Server terminal execution requires an OS sandbox', 503);
+        throw notDispatched('terminal_sandbox_required', 'Server terminal execution requires an OS sandbox', 503);
       }
-      if (!context.workspace?.capabilities.includes('shell:execute')) throw new DomainError('capability_required', 'Missing shell:execute capability', 403);
+      if (!context.workspace?.capabilities.includes('shell:execute')) throw notDispatched('capability_required', 'Missing shell:execute capability', 403);
       requireScope(context.principal, 'shell:execute');
       const command = input.command;
       const shell = input.shell;
-      if (typeof command !== 'string' || command.length === 0) throw new DomainError('invalid_input', 'command must be a non-empty string');
-      if (typeof shell !== 'string' || !allowedShells.includes(shell)) throw new DomainError('shell_not_allowed', 'Shell is not explicitly allowed', 403);
+      if (typeof command !== 'string' || command.length === 0) throw notDispatched('invalid_input', 'command must be a non-empty string');
+      if (typeof shell !== 'string' || !allowedShells.includes(shell)) throw notDispatched('shell_not_allowed', 'Shell is not explicitly allowed', 403);
       const timeoutMs = input.timeoutMs === undefined ? Math.min(30_000, maxTimeoutMs) : input.timeoutMs;
       if (!Number.isInteger(timeoutMs) || (timeoutMs as number) <= 0 || (timeoutMs as number) > maxTimeoutMs) {
-        throw new DomainError('invalid_input', `timeoutMs must be from 1 to ${maxTimeoutMs}`);
+        throw notDispatched('invalid_input', `timeoutMs must be from 1 to ${maxTimeoutMs}`);
       }
       const { root, cwd } = await resolveCwd(context, input.cwd);
       const stdout: CapturedOutput = { text: '', bytes: 0, truncated: false };
       const stderr: CapturedOutput = { text: '', bytes: 0, truncated: false };
       const startedAt = Date.now();
-      const environment = await commandEnvironment(context, shell, options);
+      const environment = await commandEnvironment(context, shell, options).catch((error: unknown) => {
+        throw asNotDispatched(error, 'terminal_environment_unavailable', 503);
+      });
       const sandbox = options.bubblewrap
         ? bubblewrapArguments(options.bubblewrap, context, root, cwd, shell, command)
         : undefined;
@@ -273,12 +288,7 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
       return new Promise((resolve, reject) => {
         let timedOut = false;
         let aborted = context.signal.aborted;
-        const child = spawn(executable, arguments_, {
-          cwd,
-          detached: process.platform !== 'win32',
-          env: environment,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
+        const child = startProcess(executable, arguments_, cwd, environment);
         const timeout = setTimeout(() => {
           timedOut = true;
           stopProcess(child.pid);
@@ -293,7 +303,7 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
         child.once('error', (error) => {
           clearTimeout(timeout);
           context.signal.removeEventListener('abort', abort);
-          reject(error);
+          reject(child.pid === undefined ? notDispatched('terminal_spawn_failed', error.message, 503) : error);
         });
         child.once('close', (exitCode, signal) => {
           clearTimeout(timeout);

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { DomainError, type Principal, type ToolDefinition } from './contracts.js';
+import { asNotDispatched, DomainError, type Principal, type ToolDefinition } from './contracts.js';
 import { requireOwner, requireScope } from './auth.js';
 import type { Entity, Store } from './storage/store.js';
 import { McpToolProvider, type McpEnvReference, type McpServerConfig } from './tools/mcp.js';
@@ -236,10 +236,14 @@ export class PluginService {
         return { content: JSON.stringify(await (await this.mcp(context.principal.id, pluginId, this.pinnedVersion(context, pluginId, input.version))).listTools()) };
       } },
       { name: 'plugin.call', description: 'Call a tool from the MCP plugin version fixed for this task. The exact plugin, tool, and arguments require action approval.', inputSchema: { type: 'object', properties: { pluginId: { type: 'string' }, version: { type: 'string' }, tool: { type: 'string' }, arguments: { type: 'object' } }, required: ['pluginId', 'tool', 'arguments'], additionalProperties: false }, requiredCapabilities: ['plugin:use'], sideEffect: 'external', execute: async (input, context) => {
-        const pluginId = String(input.pluginId);
-        const provider = await this.mcp(context.principal.id, pluginId, this.pinnedVersion(context, pluginId, input.version));
-        const tool = (await provider.asToolDefinitions()).find((candidate) => candidate.name === `mcp.${String(input.pluginId)}.${String(input.tool)}`);
-        if (!tool || !input.arguments || typeof input.arguments !== 'object' || Array.isArray(input.arguments)) throw new DomainError('tool_unavailable', 'MCP tool or arguments are invalid');
+        const prepare = async (): Promise<ToolDefinition> => {
+          const pluginId = String(input.pluginId);
+          const provider = await this.mcp(context.principal.id, pluginId, this.pinnedVersion(context, pluginId, input.version));
+          const tool = (await provider.asToolDefinitions()).find((candidate) => candidate.name === `mcp.${String(input.pluginId)}.${String(input.tool)}`);
+          if (!tool || !input.arguments || typeof input.arguments !== 'object' || Array.isArray(input.arguments)) throw new DomainError('tool_unavailable', 'MCP tool or arguments are invalid');
+          return tool;
+        };
+        const tool = await prepare().catch((error: unknown) => { throw asNotDispatched(error, 'plugin_unavailable', 503); });
         return tool.execute(input.arguments as Record<string, unknown>, context);
       } },
     ];

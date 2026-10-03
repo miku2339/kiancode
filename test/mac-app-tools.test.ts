@@ -3,7 +3,7 @@ import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import type { ToolContext, Workspace } from '../src/contracts.js';
+import { isNotDispatched, type ToolContext, type Workspace } from '../src/contracts.js';
 import { MacAppToolProvider } from '../src/tools/mac-app.js';
 
 test('Mac app tools enforce allowlists and return a bounded local screenshot', { skip: process.platform !== 'darwin' }, async () => {
@@ -19,6 +19,10 @@ if (request.operation === 'screenshot') {
   process.stdout.write(JSON.stringify({ ok: true, data: { capturedAt: new Date().toISOString() } }));
 } else if (request.operation === 'health') {
   process.stdout.write(JSON.stringify({ ok: true, data: { available: false, accessibility: false, screenCapture: false, enabled: false, paused: false, reason: 'stopped' } }));
+} else if (request.operation === 'focus') {
+  process.stdout.write(JSON.stringify({ ok: false, code: 'desktop_refused', error: 'No action started', notDispatched: true }));
+} else if (request.operation === 'window') {
+  process.stdout.write(JSON.stringify({ ok: false, code: 'desktop_failed', error: 'Action outcome unknown' }));
 } else {
   process.stdout.write(JSON.stringify({ ok: true, data: { bundleId: request.bundleId } }));
 }
@@ -40,7 +44,22 @@ if (request.operation === 'screenshot') {
     const context: ToolContext = {
       principal: { id: 'owner', level: 4, scopes: ['*'] }, workspace, taskId: 'task', signal: new AbortController().signal,
     };
-    await assert.rejects(tools.get('mac.app.snapshot')!.execute({ bundleId: 'com.example.Other' }, context), /allowlist/);
+    await assert.rejects(tools.get('mac.app.snapshot')!.execute({ bundleId: 'com.example.Other' }, context), (error: unknown) => {
+      assert.ok(isNotDispatched(error));
+      assert.equal(error.code, 'desktop_app_forbidden');
+      return true;
+    });
+    await assert.rejects(tools.get('mac.app.focus')!.execute({ bundleId: 'com.example.Allowed' }, context), (error: unknown) => {
+      assert.ok(isNotDispatched(error));
+      assert.equal(error.code, 'desktop_refused');
+      return true;
+    });
+    await assert.rejects(tools.get('mac.app.window')!.execute({
+      bundleId: 'com.example.Allowed', windowIndex: 0, action: 'raise',
+    }, context), (error: unknown) => {
+      assert.equal(isNotDispatched(error), false);
+      return true;
+    });
     const result = await tools.get('mac.app.screenshot')!.execute({ bundleId: 'com.example.Allowed', windowIndex: 0 }, context);
     assert.equal(result.artifacts?.length, 1);
     assert.match(result.artifacts![0]!.path, /^\/.*\/screenshots\/mac-app-task-/);

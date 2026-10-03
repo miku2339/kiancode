@@ -4,7 +4,7 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import type { ToolDefinition, ToolResult } from '../src/contracts.js';
+import { notDispatched, type ToolDefinition, type ToolResult } from '../src/contracts.js';
 import {
   DeviceConnector,
   HttpDeviceTransport,
@@ -337,4 +337,73 @@ test('HTTP device transport requires HTTPS except loopback and sends bearer with
   assert.equal((requests[0]?.headers as Record<string, string>).authorization, `Bearer ${'x'.repeat(32)}`);
   assert.equal(requests[0]?.redirect, 'error');
   assert.ok(requests[0]?.signal);
+});
+
+test('a marked failure from a write or external tool is submitted as failed', async () => {
+  for (const sideEffect of ['write', 'external'] as const) {
+    const transport = new MemoryTransport();
+    let executions = 0;
+    const tool: ToolDefinition = {
+      name: 'test.write', description: 'test', inputSchema: {}, requiredCapabilities: ['workspace:read'], sideEffect,
+      async execute(): Promise<ToolResult> {
+        executions += 1;
+        throw notDispatched('write_conflict', 'File changed since it was read (hash conflict)', 409);
+      },
+    };
+    const connector = new DeviceConnector({
+      deviceId: 'device-1', transport, capabilities: ['workspace:read'], workspaceIds: ['workspace-1'], tools: [tool],
+    });
+    transport.jobs = [job({ id: 'refused', toolName: 'test.write' })];
+    await connector.pollOnce();
+    await connector.pollOnce();
+    assert.equal(executions, 1);
+    assert.deepEqual(transport.results, [{
+      jobId: 'refused', result: { status: 'failed', error: 'File changed since it was read (hash conflict)' },
+    }]);
+  }
+});
+
+test('a marked failure is still failed when the job was cancelled meanwhile', async () => {
+  const transport = new MemoryTransport();
+  let entered = false;
+  const tool: ToolDefinition = {
+    name: 'test.write', description: 'test', inputSchema: {}, requiredCapabilities: ['workspace:read'], sideEffect: 'write',
+    async execute(_input, context): Promise<ToolResult> {
+      entered = true;
+      await new Promise<void>((resolve) => context.signal.addEventListener('abort', () => resolve(), { once: true }));
+      throw notDispatched('aborted', 'Operation was cancelled before it started', 499);
+    },
+  };
+  const connector = new DeviceConnector({
+    deviceId: 'device-1', transport, capabilities: ['workspace:read'], workspaceIds: ['workspace-1'], tools: [tool],
+  });
+  transport.jobs = [job({ id: 'cancelled-before-write', toolName: 'test.write' })];
+  const polling = connector.pollOnce();
+  while (!entered) await new Promise((resolve) => setTimeout(resolve, 1));
+  connector.cancel('cancelled-before-write');
+  await polling;
+  assert.deepEqual(transport.results.map((entry) => entry.result), [
+    { status: 'failed', error: 'Operation was cancelled before it started' },
+  ]);
+});
+
+test('an error raised after the tool returned is unknown even when it carries the marker', async () => {
+  const transport = new MemoryTransport();
+  const tool: ToolDefinition = {
+    name: 'test.write', description: 'test', inputSchema: {}, requiredCapabilities: ['workspace:read'], sideEffect: 'external',
+    async execute(): Promise<ToolResult> {
+      return {
+        content: 'sent',
+        get artifacts(): ToolResult['artifacts'] { throw notDispatched('invalid_input', 'raised while the result was prepared'); },
+      };
+    },
+  };
+  const connector = new DeviceConnector({
+    deviceId: 'device-1', transport, capabilities: ['workspace:read'], workspaceIds: ['workspace-1'], tools: [tool],
+  });
+  transport.jobs = [job({ id: 'sent', toolName: 'test.write' })];
+  await connector.pollOnce();
+  assert.deepEqual(transport.results.map((entry) => entry.result), [
+    { status: 'unknown', error: 'raised while the result was prepared' },
+  ]);
 });

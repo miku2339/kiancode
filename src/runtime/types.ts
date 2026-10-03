@@ -15,6 +15,7 @@ export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export interface ToolCall {
   id: string;
+  occurrenceId?: string;
   name: string;
   arguments: Record<string, unknown>;
   actionHash?: string;
@@ -33,6 +34,7 @@ export interface ChatMessage {
   attachments?: ChatAttachment[];
   name?: string;
   toolCallId?: string;
+  toolOccurrenceId?: string;
   toolCalls?: ToolCall[];
   actionHash?: string;
   toolOutcome?: 'confirmed' | 'failed' | 'unknown' | 'not_replayed';
@@ -97,10 +99,10 @@ export type RuntimeEvent =
   | { type: 'start'; taskId: string; strategy: ExecutionStrategy }
   | { type: 'model_call'; taskId: string; modelId: string; call: number; reservedTokens?: number }
   | { type: 'token'; taskId: string; content: string }
-  | { type: 'tool_call'; taskId: string; toolCall: ToolCall }
-  | { type: 'approval_required'; taskId: string; toolCall: ToolCall; actionHash?: string }
-  | { type: 'tool_dispatched'; taskId: string; toolCall: ToolCall; actionHash: string; sideEffect: ToolDefinition['sideEffect'] }
-  | { type: 'tool_result'; taskId: string; toolCallId: string; isError: boolean; outcome: 'confirmed' | 'failed' | 'unknown' | 'not_replayed'; actionHash?: string; sideEffect?: ToolDefinition['sideEffect']; result?: ToolResult; checkpointMessages?: ChatMessage[] }
+  | { type: 'tool_call'; taskId: string; toolCall: ToolCall; toolOccurrenceId?: string }
+  | { type: 'approval_required'; taskId: string; toolCall: ToolCall; toolOccurrenceId?: string; actionHash?: string }
+  | { type: 'tool_dispatched'; taskId: string; toolCall: ToolCall; toolOccurrenceId?: string; actionHash: string; sideEffect: ToolDefinition['sideEffect']; checkpointMessages?: ChatMessage[] }
+  | { type: 'tool_result'; taskId: string; toolCallId: string; toolOccurrenceId?: string; isError: boolean; outcome: 'confirmed' | 'failed' | 'unknown' | 'not_replayed'; notDispatched?: true; actionHash?: string; sideEffect?: ToolDefinition['sideEffect']; result?: ToolResult; checkpointMessages?: ChatMessage[] }
   | { type: 'usage'; taskId: string; usage: RunUsage }
   | { type: 'candidate'; taskId: string; index: number; ok: boolean }
   | { type: 'final'; taskId: string; result: RunResult };
@@ -149,6 +151,7 @@ export interface RunResult {
 
 export interface PendingAction {
   toolCallId: string;
+  toolOccurrenceId?: string;
   toolName: string;
   input: Record<string, unknown>;
   actionHash?: string;

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
-import { DomainError, type ToolContext, type ToolDefinition } from '../src/contracts.js';
+import { DomainError, isNotDispatched, notDispatched, type ToolContext, type ToolDefinition } from '../src/contracts.js';
 import { WorkspaceWriteLeaseService } from '../src/workspace-write-lease.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
 
@@ -117,4 +117,26 @@ test('a stopped writer cannot renew or release a reconciled lease', async () => 
     await rejected;
     assert.equal(await service.validate('owner', 'workspace', 'next', next), true);
   } finally { leave(); await rejected; await store.close(); }
+});
+
+test('write leases release only for an explicit not-dispatched marker', async () => {
+  const store = new SqliteStore();
+  const service = new WorkspaceWriteLeaseService(store);
+  const tool: ToolDefinition = {
+    name: 'workspace.write', description: 'Write', inputSchema: {}, requiredCapabilities: [], requiresWorkspace: true, sideEffect: 'write',
+    async execute() { throw notDispatched('write_conflict', 'No write started', 409); },
+  };
+  try {
+    await assert.rejects(service.wrap(tool).execute({}, context('refused')), (error: unknown) => isNotDispatched(error));
+    assert.equal((await service.get('owner', 'workspace'))?.data.state, 'released');
+
+    await assert.rejects(service.wrap({ ...tool, async execute() { throw new DomainError('write_conflict', 'May have written', 409); } })
+      .execute({}, context('uncertain')), /May have written/);
+    assert.equal((await service.get('owner', 'workspace'))?.data.state, 'unknown');
+    await assert.rejects(service.acquire(context('blocked')), (error: unknown) => {
+      assert.ok(isNotDispatched(error));
+      assert.equal(error.code, 'workspace_writer_unverified');
+      return true;
+    });
+  } finally { await store.close(); }
 });

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { DomainError, type Principal, type ToolDefinition, type ToolResult, type Workspace } from '../contracts.js';
+import { DomainError, isNotDispatched, type Principal, type ToolDefinition, type ToolResult, type Workspace } from '../contracts.js';
 import type { WorkspaceWriteLease } from '../workspace-write-lease.js';
 import {
   MAX_WORKSPACE_EXPORT_BYTES,
@@ -375,6 +375,7 @@ export class DeviceConnector {
         finally { checking = false; }
       }, 1000) : undefined;
       fenceTimer?.unref();
+      let toolReturned = false;
       try {
         const rawResult = await tool.execute(job.input, {
           principal: job.principal,
@@ -383,6 +384,7 @@ export class DeviceConnector {
           signal: controller.signal,
           workspaceWriteLease: job.workspaceWriteLease,
         });
+        toolReturned = true;
         const cancelled = controller.signal.aborted;
         const prepared = cancelled
           ? await this.discardLocalArtifacts(job, rawResult)
@@ -402,7 +404,7 @@ export class DeviceConnector {
       } catch (error) {
         const status = tool.sideEffect === 'read'
           ? (controller.signal.aborted ? 'cancelled' : 'failed')
-          : 'unknown';
+          : (!toolReturned && isNotDispatched(error) ? 'failed' : 'unknown');
         await this.markCompleted(job.id, tool.sideEffect, {
           status,
           error: error instanceof Error ? error.message : 'Unknown tool error',

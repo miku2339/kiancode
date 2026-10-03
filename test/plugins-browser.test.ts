@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { access } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import test from 'node:test';
+import { isNotDispatched } from '../src/contracts.js';
 import { BrowserToolProvider, probeBrowserAutomation } from '../src/tools/browser.js';
 
 const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -12,6 +13,11 @@ test('browser tools navigate, snapshot, fill, and click a configured localhost f
   if (!health.available) { t.skip(`Chromium cannot launch: ${health.reason}`); return; }
 
   const server = createServer((request, response) => {
+    if (request.url === '/redirect') {
+      response.writeHead(302, { location: 'https://example.com' });
+      response.end();
+      return;
+    }
     response.setHeader('content-type', 'text/html; charset=utf-8');
     response.end('<!doctype html><title>Fixture</title><label>Name <input id="name"></label><button id="save" onclick="document.body.dataset.saved=document.querySelector(\'#name\').value">Save</button>');
   });
@@ -32,7 +38,15 @@ test('browser tools navigate, snapshot, fill, and click a configured localhost f
     const snapshot = JSON.parse((await tools.get('browser.snapshot')!.execute({}, context)).content) as { title: string; visibleText: string };
     assert.equal(snapshot.title, 'Fixture');
     assert.match(snapshot.visibleText, /Name/);
-    await assert.rejects(tools.get('browser.navigate')!.execute({ url: 'https://example.com' }, context), /origin/i);
+    await assert.rejects(tools.get('browser.navigate')!.execute({ url: 'https://example.com' }, context), (error: unknown) => {
+      assert.ok(isNotDispatched(error));
+      assert.equal(error.code, 'browser_origin_forbidden');
+      return true;
+    });
+    await assert.rejects(tools.get('browser.navigate')!.execute({ url: `${origin}/redirect` }, context), (error: unknown) => {
+      assert.equal(isNotDispatched(error), false);
+      return true;
+    });
   } finally {
     await provider.close();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

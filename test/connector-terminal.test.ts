@@ -3,7 +3,7 @@ import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import type { ToolContext } from '../src/contracts.js';
+import { isNotDispatched, type ToolContext } from '../src/contracts.js';
 import { createTerminalTool } from '../src/tools/terminal.js';
 
 function context(root: string, signal: AbortSignal): ToolContext {
@@ -213,4 +213,36 @@ test('Bubblewrap rejects host credential directories from read-only mounts', () 
   assert.throws(() => createTerminalTool({
     bubblewrap: { binary: '/usr/bin/bwrap', readOnlyPaths: ['/etc'] },
   }), /read-only paths/);
+});
+
+test('terminal marks refusals before a process exists but returns failures after it ran', async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'kiancode-terminal-refused-')));
+  const marker = path.join(root, 'ran');
+  const signal = new AbortController().signal;
+  try {
+    const tool = createTerminalTool({ allowedShells: ['/bin/sh'], maxTimeoutMs: 1_000 });
+    for (const [input, code] of [
+      [{ command: '', shell: '/bin/sh' }, 'invalid_input'],
+      [{ command: `touch ${marker}`, shell: '/bin/zsh' }, 'shell_not_allowed'],
+      [{ command: `touch ${marker}`, shell: '/bin/sh', cwd: '../outside' }, 'path_outside_workspace'],
+    ] as const) {
+      await assert.rejects(tool.execute(input, context(root, signal)), (error: unknown) => {
+        assert.ok(isNotDispatched(error));
+        assert.equal(error.code, code);
+        return true;
+      });
+    }
+    const missingShell = path.join(root, 'no-such-shell');
+    await assert.rejects(
+      createTerminalTool({ allowedShells: [missingShell], runtimeDirectory: path.join(root, '.runtime') })
+        .execute({ command: 'true', shell: missingShell }, context(root, signal)),
+      (error: unknown) => isNotDispatched(error) && error.code === 'terminal_spawn_failed',
+    );
+    const failed = await tool.execute({ command: 'exit 3', shell: '/bin/sh' }, context(root, signal));
+    assert.equal(failed.isError, true);
+    assert.equal((JSON.parse(failed.content) as { exitCode: number }).exitCode, 3);
+    await assert.rejects(access(marker));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

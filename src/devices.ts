@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { bearer, requireScope, tokenHash } from './auth.js';
-import { DomainError, type Principal, type ToolContext, type ToolDefinition, type ToolResult } from './contracts.js';
+import { DomainError, notDispatched, type Principal, type ToolContext, type ToolDefinition, type ToolResult } from './contracts.js';
 import type { DeviceJob, DeviceJobResult, DevicePairRequest, InlineDeviceArtifact } from './connectors/device.js';
 import type { Entity, Store } from './storage/store.js';
 import type { EphemeralModelPayload, EphemeralPayloadStore } from './runtime/visual-context.js';
@@ -229,16 +229,16 @@ export class DeviceService {
 
   private async execute(tool: Omit<ToolDefinition, 'execute'>, input: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
     const workspace = context.workspace;
-    if (!workspace) throw new DomainError('workspace_required', 'Select a workspace before using device tools');
+    if (!workspace) throw notDispatched('workspace_required', 'Select a workspace before using device tools');
     const device = await this.store.get<Device>('device', workspace.deviceId, context.principal.id);
-    if (!device) throw new DomainError('waiting_for_device', 'Waiting for an authorized workspace device');
-    if (device.data.revokedAt) throw new DomainError('device_revoked', 'Device is no longer authorized', 403);
-    if (device.data.paused || !device.data.lastSeen || this.now() - Date.parse(device.data.lastSeen) > 45000) throw new DomainError('waiting_for_device', 'Waiting for the authorized device to reconnect');
-    if (!device.data.workspaceIds.includes(workspace.id)) throw new DomainError('workspace_denied', 'Workspace is not granted to this device', 403);
+    if (!device) throw notDispatched('waiting_for_device', 'Waiting for an authorized workspace device');
+    if (device.data.revokedAt) throw notDispatched('device_revoked', 'Device is no longer authorized', 403);
+    if (device.data.paused || !device.data.lastSeen || this.now() - Date.parse(device.data.lastSeen) > 45000) throw notDispatched('waiting_for_device', 'Waiting for the authorized device to reconnect');
+    if (!device.data.workspaceIds.includes(workspace.id)) throw notDispatched('workspace_denied', 'Workspace is not granted to this device', 403);
     for (const capability of tool.requiredCapabilities) {
       requireScope(context.principal, capability);
-      if (!workspace.capabilities.includes(capability) || !device.data.capabilities.includes(capability)) throw new DomainError('forbidden', 'Tool capability is not granted', 403);
-      if (!device.data.reportedCapabilities.includes(capability)) throw new DomainError('waiting_for_device', `Waiting for device capability ${capability}`);
+      if (!workspace.capabilities.includes(capability) || !device.data.capabilities.includes(capability)) throw notDispatched('forbidden', 'Tool capability is not granted', 403);
+      if (!device.data.reportedCapabilities.includes(capability)) throw notDispatched('waiting_for_device', `Waiting for device capability ${capability}`);
     }
     const job: DeviceJob = { id: randomUUID(), deviceId: device.id, principal: context.principal, taskId: context.taskId, workspace, toolName: tool.name, input, requiredCapabilities: tool.requiredCapabilities, expiresAt: new Date(this.now() + 300000).toISOString(), dispatchedAt: '', workspaceWriteLease: context.workspaceWriteLease };
     return this.dispatch(job, context);
@@ -262,7 +262,10 @@ export class DeviceService {
       const row = await this.store.get<Job>('device_job', job.id, ownerId);
       if (row && ['queued', 'dispatched'].includes(row.data.state)) {
         await this.store.put('device_job', row.id, row.ownerId, { ...row.data, state: row.data.state === 'queued' ? 'cancelled' : 'unknown', error: 'Execution stopped before a confirmed result' }, row.revision);
-        if (row.data.state === 'queued') throw new DomainError('device_not_dispatched', 'Device operation stopped before dispatch', 409);
+        if (row.data.state === 'queued') throw notDispatched('device_not_dispatched', 'Device operation stopped before dispatch', 409);
+      }
+      if (row?.data.state === 'cancelled' && !row.data.job.dispatchedAt) {
+        throw notDispatched('device_not_dispatched', row.data.error ?? 'Device operation was cancelled before dispatch', 409);
       }
       throw error;
     }

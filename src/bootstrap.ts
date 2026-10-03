@@ -5,7 +5,7 @@ import { accountAuth, developmentAuth, oidcAuth } from './auth.js';
 import { AccessService } from './access.js';
 import { ArtifactService } from './artifacts.js';
 import { requireOwnerSubject, type Configuration } from './config.js';
-import { DomainError, type ToolDefinition } from './contracts.js';
+import { DomainError, notDispatched, type ToolDefinition } from './contracts.js';
 import { DeviceService } from './devices.js';
 import { createServer } from './http/server.js';
 import { AgentRuntime, DeviceModelProvider, OllamaProvider, OpenAICompatibleProvider, VisualContextStore } from './runtime/index.js';
@@ -139,8 +139,10 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
       ...tool,
       async execute(input, context) {
         if (context.workspace?.deviceId !== 'server') return devices.remoteTool(tool).execute(input, context);
-        const actual = await realpath(context.workspace.root);
-        if (!roots.some((root) => { const relative = path.relative(root, actual); return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative)); })) throw new DomainError('workspace_denied', 'Workspace is outside configured server roots', 403);
+        const actual = await realpath(context.workspace.root).catch(() => {
+          throw notDispatched('workspace_unavailable', 'Workspace root is unavailable', 404);
+        });
+        if (!roots.some((root) => { const relative = path.relative(root, actual); return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative)); })) throw notDispatched('workspace_denied', 'Workspace is outside configured server roots', 403);
         return tool.execute(input, context);
       },
     }));

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { DomainError, type Principal, type RunMode, type ToolDefinition } from './contracts.js';
+import { DomainError, isNotDispatched, type Principal, type RunMode, type ToolDefinition } from './contracts.js';
 import type { Memory, Task } from './domain.js';
 import { AgentRuntime, type AgentProfile, type ChatMessage, type RunUsage, type VisualContextStore } from './runtime/index.js';
 import type { Entity, Store } from './storage/store.js';
@@ -23,9 +23,15 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function operationActionHash(principalId: string, taskId: string, tool: string, input: Record<string, unknown>): string {
+function operationActionHash(
+  principalId: string,
+  taskId: string,
+  toolOccurrenceId: string | undefined,
+  tool: string,
+  input: Record<string, unknown>,
+): string {
   return createHash('sha256')
-    .update(`${principalId}\0${taskId}\0${taskId}\0${tool}\0${stableJson(input)}`)
+    .update(`${principalId}\0${taskId}\0${toolOccurrenceId ?? taskId}\0${tool}\0${stableJson(input)}`)
     .digest('hex');
 }
 
@@ -133,19 +139,27 @@ export function createTaskRunner(
       const operation = conversation.data.internalOperation;
       const tool = tools.find((candidate) => candidate.name === operation.tool);
       if (!tool || !workspace) throw new DomainError('operation_unavailable', 'Workspace operation is unavailable');
-      const toolCall = { id: task.id, name: tool.name, arguments: operation.input };
+      const storedPending = task.data.pendingActions.find((action) => action.tool === tool.name);
+      const toolOccurrenceId = storedPending?.toolOccurrenceId ?? `operation:${task.id}`;
+      const toolCall = { id: task.id, occurrenceId: toolOccurrenceId, name: tool.name, arguments: operation.input };
       const actionHash = tool.name === 'workspace.export'
-        ? operationActionHash(task.data.principal.id, task.id, tool.name, operation.input)
+        ? operationActionHash(
+            task.data.principal.id,
+            task.id,
+            storedPending && !storedPending.toolOccurrenceId ? undefined : toolOccurrenceId,
+            tool.name,
+            operation.input,
+          )
         : undefined;
       if (actionHash && !task.data.approvedActionHashes.includes(actionHash)) {
-        await onEvent({ type: 'approval_required', taskId: task.id, toolCall: { ...toolCall, actionHash }, actionHash });
+        await onEvent({ type: 'approval_required', taskId: task.id, toolCall: { ...toolCall, actionHash }, toolOccurrenceId, actionHash });
         return {
           text: '',
           status: 'waiting_for_approval',
-          pendingActions: [{ hash: actionHash, tool: tool.name, input: operation.input }],
+          pendingActions: [{ hash: actionHash, tool: tool.name, input: operation.input, toolOccurrenceId }],
         };
       }
-      await onEvent({ type: 'tool_dispatched', taskId: task.id, toolCall: { ...toolCall, ...(actionHash ? { actionHash } : {}) }, ...(actionHash ? { actionHash } : {}), sideEffect: tool.sideEffect });
+      await onEvent({ type: 'tool_dispatched', taskId: task.id, toolCall: { ...toolCall, ...(actionHash ? { actionHash } : {}) }, toolOccurrenceId, ...(actionHash ? { actionHash } : {}), sideEffect: tool.sideEffect });
       let result;
       try {
         result = await tool.execute(operation.input, {
@@ -158,10 +172,40 @@ export function createTaskRunner(
         });
       }
       catch (error) {
-        if (tool.sideEffect === 'external' && !(error instanceof DomainError && error.code === 'waiting_for_device')) throw new DomainError('outcome_unknown', 'Workspace operation stopped without a confirmed result');
+        if (isNotDispatched(error) || (error instanceof DomainError && error.code === 'waiting_for_device')) {
+          await onEvent({
+            type: 'tool_result',
+            taskId: task.id,
+            toolCallId: task.id,
+            toolOccurrenceId,
+            outcome: 'failed',
+            isError: true,
+            notDispatched: true,
+            ...(actionHash ? { actionHash } : {}),
+            sideEffect: tool.sideEffect,
+          });
+          throw error;
+        }
+        if (tool.sideEffect === 'write' || tool.sideEffect === 'external') {
+          await onEvent({
+            type: 'tool_result',
+            taskId: task.id,
+            toolCallId: task.id,
+            toolOccurrenceId,
+            outcome: 'unknown',
+            isError: true,
+            ...(actionHash ? { actionHash } : {}),
+            sideEffect: tool.sideEffect,
+          });
+          throw new DomainError(
+            'outcome_unknown',
+            'A side-effecting workspace action stopped without a confirmed result',
+            409,
+          );
+        }
         throw error;
       }
-      await onEvent({ type: 'tool_result', taskId: task.id, toolCallId: task.id, outcome: 'confirmed', isError: result.isError ?? false, ...(actionHash ? { actionHash } : {}), sideEffect: tool.sideEffect, result });
+      await onEvent({ type: 'tool_result', taskId: task.id, toolCallId: task.id, toolOccurrenceId, outcome: 'confirmed', isError: result.isError ?? false, ...(actionHash ? { actionHash } : {}), sideEffect: tool.sideEffect, result });
       if (result.isError) throw new DomainError('operation_failed', result.content);
       return { text: result.content };
     }
@@ -293,7 +337,9 @@ export function createTaskRunner(
           }
           if (event.type === 'usage') await coordinator.budgets.chargeModelUsage(task.ownerId, task.data.orchestration.budgetId, task.id, event.usage);
         }
-        if (event.type === 'tool_result' && event.checkpointMessages) return onEvent({ ...event, checkpointMessages: withoutImageData(event.checkpointMessages) });
+        if ('checkpointMessages' in event && event.checkpointMessages) {
+          return onEvent({ ...event, checkpointMessages: withoutImageData(event.checkpointMessages) });
+        }
         if (event.type === 'final') return onEvent({ ...event, result: { ...event.result, messages: withoutImageData(event.result.messages) } });
         return onEvent(event);
       },
@@ -301,7 +347,12 @@ export function createTaskRunner(
     return { text: result.content, status: result.status, messages: withoutImageData(result.messages), usage: result.usage,
       pendingActions: result.pendingActions?.map((action) => {
         if (!action.actionHash) throw new DomainError('invalid_approval', 'Runtime returned an action without an approval hash', 500);
-        return { hash: action.actionHash, tool: action.toolName, input: action.input };
+        return {
+          hash: action.actionHash,
+          tool: action.toolName,
+          input: action.input,
+          ...(action.toolOccurrenceId ? { toolOccurrenceId: action.toolOccurrenceId } : {}),
+        };
       }) };
   };
 }

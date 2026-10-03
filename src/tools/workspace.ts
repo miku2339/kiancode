@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { DomainError, type ToolContext, type ToolDefinition, type Workspace } from '../contracts.js';
+import { asNotDispatched, DomainError, notDispatched, type ToolContext, type ToolDefinition, type Workspace } from '../contracts.js';
 import { requireScope } from '../auth.js';
 import { applyWorkspacePatch, parseWorkspacePatch } from './workspace-patch.js';
 import { MAX_WORKSPACE_EXPORT_BYTES, readStableWorkspaceExport, validateWorkspaceExport, workspaceExportMimeType } from './workspace-export.js';
@@ -70,10 +70,22 @@ function validRestoreToken(checkpoint: Checkpoint, token: string | undefined): b
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
+function assertNotCancelledBeforeEffect(signal: AbortSignal): void {
+  if (signal.aborted) throw notDispatched('aborted', 'Operation was cancelled before it started', 499);
+}
+
+async function beforeEffect<T>(code: string, statusCode: number, step: () => T | Promise<T>): Promise<T> {
+  try {
+    return await step();
+  } catch (error) {
+    throw asNotDispatched(error, code, statusCode);
+  }
+}
+
 function stringInput(input: Record<string, unknown>, key: string, required = true): string | undefined {
   const value = input[key];
   if (value === undefined && !required) return undefined;
-  if (typeof value !== 'string') throw new DomainError('invalid_input', `${key} must be a string`);
+  if (typeof value !== 'string') throw notDispatched('invalid_input', `${key} must be a string`);
   return value;
 }
 
@@ -81,7 +93,7 @@ function numberInput(input: Record<string, unknown>, key: string, fallback: numb
   const value = input[key];
   if (value === undefined) return fallback;
   if (!Number.isInteger(value) || (value as number) <= 0 || (value as number) > maximum) {
-    throw new DomainError('invalid_input', `${key} must be an integer from 1 to ${maximum}`);
+    throw notDispatched('invalid_input', `${key} must be an integer from 1 to ${maximum}`);
   }
   return value as number;
 }
@@ -97,55 +109,57 @@ function hasScope(context: ToolContext, scope: string): boolean {
 
 function requireWorkspace(context: ToolContext, capability: string): Workspace {
   const workspace = context.workspace;
-  if (!workspace) throw new DomainError('workspace_required', 'A workspace is required', 400);
+  if (!workspace) throw notDispatched('workspace_required', 'A workspace is required', 400);
   const workspaceScope = `workspace:${workspace.id}`;
   const isOwner = workspace.ownerId === context.principal.id;
   const delegatedAction = capability === EXPORT_CAPABILITY ? 'export' : capability.endsWith('write') ? 'write' : 'read';
   const hasDelegation = hasScope(context, workspaceScope)
     || hasScope(context, `${workspaceScope}:${delegatedAction}`);
-  if (!isOwner && !hasDelegation) throw new DomainError('forbidden', 'Principal cannot access this workspace', 403);
-  if (!workspace.capabilities.includes(capability)) throw new DomainError('capability_required', `Missing ${capability} capability`, 403);
+  if (!isOwner && !hasDelegation) throw notDispatched('forbidden', 'Principal cannot access this workspace', 403);
+  if (!workspace.capabilities.includes(capability)) throw notDispatched('capability_required', `Missing ${capability} capability`, 403);
   requireScope(context.principal, capability);
   return workspace;
 }
 
 async function existingWorkspaceRoot(workspace: Workspace): Promise<string> {
   const resolved = await realpath(workspace.root).catch(() => {
-    throw new DomainError('workspace_unavailable', 'Workspace root is unavailable', 404);
+    throw notDispatched('workspace_unavailable', 'Workspace root is unavailable', 404);
   });
-  const details = await stat(resolved);
-  if (!details.isDirectory()) throw new DomainError('workspace_unavailable', 'Workspace root is not a directory', 400);
+  const details = await stat(resolved).catch(() => {
+    throw notDispatched('workspace_unavailable', 'Workspace root is unavailable', 404);
+  });
+  if (!details.isDirectory()) throw notDispatched('workspace_unavailable', 'Workspace root is not a directory', 400);
   return resolved;
 }
 
 async function resolveExisting(root: string, requested: string): Promise<string> {
   const lexical = path.resolve(root, requested || '.');
-  if (!isWithin(root, lexical)) throw new DomainError('path_outside_workspace', 'Path is outside workspace', 403);
+  if (!isWithin(root, lexical)) throw notDispatched('path_outside_workspace', 'Path is outside workspace', 403);
   const resolved = await realpath(lexical).catch(() => {
-    throw new DomainError('path_not_found', 'Workspace path was not found', 404);
+    throw notDispatched('path_not_found', 'Workspace path was not found', 404);
   });
-  if (!isWithin(root, resolved)) throw new DomainError('path_outside_workspace', 'Path resolves outside workspace', 403);
+  if (!isWithin(root, resolved)) throw notDispatched('path_outside_workspace', 'Path resolves outside workspace', 403);
   return resolved;
 }
 
 async function resolveForWrite(root: string, requested: string): Promise<string> {
   const lexical = path.resolve(root, requested);
   if (!requested || !isWithin(root, lexical) || lexical === root) {
-    throw new DomainError('path_outside_workspace', 'Path is outside workspace', 403);
+    throw notDispatched('path_outside_workspace', 'Path is outside workspace', 403);
   }
   let ancestor = path.dirname(lexical);
   while (isWithin(root, ancestor)) {
     try {
       const resolvedAncestor = await realpath(ancestor);
       if (!isWithin(root, resolvedAncestor)) {
-        throw new DomainError('path_outside_workspace', 'Path resolves outside workspace', 403);
+        throw notDispatched('path_outside_workspace', 'Path resolves outside workspace', 403);
       }
       const suffix = path.relative(ancestor, lexical);
       const target = path.resolve(resolvedAncestor, suffix);
-      if (!isWithin(root, target)) throw new DomainError('path_outside_workspace', 'Path resolves outside workspace', 403);
+      if (!isWithin(root, target)) throw notDispatched('path_outside_workspace', 'Path resolves outside workspace', 403);
       try {
         const targetRealpath = await realpath(target);
-        if (!isWithin(root, targetRealpath)) throw new DomainError('path_outside_workspace', 'Path resolves outside workspace', 403);
+        if (!isWithin(root, targetRealpath)) throw notDispatched('path_outside_workspace', 'Path resolves outside workspace', 403);
         return targetRealpath;
       } catch (error) {
         if (error instanceof DomainError) throw error;
@@ -157,7 +171,7 @@ async function resolveForWrite(root: string, requested: string): Promise<string>
       ancestor = path.dirname(ancestor);
     }
   }
-  throw new DomainError('path_outside_workspace', 'Path resolves outside workspace', 403);
+  throw notDispatched('path_outside_workspace', 'Path resolves outside workspace', 403);
 }
 
 function schema(properties: Record<string, unknown>, required: string[] = []): Record<string, unknown> {
@@ -351,18 +365,18 @@ export async function createWorkspaceTools(options: WorkspaceToolOptions = {}): 
     sideEffect: 'external',
     async execute(input, context) {
       const workspace = requireWorkspace(context, EXPORT_CAPABILITY);
-      context.signal.throwIfAborted();
+      assertNotCancelledBeforeEffect(context.signal);
       const root = await existingWorkspaceRoot(workspace);
       const requested = stringInput(input, 'path')!;
       const target = await resolveExisting(root, requested);
       const name = path.basename(requested);
       const relativePath = path.relative(root, path.resolve(root, requested));
       const mimeType = workspaceExportMimeType(name);
-      if (!mimeType) throw new DomainError('unsupported_export_type', 'Workspace file type cannot be exported', 415);
-      const bytes = await readStableWorkspaceExport(target, maxExportBytes, root);
-      validateWorkspaceExport(bytes, name, mimeType);
+      if (!mimeType) throw notDispatched('unsupported_export_type', 'Workspace file type cannot be exported', 415);
+      const bytes = await beforeEffect('workspace_read_failed', 503, () => readStableWorkspaceExport(target, maxExportBytes, root));
+      await beforeEffect('invalid_export', 400, () => validateWorkspaceExport(bytes, name, mimeType));
       const sha256 = hash(bytes);
-      context.signal.throwIfAborted();
+      assertNotCancelledBeforeEffect(context.signal);
       if (options.exportArtifact) {
         const exported = await options.exportArtifact({
           ownerId: context.principal.id,
@@ -450,14 +464,14 @@ export async function createWorkspaceTools(options: WorkspaceToolOptions = {}): 
         previous = await readFile(target);
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'ENOENT') throw error;
+        if (code !== 'ENOENT') throw asNotDispatched(error, 'workspace_read_failed', 503);
       }
       const previousHash = previous ? hash(previous) : undefined;
       if (previous && expectedHash === undefined) {
-        throw new DomainError('hash_required', 'expectedHash is required when replacing an existing file', 409);
+        throw notDispatched('hash_required', 'expectedHash is required when replacing an existing file', 409);
       }
       if (previousHash !== expectedHash && (previous !== undefined || expectedHash !== undefined)) {
-        throw new DomainError('write_conflict', 'File changed since it was read (hash conflict)', 409);
+        throw notDispatched('write_conflict', 'File changed since it was read (hash conflict)', 409);
       }
       const writtenHash = hash(content);
       const restoreToken = randomBytes(32).toString('base64url');
@@ -477,10 +491,10 @@ export async function createWorkspaceTools(options: WorkspaceToolOptions = {}): 
         createdAt: new Date().toISOString(),
       };
       const checkpointPath = path.join(checkpointRoot, `${checkpointId}.json`);
-      context.signal.throwIfAborted();
-      await writeFile(checkpointPath, JSON.stringify(checkpoint), { flag: 'wx', mode: 0o600 });
+      assertNotCancelledBeforeEffect(context.signal);
+      await beforeEffect('checkpoint_write_failed', 503, () => writeFile(checkpointPath, JSON.stringify(checkpoint), { flag: 'wx', mode: 0o600 }));
       try {
-        context.signal.throwIfAborted();
+        assertNotCancelledBeforeEffect(context.signal);
         await atomicWrite(target, content);
       } catch (error) {
         await rm(checkpointPath, { force: true });
@@ -513,36 +527,36 @@ export async function createWorkspaceTools(options: WorkspaceToolOptions = {}): 
     async execute(input, context) {
       const workspace = requireWorkspace(context, WRITE_CAPABILITY);
       const root = await existingWorkspaceRoot(workspace);
-      const parsed = parseWorkspacePatch(stringInput(input, 'patch')!, { maxBytes: maxPatchBytes });
+      const parsed = await beforeEffect('invalid_patch', 400, () => parseWorkspacePatch(stringInput(input, 'patch')!, { maxBytes: maxPatchBytes }));
       const target = await resolveForWrite(root, parsed.path);
       const details = await stat(target).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === 'ENOENT') throw new DomainError('path_not_found', 'Workspace path was not found', 404);
-        throw error;
+        if (error.code === 'ENOENT') throw notDispatched('path_not_found', 'Workspace path was not found', 404);
+        throw asNotDispatched(error, 'workspace_read_failed', 503);
       });
-      if (!details.isFile()) throw new DomainError('not_a_file', 'Workspace path is not a file');
-      if (details.size > maxReadBytes) throw new DomainError('file_too_large', `File exceeds ${maxReadBytes} bytes`, 413);
+      if (!details.isFile()) throw notDispatched('not_a_file', 'Workspace path is not a file');
+      if (details.size > maxReadBytes) throw notDispatched('file_too_large', `File exceeds ${maxReadBytes} bytes`, 413);
       const expectedHash = stringInput(input, 'expectedHash')!;
       if (!/^[0-9a-f]{64}$/.test(expectedHash)) {
-        throw new DomainError('invalid_input', 'expectedHash must be a lowercase SHA-256 hash');
+        throw notDispatched('invalid_input', 'expectedHash must be a lowercase SHA-256 hash');
       }
-      const previous = await readFile(target);
+      const previous = await beforeEffect('workspace_read_failed', 503, () => readFile(target));
       const previousHash = hash(previous);
       if (previousHash !== expectedHash) {
-        throw new DomainError('write_conflict', 'File changed since it was read (hash conflict)', 409);
+        throw notDispatched('write_conflict', 'File changed since it was read (hash conflict)', 409);
       }
       let previousText: string;
       try {
         previousText = new TextDecoder('utf-8', { fatal: true }).decode(previous);
       } catch {
-        throw new DomainError('binary_file', 'Only valid UTF-8 text files can be patched.');
+        throw notDispatched('binary_file', 'Only valid UTF-8 text files can be patched.');
       }
-      const content = applyWorkspacePatch(previousText, parsed);
+      const content = await beforeEffect('invalid_patch', 400, () => applyWorkspacePatch(previousText, parsed));
       const writtenHash = hash(content);
-      if (writtenHash === previousHash) throw new DomainError('no_change', 'Patch does not change the file.', 409);
+      if (writtenHash === previousHash) throw notDispatched('no_change', 'Patch does not change the file.', 409);
       const restoreToken = randomBytes(32).toString('base64url');
-      const current = await readFile(target);
+      const current = await beforeEffect('workspace_read_failed', 503, () => readFile(target));
       if (hash(current) !== previousHash) {
-        throw new DomainError('write_conflict', 'File changed while the patch was prepared (hash conflict)', 409);
+        throw notDispatched('write_conflict', 'File changed while the patch was prepared (hash conflict)', 409);
       }
       const checkpointId = randomUUID();
       const checkpoint: Checkpoint = {
@@ -560,10 +574,10 @@ export async function createWorkspaceTools(options: WorkspaceToolOptions = {}): 
         createdAt: new Date().toISOString(),
       };
       const checkpointPath = path.join(checkpointRoot, `${checkpointId}.json`);
-      context.signal.throwIfAborted();
-      await writeFile(checkpointPath, JSON.stringify(checkpoint), { flag: 'wx', mode: 0o600 });
+      assertNotCancelledBeforeEffect(context.signal);
+      await beforeEffect('checkpoint_write_failed', 503, () => writeFile(checkpointPath, JSON.stringify(checkpoint), { flag: 'wx', mode: 0o600 }));
       try {
-        context.signal.throwIfAborted();
+        assertNotCancelledBeforeEffect(context.signal);
         await atomicWrite(target, content);
       } catch (error) {
         await rm(checkpointPath, { force: true });
@@ -614,31 +628,30 @@ export async function createWorkspaceTools(options: WorkspaceToolOptions = {}): 
       const workspace = requireWorkspace(context, WRITE_CAPABILITY);
       const root = await existingWorkspaceRoot(workspace);
       const checkpointId = stringInput(input, 'checkpointId')!;
-      if (!/^[0-9a-f-]{36}$/i.test(checkpointId)) throw new DomainError('invalid_input', 'Invalid checkpointId');
+      if (!/^[0-9a-f-]{36}$/i.test(checkpointId)) throw notDispatched('invalid_input', 'Invalid checkpointId');
       const checkpointPath = path.join(checkpointRoot, `${checkpointId}.json`);
       const resolvedCheckpoint = path.resolve(checkpointPath);
-      if (!isWithin(checkpointRoot, resolvedCheckpoint)) throw new DomainError('invalid_input', 'Invalid checkpointId');
-      const checkpoint = JSON.parse(await readFile(resolvedCheckpoint, 'utf8').catch(() => {
-        throw new DomainError('checkpoint_not_found', 'Checkpoint was not found', 404);
-      })) as Checkpoint;
-      if (checkpoint.principalId !== context.principal.id) throw new DomainError('checkpoint_forbidden', 'Checkpoint belongs to another principal', 403);
+      if (!isWithin(checkpointRoot, resolvedCheckpoint)) throw notDispatched('invalid_input', 'Invalid checkpointId');
+      const checkpoint = await beforeEffect('checkpoint_not_found', 404, async () => JSON.parse(await readFile(resolvedCheckpoint, 'utf8').catch(() => {
+        throw notDispatched('checkpoint_not_found', 'Checkpoint was not found', 404);
+      })) as Checkpoint);
+      if (checkpoint.principalId !== context.principal.id) throw notDispatched('checkpoint_forbidden', 'Checkpoint belongs to another principal', 403);
       const restoreToken = stringInput(input, 'restoreToken', false);
       if (checkpoint.taskId !== context.taskId && !validRestoreToken(checkpoint, restoreToken)) {
-        throw new DomainError('checkpoint_forbidden', 'A valid restore token is required outside the creating task', 403);
+        throw notDispatched('checkpoint_forbidden', 'A valid restore token is required outside the creating task', 403);
       }
       if (checkpoint.workspaceId !== workspace.id || checkpoint.workspaceRoot !== root) {
-        throw new DomainError('checkpoint_forbidden', 'Checkpoint belongs to another workspace', 403);
+        throw notDispatched('checkpoint_forbidden', 'Checkpoint belongs to another workspace', 403);
       }
       const target = await resolveForWrite(root, checkpoint.relativePath);
       const current = await readFile(target).catch(() => undefined);
       if (!current || hash(current) !== checkpoint.writtenHash) {
-        throw new DomainError('restore_conflict', 'File changed after this checkpoint (restore conflict)', 409);
+        throw notDispatched('restore_conflict', 'File changed after this checkpoint (restore conflict)', 409);
       }
+      assertNotCancelledBeforeEffect(context.signal);
       if (checkpoint.previousExists) {
-        context.signal.throwIfAborted();
         await atomicWrite(target, Buffer.from(checkpoint.previousContent ?? '', 'base64'));
       } else {
-        context.signal.throwIfAborted();
         await rm(target);
       }
       await rm(resolvedCheckpoint);

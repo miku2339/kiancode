@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
+import { isNotDispatched } from '../src/contracts.js';
 import { McpToolProvider } from '../src/tools/mcp.js';
 
 test('MCP stdio tools map schemas, progress, and results through ToolDefinition', async () => {
@@ -43,7 +44,7 @@ await server.connect(new StdioServerTransport());
     };
     await assert.rejects(
       echo.execute({ value: 42 }, context),
-      (error: unknown) => error instanceof Error && 'code' in error && error.code === 'invalid_tool_input',
+      (error: unknown) => isNotDispatched(error) && error.code === 'invalid_tool_input',
     );
     const result = JSON.parse((await echo.execute({ value: 'hello' }, context)).content) as { content: Array<{ text: string }>; progress: Array<{ message?: string }> };
     assert.equal(result.content[0]?.text, 'hello');

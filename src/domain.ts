@@ -44,7 +44,7 @@ export interface TaskOrchestration {
   verification: 'pending' | 'passed';
 }
 
-export interface PendingAction { hash: string; tool: string; input: Record<string, unknown> }
+export interface PendingAction { hash: string; tool: string; input: Record<string, unknown>; toolOccurrenceId?: string }
 
 export interface Task {
   conversationId: string;

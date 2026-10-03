@@ -2,7 +2,7 @@ import { constants as fsConstants } from 'node:fs';
 import { access } from 'node:fs/promises';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { requireScope } from '../auth.js';
-import { DomainError, type ToolContext, type ToolDefinition, type ToolSpecification } from '../contracts.js';
+import { asNotDispatched, DomainError, notDispatched, type ToolContext, type ToolDefinition, type ToolSpecification } from '../contracts.js';
 
 export interface BrowserToolOptions {
   permission: 'configured';
@@ -28,7 +28,7 @@ function schema(properties: Record<string, unknown>, required: string[] = []): R
 
 function stringInput(input: Record<string, unknown>, key: string): string {
   const value = input[key];
-  if (typeof value !== 'string' || value.length === 0) throw new DomainError('invalid_input', `${key} must be a non-empty string`);
+  if (typeof value !== 'string' || value.length === 0) throw notDispatched('invalid_input', `${key} must be a non-empty string`);
   return value;
 }
 
@@ -124,19 +124,26 @@ export class BrowserToolProvider {
   }
 
   private async currentPage(): Promise<Page> {
-    if (!this.page || this.page.isClosed()) this.page = await this.browserContext.newPage();
+    if (!this.page || this.page.isClosed()) {
+      this.page = await this.browserContext.newPage().catch((error: unknown) => {
+        throw asNotDispatched(error, 'browser_unavailable', 503);
+      });
+    }
     return this.page;
   }
 
-  private allowedUrl(raw: string): URL {
+  private allowedUrl(raw: string, stage: 'requested' | 'resulting'): URL {
+    const refuse = (code: string, message: string, statusCode: number): DomainError => stage === 'requested'
+      ? notDispatched(code, message, statusCode)
+      : new DomainError(code, message, statusCode);
     let url: URL;
     try {
       url = new URL(raw);
     } catch {
-      throw new DomainError('invalid_input', 'url must be an absolute HTTP or HTTPS URL');
+      throw refuse('invalid_input', 'url must be an absolute HTTP or HTTPS URL', 400);
     }
     if (!['http:', 'https:'].includes(url.protocol) || !this.origins.has(url.origin)) {
-      throw new DomainError('browser_origin_forbidden', 'URL origin is not configured for this browser', 403);
+      throw refuse('browser_origin_forbidden', 'URL origin is not configured for this browser', 403);
     }
     return url;
   }
@@ -148,7 +155,7 @@ export class BrowserToolProvider {
   }
 
   private async action<T>(context: ToolContext, operation: () => Promise<T>): Promise<T> {
-    if (context.signal.aborted) throw new DomainError('browser_aborted', 'Browser action was cancelled', 499);
+    if (context.signal.aborted) throw notDispatched('browser_aborted', 'Browser action was cancelled', 499);
     const abort = (): void => { void this.page?.close(); };
     context.signal.addEventListener('abort', abort, { once: true });
     try {
@@ -166,10 +173,10 @@ export class BrowserToolProvider {
       ...browserToolSpecifications[0],
       execute: async (input, context) => {
         requireCapability(context);
-        const url = this.allowedUrl(stringInput(input, 'url'));
+        const url = this.allowedUrl(stringInput(input, 'url'), 'requested');
         const page = await this.currentPage();
         const response = await this.action(context, () => page.goto(url.href, { waitUntil: 'domcontentloaded', timeout: 30_000 }));
-        const finalUrl = this.allowedUrl(page.url());
+        const finalUrl = this.allowedUrl(page.url(), 'resulting');
         return { content: JSON.stringify({ url: finalUrl.href, title: await page.title(), status: response?.status() ?? null }) };
       },
     };
@@ -179,7 +186,7 @@ export class BrowserToolProvider {
       execute: async (_input, context) => {
         requireCapability(context);
         const page = await this.currentPage();
-        if (page.url() !== 'about:blank') this.allowedUrl(page.url());
+        if (page.url() !== 'about:blank') this.allowedUrl(page.url(), 'resulting');
         const maximum = this.options.maxSnapshotCharacters ?? 100_000;
         const visibleText = (await this.action(context, () => page.locator('body').innerText())).slice(0, maximum);
         const accessibility = (await this.action(context, () => page.locator('body').ariaSnapshot())).slice(0, maximum);
@@ -191,10 +198,11 @@ export class BrowserToolProvider {
       ...browserToolSpecifications[2],
       execute: async (input, context) => {
         requireCapability(context);
+        const selector = stringInput(input, 'selector');
         const page = await this.currentPage();
-        await this.action(context, () => page.locator(stringInput(input, 'selector')).click({ timeout: 15_000 }));
+        await this.action(context, () => page.locator(selector).click({ timeout: 15_000 }));
         await this.closeExtraPages();
-        if (page.url() !== 'about:blank') this.allowedUrl(page.url());
+        if (page.url() !== 'about:blank') this.allowedUrl(page.url(), 'resulting');
         return { content: JSON.stringify({ clicked: true, url: page.url() }) };
       },
     };
@@ -203,9 +211,11 @@ export class BrowserToolProvider {
       ...browserToolSpecifications[3],
       execute: async (input, context) => {
         requireCapability(context);
+        const selector = stringInput(input, 'selector');
+        const value = input.value;
+        if (typeof value !== 'string') throw notDispatched('invalid_input', 'value must be a string');
         const page = await this.currentPage();
-        if (typeof input.value !== 'string') throw new DomainError('invalid_input', 'value must be a string');
-        await this.action(context, () => page.locator(stringInput(input, 'selector')).fill(input.value as string, { timeout: 15_000 }));
+        await this.action(context, () => page.locator(selector).fill(value, { timeout: 15_000 }));
         return { content: JSON.stringify({ filled: true, url: page.url() }) };
       },
     };

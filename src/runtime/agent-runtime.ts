@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { DomainError, type ToolDefinition, type ToolResult } from '../contracts.js';
+import { createHash, randomUUID } from 'node:crypto';
+import { DomainError, isNotDispatched, type ToolDefinition, type ToolResult } from '../contracts.js';
 import type {
   ChatMessage,
   ChatRequest,
@@ -292,8 +292,9 @@ export class AgentRuntime {
       if (budgetViolation) {
         throw new DomainError('budget_violation', 'Provider reported usage beyond the reserved token budget.', 409);
       }
-      messages.push(response.message);
-      if (!response.message.toolCalls?.length) {
+      const responseMessage = normalizeProviderMessage(response.message);
+      messages.push(responseMessage);
+      if (!responseMessage.toolCalls?.length) {
         if (input.mode === 'act' && unresolvedFailures.size > 0) {
           const tools = [...new Set([...unresolvedFailures.values()].map((failure) => failure.tool))];
           throw new DomainError(
@@ -304,7 +305,7 @@ export class AgentRuntime {
         }
         const result: RunResult = {
           status: 'completed',
-          content: response.message.content,
+          content: responseMessage.content,
           modelId: model.id,
           usage,
           strategy: options.strategy,
@@ -316,7 +317,7 @@ export class AgentRuntime {
         return result;
       }
       const batch = await this.executeToolCalls(
-        response.message.toolCalls, messages, input, signal, modelTools, consumedActionHashes, unresolvedFailures,
+        responseMessage.toolCalls, messages, input, signal, modelTools, consumedActionHashes, unresolvedFailures,
       );
       if (batch.pendingActions) {
         return this.waitingResult(model, usage, options.strategy, messages, batch.pendingActions);
@@ -342,12 +343,18 @@ export class AgentRuntime {
         actionHash: actionHash(input.principal.id, input.taskId, originalToolCall),
       };
       this.assertNotAborted(signal);
-      await input.onEvent?.({ type: 'tool_call', taskId: input.taskId, toolCall });
+      await input.onEvent?.({
+        type: 'tool_call',
+        taskId: input.taskId,
+        toolCall,
+        ...(toolCall.occurrenceId ? { toolOccurrenceId: toolCall.occurrenceId } : {}),
+      });
       const tool = allowedTools.find((candidate) => candidate.name === toolCall.name);
       let content: string;
       let isError = false;
       let outcome: 'confirmed' | 'failed' | 'unknown' | 'not_replayed' = 'failed';
       let result: ToolResult | undefined;
+      let neverDispatched = false;
       if (!tool || !allowedTools.includes(tool)) {
         content = `Tool ${toolCall.name} is unavailable in ${input.mode} mode.`;
         isError = true;
@@ -360,11 +367,13 @@ export class AgentRuntime {
           type: 'approval_required',
           taskId: input.taskId,
           toolCall,
+          ...(toolCall.occurrenceId ? { toolOccurrenceId: toolCall.occurrenceId } : {}),
           ...(toolCall.actionHash ? { actionHash: toolCall.actionHash } : {}),
         });
         return {
           pendingActions: [{
             toolCallId: toolCall.id,
+            ...(toolCall.occurrenceId ? { toolOccurrenceId: toolCall.occurrenceId } : {}),
             toolName: toolCall.name,
             input: toolCall.arguments,
             ...(toolCall.actionHash ? { actionHash: toolCall.actionHash } : {}),
@@ -375,14 +384,18 @@ export class AgentRuntime {
         isError = true;
         outcome = 'not_replayed';
       } else {
+        let dispatched = false;
         const execute = async (): Promise<ToolResult> => {
           await input.onEvent?.({
             type: 'tool_dispatched',
             taskId: input.taskId,
             toolCall,
+            ...(toolCall.occurrenceId ? { toolOccurrenceId: toolCall.occurrenceId } : {}),
             actionHash: toolCall.actionHash!,
             sideEffect: tool.sideEffect,
+            checkpointMessages: [...messages],
           });
+          dispatched = true;
           return tool.execute(toolCall.arguments, {
               principal: input.principal,
               ...(input.workspace ? { workspace: input.workspace } : {}),
@@ -404,15 +417,32 @@ export class AgentRuntime {
             consumedActionHashes.add(toolCall.actionHash!);
           }
         } catch (error) {
-          if (error instanceof DomainError && error.code === 'waiting_for_device') {
+          if (!dispatched) {
             throw error;
           }
-          if (tool.sideEffect === 'external'
-            || (error instanceof DomainError && error.code === 'outcome_unknown')) {
+          if (error instanceof DomainError && error.code === 'waiting_for_device') {
+            if (tool.sideEffect !== 'read') {
+              await input.onEvent?.({
+                type: 'tool_result',
+                taskId: input.taskId,
+                toolCallId: toolCall.id,
+                ...(toolCall.occurrenceId ? { toolOccurrenceId: toolCall.occurrenceId } : {}),
+                isError: true,
+                outcome: 'failed',
+                notDispatched: true,
+                actionHash: toolCall.actionHash,
+                sideEffect: tool.sideEffect,
+              });
+            }
+            throw error;
+          }
+          if (!isNotDispatched(error)
+            && (tool.sideEffect === 'write' || tool.sideEffect === 'external')) {
             await input.onEvent?.({
               type: 'tool_result',
               taskId: input.taskId,
               toolCallId: toolCall.id,
+              ...(toolCall.occurrenceId ? { toolOccurrenceId: toolCall.occurrenceId } : {}),
               isError: true,
               outcome: 'unknown',
               actionHash: toolCall.actionHash,
@@ -420,7 +450,7 @@ export class AgentRuntime {
             });
             throw new DomainError(
               'outcome_unknown',
-              'External action was dispatched but its result was not confirmed. Verify the outcome before retrying.',
+              'A side-effecting action was dispatched but its result was not confirmed. Verify the outcome before retrying.',
               409,
             );
           }
@@ -430,6 +460,7 @@ export class AgentRuntime {
           content = `Tool error: ${error instanceof Error ? error.message : String(error)}`;
           isError = true;
           outcome = 'failed';
+          neverDispatched = isNotDispatched(error);
         }
       }
       messages.push({
@@ -437,6 +468,7 @@ export class AgentRuntime {
         content,
         name: toolCall.name,
         toolCallId: toolCall.id,
+        ...(toolCall.occurrenceId ? { toolOccurrenceId: toolCall.occurrenceId } : {}),
         actionHash: toolCall.actionHash,
         toolOutcome: outcome,
       });
@@ -452,8 +484,10 @@ export class AgentRuntime {
         type: 'tool_result',
         taskId: input.taskId,
         toolCallId: toolCall.id,
+        ...(toolCall.occurrenceId ? { toolOccurrenceId: toolCall.occurrenceId } : {}),
         isError,
         outcome,
+        ...(neverDispatched ? { notDispatched: true } : {}),
         actionHash: toolCall.actionHash,
         ...(tool ? { sideEffect: tool.sideEffect } : {}),
         ...(result ? { result } : {}),
@@ -648,16 +682,27 @@ class BudgetLedger {
 }
 
 function pendingToolCalls(messages: ChatMessage[]): ToolCall[] {
-  const completed = new Set(messages
-    .filter((message) => message.role === 'tool' && message.toolCallId)
-    .map((message) => message.toolCallId));
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message?.role === 'assistant' && message.toolCalls?.length) {
-      return message.toolCalls.filter((call) => !completed.has(call.id));
+      const receipts = messages.slice(index + 1).filter((candidate) => candidate.role === 'tool');
+      return message.toolCalls.filter((call) => !receipts.some((receipt) => call.occurrenceId
+        ? receipt.toolOccurrenceId === call.occurrenceId
+        : receipt.toolCallId === call.id));
     }
   }
   return [];
+}
+
+function normalizeProviderMessage(message: ChatMessage): ChatMessage {
+  if (!message.toolCalls?.length) return message;
+  return {
+    ...message,
+    toolCalls: message.toolCalls.map(({ actionHash: _actionHash, occurrenceId: _occurrenceId, ...call }) => ({
+      ...call,
+      occurrenceId: randomUUID(),
+    })),
+  };
 }
 
 function stableJson(value: unknown): string {
@@ -690,12 +735,14 @@ function unresolvedActionFailures(
   messages: ChatMessage[],
   tools: Map<string, ToolDefinition>,
 ): Map<string, ActionFailure> {
-  const calls = new Map<string, ToolCall>();
   const failures = new Map<string, ActionFailure>();
+  let currentCalls: ToolCall[] = [];
   for (const message of messages) {
-    for (const call of message.toolCalls ?? []) calls.set(call.id, call);
+    if (message.role === 'assistant') currentCalls = message.toolCalls ?? [];
     if (message.role !== 'tool' || !message.toolCallId || !message.name) continue;
-    const call = calls.get(message.toolCallId) ?? {
+    const call = (message.toolOccurrenceId
+      ? currentCalls.find((candidate) => candidate.occurrenceId === message.toolOccurrenceId)
+      : currentCalls.find((candidate) => candidate.id === message.toolCallId)) ?? {
       id: message.toolCallId,
       name: message.name,
       arguments: {},
@@ -714,7 +761,7 @@ function unresolvedActionFailures(
 
 function actionHash(principalId: string, taskId: string, toolCall: ToolCall): string {
   return createHash('sha256')
-    .update(`${principalId}\0${taskId}\0${toolCall.id}\0${toolCall.name}\0${stableJson(toolCall.arguments)}`)
+    .update(`${principalId}\0${taskId}\0${toolCall.occurrenceId ?? toolCall.id}\0${toolCall.name}\0${stableJson(toolCall.arguments)}`)
     .digest('hex');
 }
 

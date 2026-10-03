@@ -53,9 +53,35 @@ export interface ToolDefinition {
 
 export type ToolSpecification = Omit<ToolDefinition, 'execute'>;
 
+export interface DomainErrorOptions {
+  notDispatched?: boolean;
+}
+
 export class DomainError extends Error {
-  constructor(public code: string, message: string, public statusCode = 400) {
+  public readonly notDispatched: boolean;
+
+  constructor(public code: string, message: string, public statusCode = 400, options: DomainErrorOptions = {}) {
     super(message);
     this.name = 'DomainError';
+    this.notDispatched = options.notDispatched === true;
   }
+}
+
+export function notDispatched(code: string, message: string, statusCode = 400): DomainError {
+  return new DomainError(code, message, statusCode, { notDispatched: true });
+}
+
+export function asNotDispatched(error: unknown, code: string, statusCode = 400): DomainError {
+  if (error instanceof DomainError) {
+    return error.notDispatched
+      ? error
+      : new DomainError(error.code, error.message, error.statusCode, { notDispatched: true });
+  }
+  return new DomainError(code, error instanceof Error ? error.message : String(error), statusCode, {
+    notDispatched: true,
+  });
+}
+
+export function isNotDispatched(error: unknown): error is DomainError {
+  return error instanceof DomainError && error.notDispatched;
 }

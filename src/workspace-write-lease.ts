@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { DomainError, type ToolContext, type ToolDefinition } from './contracts.js';
+import { asNotDispatched, DomainError, isNotDispatched, notDispatched, type ToolContext, type ToolDefinition } from './contracts.js';
 import type { Entity, Store } from './storage/store.js';
 
 export interface WorkspaceWriteLease {
@@ -40,7 +40,7 @@ export class WorkspaceWriteLeaseService {
           try { await this.store.put('workspace_write_lease', id, ownerId, { ...row.data, state: 'unknown' }, row.revision); }
           catch (error) { if (!(error instanceof DomainError && error.code === 'conflict')) throw error; }
         }
-        throw new DomainError('outcome_unknown', 'Previous workspace writer must be verified before another write', 409);
+        throw notDispatched('workspace_writer_unverified', 'Previous workspace writer must be verified before another write', 409);
       }
       if (row?.data.state === 'active') {
         await delay(100, undefined, { signal: context.signal });
@@ -101,7 +101,9 @@ export class WorkspaceWriteLeaseService {
   wrap(tool: ToolDefinition): ToolDefinition {
     if (!tool.requiresWorkspace || tool.sideEffect === 'read') return tool;
     return { ...tool, execute: async (input, context) => {
-      const lease = await this.acquire(context);
+      const lease = await this.acquire(context).catch((error: unknown) => {
+        throw asNotDispatched(error, 'workspace_lease_unavailable', 409);
+      });
       const controller = new AbortController();
       const signal = AbortSignal.any([context.signal, controller.signal]);
       let renewal = Promise.resolve();
@@ -120,14 +122,10 @@ export class WorkspaceWriteLeaseService {
         return result;
       } catch (error) {
         clearInterval(timer); await renewal;
-        const notDispatched = !started || (error instanceof DomainError && [
-          'waiting_for_device', 'device_not_dispatched', 'device_revoked', 'workspace_denied', 'forbidden', 'workspace_required', 'capability_required',
-          'hash_required', 'write_conflict', 'restore_conflict', 'invalid_input', 'path_not_found', 'not_a_file', 'file_too_large', 'binary_file', 'no_change',
-          'checkpoint_not_found', 'checkpoint_forbidden', 'terminal_sandbox_required', 'shell_not_allowed',
-          'path_outside_workspace', 'workspace_unavailable', 'invalid_patch', 'patch_ambiguous', 'patch_context_not_found', 'patch_too_large', 'unsupported_line_endings',
-        ].includes(error.code));
-        await this.update(context, lease, notDispatched ? 'released' : 'unknown');
-        throw error;
+        const untouched = !started || isNotDispatched(error)
+          || (error instanceof DomainError && error.code === 'waiting_for_device');
+        await this.update(context, lease, untouched ? 'released' : 'unknown');
+        throw started ? error : asNotDispatched(error, 'workspace_lease_unavailable', 409);
       } finally { clearInterval(timer); }
     } };
   }

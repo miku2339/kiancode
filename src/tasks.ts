@@ -657,7 +657,7 @@ export class TaskService {
           usage: runtimeEvent.usage,
         }));
       }
-      if (runtimeEvent.type === 'tool_result' && Array.isArray(runtimeEvent.checkpointMessages)) {
+      if (Array.isArray(runtimeEvent.checkpointMessages)) {
         await this.change(task.ownerId, task.id, (current) => ({
           ...current,
           runtimeMessages: runtimeEvent.checkpointMessages as unknown[],
@@ -910,12 +910,13 @@ export class TaskService {
       const payload = row.data.payload as {
         type?: string;
         toolCallId?: string;
+        toolOccurrenceId?: string;
         actionHash?: string;
         sideEffect?: string;
         outcome?: string;
         toolCall?: { id?: string };
       };
-      const key = payload.actionHash ?? payload.toolCallId ?? payload.toolCall?.id;
+      const key = payload.toolOccurrenceId ?? payload.actionHash ?? payload.toolCallId ?? payload.toolCall?.id;
       if (!key) {
         continue;
       }
