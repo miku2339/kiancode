@@ -81,7 +81,13 @@ interface ParentPlanClaim {
 interface PreparedChildren {
   parentConversation: Entity<Conversation>;
   depth: number;
-  children: Array<{ spec: ChildSpec; principal: Principal; grantExpiresAt: string }>;
+  children: Array<{
+    spec: ChildSpec;
+    principal: Principal;
+    grantExpiresAt: string;
+    authorizationKind?: Task['authorizationKind'];
+    automationSource?: Task['automationSource'];
+  }>;
 }
 
 interface ConfirmedAction {
@@ -584,7 +590,13 @@ export class AgentCoordinator {
       if (!Number.isFinite(requestedExpiry) || requestedExpiry > parentExpiry) {
         throw new DomainError('grant_expansion', 'Child grant cannot outlive its parent', 403);
       }
-      children.push({ spec, principal, grantExpiresAt: new Date(requestedExpiry).toISOString() });
+      children.push({
+        spec,
+        principal,
+        grantExpiresAt: new Date(requestedExpiry).toISOString(),
+        authorizationKind: parent.data.authorizationKind,
+        automationSource: parent.data.automationSource,
+      });
     }
     return { parentConversation, depth, children };
   }
@@ -597,7 +609,7 @@ export class AgentCoordinator {
   ): Promise<Entity<OrchestrationPlan>> {
     await this.reserveSlots(parent.ownerId, plan.id, plan.data.childIds);
     for (let index = 0; index < prepared.children.length; index += 1) {
-      const { spec, principal, grantExpiresAt } = prepared.children[index]!;
+      const { spec, principal, grantExpiresAt, authorizationKind, automationSource } = prepared.children[index]!;
       const childId = plan.data.childIds[index]!;
       const conversationId = `${childId}:conversation`;
       await this.createOnce<Conversation>('conversation', conversationId, parent.ownerId, {
@@ -646,6 +658,8 @@ export class AgentCoordinator {
         approvedActionHashes: [],
         attachmentIds: parent.data.attachmentIds,
         pluginVersions: parent.data.pluginVersions,
+        ...(authorizationKind ? { authorizationKind } : {}),
+        ...(automationSource ? { automationSource } : {}),
         orchestration,
       });
     }
@@ -756,6 +770,8 @@ export class AgentCoordinator {
         principal: data.principal,
         grantExpiresAt: data.grantExpiresAt,
         pluginVersions: data.pluginVersions,
+        authorizationKind: data.authorizationKind,
+        automationSource: data.automationSource,
         orchestration: data.orchestration,
       };
       const actual = {
@@ -764,6 +780,8 @@ export class AgentCoordinator {
         principal: existing.data.principal,
         grantExpiresAt: existing.data.grantExpiresAt,
         pluginVersions: existing.data.pluginVersions,
+        authorizationKind: existing.data.authorizationKind,
+        automationSource: existing.data.automationSource,
         orchestration: existing.data.orchestration,
       };
       if (canonical(actual) !== canonical(expected)) {

@@ -520,6 +520,40 @@ test('MoA is capped at three durable candidates and claims exactly one parent ag
   }
 });
 
+test('automation authorization context is inherited by children and checked during idempotent recovery', async () => {
+  const store = new SqliteStore();
+  const durable = { ...principal };
+  delete durable.expiresAt;
+  const service = new TaskService(store, async () => ({ text: 'unused' }));
+  const coordinator = new AgentCoordinator(store);
+  const request = {
+    key: 'automation-child',
+    children: [{ key: 'worker', prompt: 'Continue safely' }],
+    budget: { maxCalls: 3, maxTokens: 30 },
+  };
+  try {
+    const thread = await store.create('conversation', durable.id, conversation());
+    const parent = await service.enqueue(durable, thread.id, 'Coordinate', undefined, [], [], undefined, undefined, {
+      authorizationKind: 'account_automation',
+      automationSource: { type: 'event_trigger', id: 'trigger-1', version: 6 },
+    });
+    let plan = await coordinator.prepare(durable.id, parent.id, request);
+    const child = (await store.get<Task>('task', plan.data.childIds[0]!, durable.id))!;
+    assert.equal(child.data.authorizationKind, 'account_automation');
+    assert.deepEqual(child.data.automationSource, { type: 'event_trigger', id: 'trigger-1', version: 6 });
+
+    await store.put<Task>('task', child.id, durable.id, {
+      ...child.data,
+      automationSource: { type: 'event_trigger', id: 'trigger-1', version: 7 },
+    }, child.revision);
+    plan = await store.put('agent_plan', plan.id, durable.id, { ...plan.data, state: 'preparing' }, plan.revision);
+    await assert.rejects(coordinator.prepare(durable.id, parent.id, request), hasCode('idempotency_conflict'));
+  } finally {
+    await service.close();
+    await store.close();
+  }
+});
+
 function hasCode(code: string): (error: unknown) => boolean {
   return (error) => error instanceof Error && 'code' in error && error.code === code;
 }

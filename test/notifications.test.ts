@@ -363,3 +363,46 @@ test('concurrent task reconciliation retains one occurrence despite different me
     await store.close();
   }
 });
+
+test('trigger authorization failures notify once with neutral wording and legacy schedule copy remains compatible', async () => {
+  const store = new SqliteStore();
+  const failedAt = '2026-09-27T07:59:00.000Z';
+  const notifications = new NotificationService(store);
+  try {
+    await store.create('event_trigger', 'alice', {
+      enabled: false,
+      version: 4,
+      authorizationFailedAt: failedAt,
+      authorizationFailedVersion: 4,
+      settings: { notification: { type: 'in_app' } },
+    }, 'trigger-1');
+    await notifications.reconcile();
+    await notifications.reconcile();
+    const triggerRows = await store.scan<Notification>('notification', 'alice');
+    assert.equal(triggerRows.length, 1);
+    assert.equal(triggerRows[0]?.data.eventTriggerId, 'trigger-1');
+    assert.equal(triggerRows[0]?.data.scheduleId, undefined);
+    assert.equal(triggerRows[0]?.data.title, '自動化已暫停');
+    assert.equal(triggerRows[0]?.data.dedupeKey, 'event-trigger:trigger-1:authorization:4');
+
+    await store.create('automation_schedule', 'alice', {
+      enabled: false,
+      authorizationFailedAt: failedAt,
+      settings: { notification: { type: 'in_app' } },
+    }, 'legacy-schedule');
+    const legacy = (await notifications.publishTask('alice', {
+      type: 'schedule_authorization_failed',
+      dedupeKey: `schedule:legacy-schedule:authorization:${failedAt}`,
+      scheduleId: 'legacy-schedule',
+      title: '排程已暫停',
+      body: '排程授權已失效，請重新登入後啟用。',
+    }, new Date(failedAt), { type: 'in_app' }))!;
+    await notifications.reconcile();
+    assert.deepEqual(
+      (await store.get<Notification>('notification', legacy.id, 'alice'))?.data,
+      legacy.data,
+    );
+  } finally {
+    await store.close();
+  }
+});

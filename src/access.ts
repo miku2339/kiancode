@@ -1,4 +1,5 @@
-import { requireOwner, requireScope, scopeAllows, secureAccountApiOrigin } from './auth.js';
+import { createHash } from 'node:crypto';
+import { canonicalAccountIssuer, requireOwner, requireScope, scopeAllows, secureAccountApiOrigin } from './auth.js';
 import { DomainError, type Principal } from './contracts.js';
 import type { Store } from './storage/store.js';
 
@@ -33,6 +34,7 @@ function intersectScopes(record: readonly string[], ceiling: readonly string[]):
 
 export class AccessService {
   private accountApiOrigin?: string;
+  private identityBinding?: { expectedIssuer: string; expectedAudience: string };
 
   constructor(
     private store: Store,
@@ -42,9 +44,19 @@ export class AccessService {
     accountApiUrl?: string,
     private fetcher: typeof fetch = fetch,
     private levelCeilings: LevelCeilings = {},
+    identityBinding?: { expectedIssuer: string; expectedAudience: string },
   ) {
     if (ownerSubject && (ownerSubject.length > 255 || ownerSubject.includes('\0'))) throw new Error('The Kian owner subject is invalid');
     this.accountApiOrigin = accountApiUrl ? secureAccountApiOrigin(accountApiUrl) : undefined;
+    this.identityBinding = identityBinding ? {
+      expectedIssuer: canonicalAccountIssuer(identityBinding.expectedIssuer),
+      expectedAudience: identityBinding.expectedAudience,
+    } : undefined;
+  }
+  unattendedAuthorization(): 'durable' | 'unsupported' | undefined {
+    if (this.identityMode === 'account') return 'durable';
+    if (this.identityMode === 'oidc') return 'unsupported';
+    return undefined;
   }
   async authorize(identity: Principal): Promise<Principal> {
     if (this.identityMode === 'development') return identity;
@@ -82,17 +94,58 @@ export class AccessService {
     const expiresAt = principal.expiresAt ? Date.parse(principal.expiresAt) : undefined;
     if ((this.identityMode === 'oidc' && expiresAt === undefined)
       || (expiresAt !== undefined && (!Number.isFinite(expiresAt) || expiresAt <= Date.now()))) return false;
+    if (this.identityMode === 'account') this.validateAccountAutomationIdentity(principal);
     const fresh = await this.authorize(principal);
     if (!principal.scopes.every((scope) => scopeAllows(fresh.scopes, scope))) return false;
     if (!principal.issuer || this.identityMode === 'development') return true;
     if (this.identityMode === 'oidc') return true;
-    if (!this.serviceToken || !principal.subject || !principal.applicationId || principal.credentialVersion === undefined) return false;
-    const response = await this.fetcher(new URL('/api/internal/authorization/check/', this.accountApiOrigin ?? principal.issuer), {
-      method: 'POST', headers: { authorization: `Bearer ${this.serviceToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ subject: principal.subject, applicationId: principal.applicationId, credentialVersion: principal.credentialVersion }), redirect: 'error', signal: AbortSignal.timeout(5000),
-    });
-    if (!response.ok) return false;
-    const result = await response.json() as { success?: boolean; data?: { active?: boolean; credentialVersion?: number } };
+    if (!this.serviceToken) throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
+    let response: Response;
+    try {
+      response = await this.fetcher(new URL('/api/internal/authorization/check/', this.accountApiOrigin ?? principal.issuer), {
+        method: 'POST', headers: { authorization: `Bearer ${this.serviceToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ subject: principal.subject, applicationId: principal.applicationId, credentialVersion: principal.credentialVersion }), redirect: 'error', signal: AbortSignal.timeout(5000),
+      });
+    } catch {
+      throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
+    }
+    if (!response.ok) throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
+    let parsed: unknown;
+    try {
+      parsed = await response.json();
+    } catch {
+      throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
+    }
+    const result = parsed as { success?: boolean; data?: { active?: boolean; credentialVersion?: number } };
+    if (result.success !== true || typeof result.data?.active !== 'boolean'
+      || !Number.isInteger(result.data.credentialVersion)) {
+      throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
+    }
     return result.success === true && result.data?.active === true && result.data.credentialVersion === principal.credentialVersion;
+  }
+
+  private validateAccountAutomationIdentity(principal: Principal): void {
+    const subject = principal.subject;
+    const issuer = principal.issuer;
+    let canonicalIssuer: string | undefined;
+    try {
+      canonicalIssuer = issuer ? canonicalAccountIssuer(issuer) : undefined;
+    } catch {
+      canonicalIssuer = undefined;
+    }
+    const valid = Boolean(subject?.match(/^acct_[0-9a-f]{32}$/)
+      && issuer
+      && issuer === canonicalIssuer
+      && principal.id === createHash('sha256').update(`${issuer}\0${subject}`).digest('hex')
+      && principal.applicationId
+      && principal.audience
+      && Number.isInteger(principal.credentialVersion)
+      && principal.credentialVersion! >= 0
+      && (!this.identityBinding || (issuer === this.identityBinding.expectedIssuer
+        && principal.audience === this.identityBinding.expectedAudience)));
+    if (!valid) throw new DomainError('invalid_automation_identity', 'Automation identity is invalid', 403);
   }
 }

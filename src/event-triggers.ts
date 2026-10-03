@@ -5,6 +5,7 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { DomainError, type Principal, type Workspace } from './contracts.js';
+import { markAutomationAuthorizationFailed } from './automation-authorization.js';
 import type { Conversation, NotificationDestination, Task } from './domain.js';
 import type { AgentProfile } from './runtime/index.js';
 import type { Entity, Store } from './storage/store.js';
@@ -56,6 +57,8 @@ export type EventTrigger = {
   actor: Principal;
   settings: AutomationExecutionSnapshot;
   version: number;
+  authorizationFailedAt?: string;
+  authorizationFailedVersion?: number;
   type: 'webhook';
   filter: WebhookFilter;
   webhook: { id: string; salt: string; secretHash: string };
@@ -66,6 +69,8 @@ export type EventTrigger = {
   actor: Principal;
   settings: AutomationExecutionSnapshot;
   version: number;
+  authorizationFailedAt?: string;
+  authorizationFailedVersion?: number;
   type: 'device_online';
   filter: DeviceOnlineFilter;
 };
@@ -132,9 +137,13 @@ export interface EventTriggerOptions {
   enabled?: boolean;
   now?: () => number;
   claimMs?: number;
+  unattended?: UnattendedAuthorization;
   reauthorize?: (principal: Principal) => Promise<Principal>;
+  onError?: (error: unknown) => void;
   validateDeviceConnection?: (edge: DeviceConnectionEdge) => Promise<ValidatedDeviceConnection>;
 }
+
+export type UnattendedAuthorization = 'durable' | 'unsupported';
 
 export interface AutomationTaskQueue {
   enqueue(
@@ -146,6 +155,7 @@ export interface AutomationTaskQueue {
     dependencyIds?: string[],
     notificationDestination?: NotificationDestination,
     pluginVersions?: Record<string, string>,
+    authorization?: Pick<Task, 'authorizationKind' | 'automationSource'>,
   ): Promise<Entity<Task>>;
 }
 
@@ -179,6 +189,7 @@ const permanentAuthorizationCodes = new Set([
   'forbidden',
   'grant_expired',
   'grant_revoked',
+  'invalid_automation_identity',
   'owner_required',
   'plugin_snapshot_missing',
   'unauthorized',
@@ -265,6 +276,8 @@ export class AutomationDispatcher {
     ownerId: string;
     source: 'event_trigger' | 'schedule';
     sourceId: string;
+    sourceVersion: number;
+    durable?: boolean;
     occurrenceId: string;
     prompt: string;
     actor: Principal;
@@ -286,16 +299,35 @@ export class AutomationDispatcher {
     };
     await createOrVerify(this.store, 'conversation', conversationId, input.ownerId, conversation);
     const requestId = `automation:${input.source}:${input.sourceId}:${input.occurrenceId}`;
-    const task = await this.tasks.enqueue(
-      principal,
-      conversationId,
-      input.prompt,
-      requestId,
-      [],
-      [],
-      input.settings.notification,
-      input.settings.pluginVersions,
-    );
+    let task: Entity<Task>;
+    try {
+      task = await this.tasks.enqueue(
+        principal,
+        conversationId,
+        input.prompt,
+        requestId,
+        [],
+        [],
+        input.settings.notification,
+        input.settings.pluginVersions,
+        ...(input.durable ? [{
+          authorizationKind: 'account_automation',
+          automationSource: { type: input.source, id: input.sourceId, version: input.sourceVersion },
+        } satisfies Pick<Task, 'authorizationKind' | 'automationSource'>] : []),
+      );
+    } catch (error) {
+      if (!input.durable || !(error instanceof DomainError && error.code === 'idempotency_conflict')) throw error;
+      task = await this.tasks.enqueue(
+        principal,
+        conversationId,
+        input.prompt,
+        requestId,
+        [],
+        [],
+        input.settings.notification,
+        input.settings.pluginVersions,
+      );
+    }
     const executionId = digest(`${input.ownerId}\0${input.source}\0${input.sourceId}\0${input.occurrenceId}`);
     const execution: AutomationExecution = {
       source: input.source,
@@ -343,6 +375,19 @@ export class AutomationDispatcher {
   }
 }
 
+export function automationActor(
+  actor: Principal,
+  unattended: UnattendedAuthorization | undefined,
+  enabled = false,
+): Principal {
+  if (unattended === 'unsupported' && enabled) {
+    throw new DomainError('unattended_automation_unsupported', 'Enabled automations require durable account authorization.', 503);
+  }
+  if (unattended !== 'durable') return actor;
+  const { expiresAt: _expiresAt, ...durable } = actor;
+  return durable;
+}
+
 export class EventTriggerService {
   private readonly enabled: boolean;
   private readonly now: () => number;
@@ -368,12 +413,13 @@ export class EventTriggerService {
     if (input.enabled && !this.enabled) {
       throw new DomainError('event_triggers_disabled', 'Event triggers are not enabled on this server.', 503);
     }
+    const storedActor = automationActor(actor, this.options.unattended, input.enabled === true);
     const settings = await this.dispatcher.snapshot(actor.id, input.settings);
     const base = {
       name: input.name.trim(),
       prompt: input.prompt.trim(),
       enabled: input.enabled === true,
-      actor,
+      actor: storedActor,
       settings,
       version: 1,
     };
@@ -415,6 +461,7 @@ export class EventTriggerService {
     if (input.enabled && !this.enabled) {
       throw new DomainError('event_triggers_disabled', 'Event triggers are not enabled on this server.', 503);
     }
+    const storedActor = automationActor(actor, this.options.unattended, input.enabled === true);
     const current = await this.requireTrigger(actor.id, id);
     if (current.revision !== expectedRevision) throw new DomainError('conflict', 'Event trigger changed; reload and retry.', 409);
     if (current.data.type !== input.type) {
@@ -426,9 +473,11 @@ export class EventTriggerService {
       name: input.name.trim(),
       prompt: input.prompt.trim(),
       enabled: input.enabled === true,
-      actor,
+      actor: storedActor,
       settings,
       version: current.data.version + 1,
+      authorizationFailedAt: undefined,
+      authorizationFailedVersion: undefined,
     };
     const data: EventTrigger = current.data.type === 'webhook'
       ? { ...common, type: 'webhook', filter: validateWebhookFilter(input.filter), webhook: current.data.webhook }
@@ -559,9 +608,11 @@ export class EventTriggerService {
         ownerId: claimed.ownerId,
         source: 'event_trigger',
         sourceId: claimed.data.triggerId,
+        sourceVersion: claimed.data.triggerVersion,
         occurrenceId: claimed.data.eventId,
         prompt: claimed.data.prompt,
-        actor: claimed.data.actor,
+        actor: automationActor(claimed.data.actor, this.options.unattended),
+        durable: this.options.unattended === 'durable',
         settings: claimed.data.settings,
         reauthorize: this.options.reauthorize,
       });
@@ -569,6 +620,16 @@ export class EventTriggerService {
     } catch (error) {
       const code = error instanceof DomainError ? error.code : 'service_unavailable';
       const permanent = permanentAuthorizationCodes.has(code);
+      if (permanent) {
+        try {
+          await markAutomationAuthorizationFailed(this.store, claimed.ownerId, {
+            type: 'event_trigger', id: claimed.data.triggerId, version: claimed.data.triggerVersion,
+          }, new Date(this.now()).toISOString());
+        } catch (stampError) {
+          this.options.onError?.(stampError);
+          throw stampError;
+        }
+      }
       await this.finishClaim(claimed, permanent ? {
         ...claimed.data,
         status: 'rejected',
@@ -582,7 +643,7 @@ export class EventTriggerService {
         availableAt: new Date(this.now() + retryDelay(claimed.data.attempts)).toISOString(),
         lastError: error instanceof Error ? error.message : 'Automation enqueue failed',
       });
-      if (permanent) await this.disableTrigger(claimed.ownerId, claimed.data.triggerId);
+      if (!permanent) this.options.onError?.(error);
     }
   }
 
@@ -651,19 +712,6 @@ export class EventTriggerService {
           claim: undefined,
           rejectionCode: code,
         }, row.revision);
-      } catch (error) {
-        if (!isConflict(error)) throw error;
-      }
-    }
-  }
-
-  private async disableTrigger(ownerId: string, triggerId: string): Promise<void> {
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const trigger = await this.store.get<EventTrigger>('event_trigger', triggerId, ownerId);
-      if (!trigger || !trigger.data.enabled) return;
-      try {
-        await this.store.put('event_trigger', trigger.id, ownerId, { ...trigger.data, enabled: false }, trigger.revision);
-        return;
       } catch (error) {
         if (!isConflict(error)) throw error;
       }

@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { CronExpressionParser } from 'cron-parser';
 import { DomainError, type Principal } from './contracts.js';
+import { markAutomationAuthorizationFailed } from './automation-authorization.js';
 import {
   AutomationDispatcher,
+  automationActor,
   type AutomationExecutionSnapshot,
   type AutomationSettingsInput,
+  type UnattendedAuthorization,
 } from './event-triggers.js';
 import type { Entity, Store } from './storage/store.js';
 
@@ -33,6 +36,7 @@ export interface AutomationSchedule {
   lastOccurrenceAt?: string;
   lastTaskId?: string;
   authorizationFailedAt?: string;
+  authorizationFailedVersion?: number;
 }
 
 export type LegacyScheduleDraftTiming =
@@ -75,7 +79,9 @@ export interface SchedulerOptions {
   enabled?: boolean;
   now?: () => number;
   claimMs?: number;
+  unattended?: UnattendedAuthorization;
   reauthorize?: (principal: Principal) => Promise<Principal>;
+  onError?: (error: unknown) => void;
 }
 
 interface ScheduleTombstone {
@@ -90,6 +96,7 @@ const permanentAuthorizationCodes = new Set([
   'forbidden',
   'grant_expired',
   'grant_revoked',
+  'invalid_automation_identity',
   'owner_required',
   'plugin_snapshot_missing',
   'unauthorized',
@@ -118,13 +125,14 @@ export class SchedulerService {
     if (input.enabled && !this.enabled) {
       throw new DomainError('scheduler_disabled', 'Scheduled execution is not enabled on this server.', 503);
     }
+    const storedActor = automationActor(actor, this.options.unattended, input.enabled === true);
     const settings = await this.dispatcher.snapshot(actor.id, input.settings);
     return this.store.create<AutomationSchedule>('automation_schedule', actor.id, {
       name: input.name.trim(),
       prompt: input.prompt.trim(),
       ...timing,
       enabled: input.enabled === true,
-      actor,
+      actor: storedActor,
       settings,
       version: 1,
     });
@@ -159,6 +167,7 @@ export class SchedulerService {
     if (input.enabled && !this.enabled) {
       throw new DomainError('scheduler_disabled', 'Scheduled execution is not enabled on this server.', 503);
     }
+    const storedActor = automationActor(actor, this.options.unattended, input.enabled === true);
     const current = await this.requireSchedule(actor.id, id);
     if (current.revision !== expectedRevision) throw new DomainError('conflict', 'Schedule changed; reload and retry.', 409);
     const settings = await this.dispatcher.snapshot(actor.id, input.settings);
@@ -171,10 +180,11 @@ export class SchedulerService {
       cronExpression: timing.cronExpression,
       timezone: timing.timezone,
       enabled: input.enabled === true,
-      actor,
+      actor: storedActor,
       settings,
       version: current.data.version + 1,
       authorizationFailedAt: undefined,
+      authorizationFailedVersion: undefined,
     }, expectedRevision);
   }
 
@@ -188,12 +198,16 @@ export class SchedulerService {
     if (enabled && !this.enabled) {
       throw new DomainError('scheduler_disabled', 'Scheduled execution is not enabled on this server.', 503);
     }
+    const storedActor = enabled ? automationActor(actor, this.options.unattended, true) : undefined;
     const current = await this.requireSchedule(actor.id, id);
     if (current.revision !== expectedRevision) throw new DomainError('conflict', 'Schedule changed; reload and retry.', 409);
     return this.store.put('automation_schedule', id, actor.id, {
       ...current.data,
       enabled,
+      ...(storedActor ? { actor: storedActor } : {}),
+      version: current.data.version + 1,
       authorizationFailedAt: enabled ? undefined : current.data.authorizationFailedAt,
+      authorizationFailedVersion: enabled ? undefined : current.data.authorizationFailedVersion,
     }, expectedRevision);
   }
 
@@ -240,7 +254,13 @@ export class SchedulerService {
       status: 'pending',
       attempts: 0,
     };
-    await createOrVerify(this.store, 'schedule_occurrence', occurrenceId, schedule.ownerId, occurrence);
+    if (!await this.store.get<ScheduleOccurrence>('schedule_occurrence', occurrenceId, schedule.ownerId)) {
+      try {
+        await this.store.create<ScheduleOccurrence>('schedule_occurrence', schedule.ownerId, occurrence, occurrenceId);
+      } catch (error) {
+        if (!isConflict(error)) throw error;
+      }
+    }
     const nextAt = schedule.data.cronExpression && schedule.data.timezone
       ? cronScheduleNextAt(schedule.data.cronExpression, schedule.data.timezone, this.now())
       : schedule.data.intervalSeconds
@@ -288,9 +308,11 @@ export class SchedulerService {
         ownerId: claimed.ownerId,
         source: 'schedule',
         sourceId: claimed.data.scheduleId,
+        sourceVersion: claimed.data.scheduleVersion,
         occurrenceId: claimed.data.dueAt,
         prompt: claimed.data.prompt,
-        actor: claimed.data.actor,
+        actor: automationActor(claimed.data.actor, this.options.unattended),
+        durable: this.options.unattended === 'durable',
         settings: claimed.data.settings,
         reauthorize: this.options.reauthorize,
       });
@@ -305,6 +327,16 @@ export class SchedulerService {
     } catch (error) {
       const code = error instanceof DomainError ? error.code : 'service_unavailable';
       const permanent = permanentAuthorizationCodes.has(code);
+      if (permanent) {
+        try {
+          await markAutomationAuthorizationFailed(this.store, claimed.ownerId, {
+            type: 'schedule', id: claimed.data.scheduleId, version: claimed.data.scheduleVersion,
+          }, new Date(this.now()).toISOString());
+        } catch (stampError) {
+          this.options.onError?.(stampError);
+          throw stampError;
+        }
+      }
       await this.finishClaim(claimed, permanent ? {
         ...claimed.data,
         status: 'rejected',
@@ -318,7 +350,7 @@ export class SchedulerService {
         availableAt: new Date(this.now() + retryDelay(claimed.data.attempts)).toISOString(),
         lastError: error instanceof Error ? error.message : 'Schedule enqueue failed',
       });
-      if (permanent) await this.disableSchedule(claimed.ownerId, claimed.data.scheduleId);
+      if (!permanent) this.options.onError?.(error);
     }
   }
 
@@ -337,24 +369,6 @@ export class SchedulerService {
         await this.store.put('automation_schedule', scheduleId, ownerId, {
           ...schedule.data,
           lastTaskId: taskId,
-        }, schedule.revision);
-        return;
-      } catch (error) {
-        if (!isConflict(error)) throw error;
-      }
-    }
-  }
-
-  private async disableSchedule(ownerId: string, scheduleId: string): Promise<void> {
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const schedule = await this.store.get<AutomationSchedule>('automation_schedule', scheduleId, ownerId);
-      if (!schedule || schedule.data.authorizationFailedAt) return;
-      const authorizationFailedAt = new Date(this.now()).toISOString();
-      try {
-        await this.store.put('automation_schedule', scheduleId, ownerId, {
-          ...schedule.data,
-          enabled: false,
-          authorizationFailedAt,
         }, schedule.revision);
         return;
       } catch (error) {

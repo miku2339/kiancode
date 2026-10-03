@@ -74,6 +74,10 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
       config.auth.accountApiUrl,
       fetch,
       config.auth.levelCeilings,
+      authMode === 'development' ? undefined : {
+        expectedIssuer: config.auth.issuer!,
+        expectedAudience: config.auth.audience,
+      },
     );
     const authenticate = async (authorization: string | undefined) => access.authorize(await identityAuth(authorization));
     const notifications = new NotificationService(store, {

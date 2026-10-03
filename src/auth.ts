@@ -32,8 +32,7 @@ export function accountAuth(
   expectedAudience?: string,
   accountApiUrl?: string,
 ): Authenticator {
-  const url = secureUrl(issuer, 'Account issuer');
-  const canonicalIssuer = url.origin;
+  const canonicalIssuer = canonicalAccountIssuer(issuer);
   const accountApiOrigin = accountApiUrl ? secureAccountApiOrigin(accountApiUrl) : canonicalIssuer;
   return async (authorization) => {
     const token = bearer(authorization);
@@ -52,6 +51,12 @@ export function accountAuth(
     if (expectedAudience && (session.audience !== expectedAudience || !session.applicationId || !Number.isInteger(session.credentialVersion))) throw new DomainError('invalid_audience', 'This session is not authorized for Kian', 403);
     return { id: createHash('sha256').update(`${canonicalIssuer}\0${session.subject}`).digest('hex'), issuer: canonicalIssuer, subject: session.subject, level: session.level as Principal['level'], scopes: session.scopes as string[], applicationId: session.applicationId, audience: session.audience, credentialVersion: session.credentialVersion, expiresAt };
   };
+}
+
+export function canonicalAccountIssuer(raw: string): string {
+  const url = secureUrl(raw, 'Account issuer');
+  if (url.username || url.password) throw new Error('Account issuer must not include user information');
+  return url.origin;
 }
 
 function accountSessionExpiry(value: unknown): string | undefined {

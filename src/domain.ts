@@ -70,6 +70,8 @@ export interface Task {
   dependencyIds?: string[];
   notificationDestination?: NotificationDestination;
   orchestration?: TaskOrchestration;
+  authorizationKind?: 'account_automation';
+  automationSource?: { type: 'schedule' | 'event_trigger'; id: string; version: number };
 }
 
 export interface TaskEvent {
@@ -141,6 +143,7 @@ export interface Notification {
   taskId?: string;
   conversationId?: string;
   scheduleId?: string;
+  eventTriggerId?: string;
 }
 
 export interface NotificationChannelDestination {

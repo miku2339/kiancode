@@ -552,7 +552,7 @@ test('automation HTTP routes default disabled, expose a secret once and support 
     });
     assert.equal(disabled.statusCode, 200, disabled.body);
     assert.equal(disabled.json().data.data.enabled, false);
-    assert.equal(disabled.json().data.data.version, 2);
+    assert.equal(disabled.json().data.data.version, 3);
     assert.equal(disabled.json().data.data.settings.fingerprint, edited.json().data.data.settings.fingerprint);
 
     const cron = await app.inject({

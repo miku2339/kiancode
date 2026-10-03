@@ -258,6 +258,75 @@ test('validateDelegation uses the canonical wildcard matcher', async () => {
   }
 });
 
+test('account automation delegation validates its canonical identity tuple before access lookup', async () => {
+  const store = new SqliteStore();
+  let requests = 0;
+  const fetcher = (async () => {
+    requests += 1;
+    return Response.json({ success: true, data: { active: true, credentialVersion: 1 } });
+  }) as typeof fetch;
+  const access = new AccessService(
+    store,
+    ownerSubject,
+    serviceToken,
+    'account',
+    undefined,
+    fetcher,
+    {},
+    { expectedIssuer: `${issuer}/tenant?source=test`, expectedAudience: 'kiancode' },
+  );
+  const valid = identity(ownerSubject, 1, { applicationId: 'kiancode-plus' });
+  try {
+    assert.equal(await access.validateDelegation(valid), true);
+    assert.equal(requests, 1);
+    for (const changed of [
+      { ...valid, id: principalId(memberSubject) },
+      { ...valid, issuer: `${issuer}/path` },
+      { ...valid, subject: memberSubject },
+      { ...valid, audience: 'other' },
+      { ...valid, audience: '' },
+      { ...valid, applicationId: '' },
+      { ...valid, credentialVersion: -1 },
+      { ...valid, credentialVersion: 1.5 },
+    ]) {
+      await assert.rejects(access.validateDelegation(changed), hasCode('invalid_automation_identity', 403));
+    }
+    assert.equal(requests, 1);
+  } finally {
+    await store.close();
+  }
+});
+
+test('account authorization outages remain retryable while explicit inactive or changed credentials are revoked', async () => {
+  const store = new SqliteStore();
+  const owner = identity(ownerSubject, 1);
+  const accessFor = (fetcher: typeof fetch, token: string | undefined = serviceToken) => new AccessService(
+    store, ownerSubject, token, 'account', undefined, fetcher, {},
+    { expectedIssuer: issuer, expectedAudience: 'kiancode' },
+  );
+  try {
+    for (const fetcher of [
+      (async () => { throw new Error('offline'); }) as typeof fetch,
+      (async () => new Response(null, { status: 401 })) as typeof fetch,
+      (async () => new Response(null, { status: 503 })) as typeof fetch,
+      (async () => new Response('{')) as typeof fetch,
+      (async () => Response.json(null)) as typeof fetch,
+      (async () => Response.json({ success: true, data: {} })) as typeof fetch,
+    ]) {
+      await assert.rejects(accessFor(fetcher).validateDelegation(owner), hasCode('identity_unavailable', 503));
+    }
+    await assert.rejects(accessFor(fetch, undefined).validateDelegation(owner), hasCode('identity_unavailable', 503));
+    assert.equal(await accessFor((async () => Response.json({
+      success: true, data: { active: false, credentialVersion: 1 },
+    })) as typeof fetch).validateDelegation(owner), false);
+    assert.equal(await accessFor((async () => Response.json({
+      success: true, data: { active: true, credentialVersion: 2 },
+    })) as typeof fetch).validateDelegation(owner), false);
+  } finally {
+    await store.close();
+  }
+});
+
 test('only the configured owner can grant a valid principal over HTTP', async () => {
   const store = new SqliteStore();
   const access = accountAccess(store, { 2: ['*'] });

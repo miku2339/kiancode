@@ -84,10 +84,12 @@ export async function createServer(options: ServerOptions) {
     if (!await options.access!.validateDelegation(identity)) throw new DomainError('grant_revoked', 'Task authorization has expired or been revoked', 403);
     return options.access!.authorize(identity);
   } : undefined);
+  const unattended = options.access?.unattendedAuthorization();
   const tasks = new TaskService(store, options.runner, {
     onError: (error) => app.log.error(error),
     notifications,
     ...(reauthorize ? { reauthorize } : {}),
+    ...(unattended === 'durable' ? { durableGrants: true } : {}),
   });
   const devices = options.devices ?? new DeviceService(store);
   const dispatcher = new AutomationDispatcher(store, tasks);
@@ -95,11 +97,15 @@ export async function createServer(options: ServerOptions) {
   const eventTriggers = new EventTriggerService(store, dispatcher, {
     enabled: options.automations?.eventTriggersEnabled === true,
     ...(reauthorize ? { reauthorize } : {}),
+    ...(unattended ? { unattended } : {}),
+    onError: (error) => app.log.warn(error),
     validateDeviceConnection: (edge) => deviceConnections.validate(edge),
   });
   const scheduler = new SchedulerService(store, dispatcher, {
     enabled: options.automations?.schedulerEnabled === true,
     ...(reauthorize ? { reauthorize } : {}),
+    ...(unattended ? { unattended } : {}),
+    onError: (error) => app.log.warn(error),
   });
   const principals = new WeakMap<FastifyRequest, Principal>();
   const outageRequests = new WeakSet<FastifyRequest>();

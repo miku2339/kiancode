@@ -19,6 +19,7 @@ export interface NotificationInput {
   taskId?: string;
   conversationId?: string;
   scheduleId?: string;
+  eventTriggerId?: string;
   title?: string;
   body?: string;
 }
@@ -51,6 +52,7 @@ export interface NotificationServiceOptions {
 
 interface AutomationScheduleNotification {
   authorizationFailedAt?: string;
+  authorizationFailedVersion?: number;
   settings: { notification: NotificationDestination };
 }
 
@@ -164,6 +166,7 @@ export class NotificationService {
       ...(input.taskId ? { taskId: input.taskId } : {}),
       ...(input.conversationId ? { conversationId: input.conversationId } : {}),
       ...(input.scheduleId ? { scheduleId: input.scheduleId } : {}),
+      ...(input.eventTriggerId ? { eventTriggerId: input.eventTriggerId } : {}),
     };
     try {
       return await this.store.create('notification', ownerId, data, id);
@@ -410,11 +413,21 @@ export class NotificationService {
     }
     for (const schedule of await this.store.scan<AutomationScheduleNotification>('automation_schedule')) {
       if (!schedule.data.authorizationFailedAt) continue;
+      const failure = schedule.data.authorizationFailedVersion ?? schedule.data.authorizationFailedAt;
       await this.publishTask(schedule.ownerId, {
         type: 'schedule_authorization_failed',
-        dedupeKey: `schedule:${schedule.id}:authorization:${schedule.data.authorizationFailedAt}`,
+        dedupeKey: `schedule:${schedule.id}:authorization:${failure}`,
         scheduleId: schedule.id,
       }, new Date(schedule.data.authorizationFailedAt), schedule.data.settings.notification);
+    }
+    for (const trigger of await this.store.scan<AutomationScheduleNotification>('event_trigger')) {
+      if (!trigger.data.authorizationFailedAt) continue;
+      const failure = trigger.data.authorizationFailedVersion ?? trigger.data.authorizationFailedAt;
+      await this.publishTask(trigger.ownerId, {
+        type: 'schedule_authorization_failed',
+        dedupeKey: `event-trigger:${trigger.id}:authorization:${failure}`,
+        eventTriggerId: trigger.id,
+      }, new Date(trigger.data.authorizationFailedAt), trigger.data.settings.notification);
     }
   }
 }
@@ -513,7 +526,7 @@ function notificationCopy(type: NotificationType): { title: string; body: string
     case 'task_failed': return { title: '任務未完成', body: '你的 Kian 任務執行失敗，請打開 App 查看詳情。' };
     case 'task_unknown': return { title: '任務結果待確認', body: '任務可能已產生外部變更，請打開 App 核實結果。' };
     case 'approval_required': return { title: '需要你的批准', body: 'Kian 正等待你批准一項操作。' };
-    case 'schedule_authorization_failed': return { title: '排程已暫停', body: '排程授權已失效，請重新登入後啟用。' };
+    case 'schedule_authorization_failed': return { title: '自動化已暫停', body: '排程或觸發器的授權已失效，請重新登入後再次啟用。' };
     case 'important_change': return { title: 'Kian 重要更新', body: '請打開 App 查看詳情。' };
   }
 }
@@ -580,11 +593,12 @@ function sameNotificationEvent(
   return existing.type === input.type
     && existing.dedupeKey === input.dedupeKey
     && (delivery.reuseOccurredAt === true || existing.occurredAt === occurredAt.toISOString())
-    && existing.title === title
-    && existing.body === body
+    && (input.title === undefined || existing.title === title)
+    && (input.body === undefined || existing.body === body)
     && existing.taskId === input.taskId
     && existing.conversationId === input.conversationId
     && existing.scheduleId === input.scheduleId
+    && existing.eventTriggerId === input.eventTriggerId
     && existing.pushEligible === delivery.pushEligible
     && existing.targetSubscriptionId === delivery.targetSubscriptionId
     && existing.targetChannelDestinationId === delivery.targetChannelDestinationId;

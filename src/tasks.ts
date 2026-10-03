@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Artifact } from './artifacts.js';
+import { markAutomationAuthorizationFailed } from './automation-authorization.js';
 import { DomainError, type Principal, type Workspace } from './contracts.js';
 import type { Conversation, Message, NotificationDestination, PendingAction, Task, TaskEvent, TaskState } from './domain.js';
 import type { NotificationInput, NotificationService } from './notifications.js';
@@ -30,6 +31,7 @@ export interface TaskServiceOptions {
   concurrency?: number;
   onError?: (error: unknown) => void;
   reauthorize?: (principal: Principal) => Promise<Principal>;
+  durableGrants?: boolean;
   isQuietTime?: (ownerId: string, at: Date) => boolean | Promise<boolean>;
   notifications?: Pick<NotificationService, 'publishTask' | 'reconcile'>;
   leaseMs?: number;
@@ -232,6 +234,7 @@ export class TaskService {
     dependencyIds: string[] = [],
     notificationDestination?: NotificationDestination,
     pluginVersions?: Record<string, string>,
+    authorization?: Pick<Task, 'authorizationKind' | 'automationSource'>,
   ): Promise<Entity<Task>> {
     const conversation = await this.store.get<Conversation>('conversation', conversationId, principal.id);
     if (!conversation || conversation.data.archived) {
@@ -270,7 +273,8 @@ export class TaskService {
         || !sameStrings(previous.data.attachmentIds ?? [], attachments)
         || !sameStrings(previous.data.dependencyIds ?? [], dependencies)
         || !sameNotificationDestination(previous.data.notificationDestination, notificationDestination)
-        || (pluginVersions !== undefined && !sameRecord(previous.data.pluginVersions ?? {}, normalizePluginVersions(pluginVersions)))) {
+        || (pluginVersions !== undefined && !sameRecord(previous.data.pluginVersions ?? {}, normalizePluginVersions(pluginVersions)))
+        || !sameAutomationAuthorization(previous.data, authorization)) {
         throw new DomainError('idempotency_conflict', 'Request ID already belongs to another task input', 409);
       }
       return previous;
@@ -293,10 +297,12 @@ export class TaskService {
         ...(attachments.length ? { attachmentIds: attachments } : {}),
         ...(dependencies.length ? { dependencyIds: dependencies } : {}),
         ...(notificationDestination ? { notificationDestination } : {}),
+        ...(authorization?.authorizationKind ? { authorizationKind: authorization.authorizationKind } : {}),
+        ...(authorization?.automationSource ? { automationSource: authorization.automationSource } : {}),
       }, id);
     } catch (error) {
       if (error instanceof DomainError && error.code === 'conflict') {
-        return this.enqueue(principal, conversationId, prompt, requestId, attachments, dependencies, notificationDestination, capturedPluginVersions);
+        return this.enqueue(principal, conversationId, prompt, requestId, attachments, dependencies, notificationDestination, capturedPluginVersions, authorization);
       }
       throw error;
     }
@@ -451,7 +457,9 @@ export class TaskService {
         && task.pendingActions.some((pending) => !approved.has(pending.hash))) {
         throw new DomainError('approval_required', 'Approve the exact pending actions first', 409);
       }
-      const principal = actor ? resumedPrincipal(task, actor, this.now()) : task.principal;
+      const principal = actor
+        ? resumedPrincipal(task, actor, this.now(), this.options.durableGrants === true)
+        : task.principal;
       return {
         ...task,
         principal,
@@ -591,9 +599,11 @@ export class TaskService {
         throw error;
       }
       const controller = new AbortController();
-      const promise = this.execute(claimed, controller).finally(() => {
-        this.active.delete(task.id);
-      });
+      const promise = this.execute(claimed, controller)
+        .catch((error) => this.options.onError?.(error))
+        .finally(() => {
+          this.active.delete(task.id);
+        });
       this.active.set(task.id, { ownerId: task.ownerId, controller, promise });
     }
   }
@@ -671,7 +681,14 @@ export class TaskService {
     }, this.options.heartbeatMs ?? 15_000);
     leaseTimer.unref();
     try {
-      if (Date.parse(task.data.grantExpiresAt) <= this.now()) {
+      if (hasMalformedAutomationAuthorization(task.data)) {
+        throw new DomainError('invalid_automation_identity', 'Automation authorization context is invalid', 403);
+      }
+      const grantLapsed = Date.parse(task.data.grantExpiresAt) <= this.now();
+      const durable = this.options.durableGrants === true
+        && this.options.reauthorize !== undefined
+        && isDurableAutomationTask(task.data);
+      if (grantLapsed && !durable) {
         throw new DomainError('grant_expired', 'Task authorization expired; resume from a signed-in client', 403);
       }
       let executionTask = task;
@@ -685,7 +702,11 @@ export class TaskService {
           if (current.state !== 'running' || current.workerId !== this.workerId) {
             throw new DomainError('lease_lost', 'Execution lease lost', 409);
           }
-          return { ...current, principal };
+          return {
+            ...current,
+            principal,
+            ...(grantLapsed ? { grantExpiresAt: renewedGrantExpiry(principal, this.now()) } : {}),
+          };
         });
       }
       const conversation = await this.store.get<Conversation>(
@@ -771,6 +792,18 @@ export class TaskService {
       const code = (error as { code?: string }).code;
       const unresolved = code === 'outcome_unknown'
         || await this.hasUnresolvedSideEffect(task.ownerId, task.id);
+      if (automationPermanentCodes.has(code ?? '') && isDurableAutomationTask(task.data)) {
+        try {
+          await markAutomationAuthorizationFailed(
+            this.store,
+            task.ownerId,
+            task.data.automationSource!,
+            new Date(this.now()).toISOString(),
+          );
+        } catch (stampError) {
+          throw stampError;
+        }
+      }
       const updated = await this.change(task.ownerId, task.id, (current) => {
         if (current.state !== 'running' || current.workerId !== this.workerId) {
           return current;
@@ -785,6 +818,15 @@ export class TaskService {
             leaseExpiresAt: undefined,
           };
         }
+        if (unresolved) {
+          return {
+            ...current,
+            state: 'unknown',
+            error: 'A side effect was dispatched but its result was not confirmed. Verify the outcome before retrying.',
+            workerId: undefined,
+            leaseExpiresAt: undefined,
+          };
+        }
         if (authorizationPauseCodes.has(code ?? '')) {
           return {
             ...current,
@@ -795,11 +837,12 @@ export class TaskService {
             leaseExpiresAt: undefined,
           };
         }
-        if (unresolved) {
+        if (code === 'identity_unavailable') {
           return {
             ...current,
-            state: 'unknown',
-            error: 'A side effect was dispatched but its result was not confirmed. Verify the outcome before retrying.',
+            state: 'queued',
+            error: error instanceof Error ? error.message : 'Identity service is unavailable',
+            nextAttemptAt: new Date(this.now() + 30_000).toISOString(),
             workerId: undefined,
             leaseExpiresAt: undefined,
           };
@@ -824,6 +867,9 @@ export class TaskService {
         this.options.onError?.(storageError);
         return undefined;
       });
+      if (code === 'identity_unavailable' && updated?.data.state === 'queued') {
+        this.options.onError?.(error);
+      }
       if (updated?.data.state === 'failed' || updated?.data.state === 'unknown') {
         const type = updated.data.state === 'failed' ? 'task_failed' : 'task_unknown';
         await this.notify(updated, taskNotification(updated, type), new Date(updated.updatedAt))
@@ -959,7 +1005,15 @@ const authorizationPauseCodes = new Set([
   'authorization_revalidation_required',
   'grant_expired',
   'grant_revoked',
+  'invalid_automation_identity',
   'unauthorized',
+]);
+
+const automationPermanentCodes = new Set([
+  'access_required',
+  'access_revoked',
+  'grant_revoked',
+  'invalid_automation_identity',
 ]);
 
 function scopeCovered(grants: string[], requested: string): boolean {
@@ -987,12 +1041,30 @@ function revalidatedPrincipal(granted: Principal, current: Principal, ownerId: s
   };
 }
 
-function resumedPrincipal(task: Task, actor: Principal, now: number): Principal {
+function resumedPrincipal(task: Task, actor: Principal, now: number, durableGrants: boolean): Principal {
   if (actor.expiresAt && (!Number.isFinite(Date.parse(actor.expiresAt)) || Date.parse(actor.expiresAt) <= now)) {
     throw new DomainError('unauthorized', 'The signed-in session has expired', 401);
   }
+  if (durableGrants && isDurableAutomationTask(task)) {
+    const { expiresAt: _expiresAt, ...durable } = revalidatedPrincipal(task.principal, actor, task.principal.id);
+    return durable;
+  }
   if (!task.orchestration) return { ...actor, scopes: [...actor.scopes] };
   return revalidatedPrincipal(task.principal, actor, task.principal.id);
+}
+
+function isDurableAutomationTask(task: Task): boolean {
+  return task.principal.expiresAt === undefined
+    && task.authorizationKind === 'account_automation'
+    && (task.automationSource?.type === 'schedule' || task.automationSource?.type === 'event_trigger')
+    && Boolean(task.automationSource.id)
+    && Number.isInteger(task.automationSource.version)
+    && task.automationSource.version >= 1;
+}
+
+function hasMalformedAutomationAuthorization(task: Task): boolean {
+  return (task.authorizationKind !== undefined || task.automationSource !== undefined)
+    && !isDurableAutomationTask(task);
 }
 
 function renewedGrantExpiry(principal: Principal, now: number): string {
@@ -1011,6 +1083,17 @@ function sameNotificationDestination(
   return left?.type === right?.type
     && (left?.type !== 'push' || right?.type !== 'push' || left.subscriptionId === right.subscriptionId)
     && (left?.type !== 'channel' || right?.type !== 'channel' || left.destinationId === right.destinationId);
+}
+
+function sameAutomationAuthorization(
+  task: Task,
+  authorization: Pick<Task, 'authorizationKind' | 'automationSource'> | undefined,
+): boolean {
+  return task.authorizationKind === authorization?.authorizationKind
+    && (task.automationSource !== undefined) === (authorization?.automationSource !== undefined)
+    && task.automationSource?.type === authorization?.automationSource?.type
+    && task.automationSource?.id === authorization?.automationSource?.id
+    && task.automationSource?.version === authorization?.automationSource?.version;
 }
 
 function normalizePluginVersions(value: Record<string, string>): Record<string, string> {
