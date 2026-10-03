@@ -330,7 +330,8 @@ export class AgentCoordinator {
       error: task.data.error,
       attachmentIds: task.data.attachmentIds ?? [],
     }));
-    const ready = children.every((child) => terminalStates.has(child.state));
+    const ready = tasks.every((task) => task.data.reconciliation?.phase !== 'pending')
+      && children.every((child) => terminalStates.has(child.state));
     return {
       plan,
       children,

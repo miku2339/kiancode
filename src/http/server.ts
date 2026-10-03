@@ -449,6 +449,23 @@ export async function createServer(options: ServerOptions) {
     const body = z.object({ hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).min(1).max(20) }).strict().parse(request.body);
     return { data: await tasks.control(owner.id, params(request).id, 'resume', body.hashes, owner) };
   });
+  app.post('/v1/tasks/:id/reconcile', async (request) => {
+    const owner = principal(request);
+    requireScope(owner, 'task:write');
+    requireScope(owner, 'approval:write');
+    const body = z.object({
+      resolution: z.enum(['applied', 'not_applied', 'abandon']),
+      dispatchSequence: z.number().int().positive().optional(),
+      toolCallId: z.string().trim().min(1).max(200).optional(),
+      toolOccurrenceId: z.string().trim().min(1).max(256).optional(),
+      actionHash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+      note: z.string().trim().min(1).max(2_000).optional(),
+    }).strict().refine((value) => value.resolution === 'abandon' || value.dispatchSequence !== undefined || value.toolCallId !== undefined
+      || value.toolOccurrenceId !== undefined || value.actionHash !== undefined, {
+      message: 'Name the exact dispatched action to reconcile',
+    }).parse(request.body);
+    return { data: await tasks.reconcileOutcome(owner, params(request).id, body) };
+  });
   app.get('/v1/tasks/:id/events', async (request) => {
     requireScope(principal(request), 'task:read');
     const query = z.object({ after: z.coerce.number().int().nonnegative().default(0) }).parse(request.query);

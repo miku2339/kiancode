@@ -46,6 +46,32 @@ export interface TaskOrchestration {
 
 export interface PendingAction { hash: string; tool: string; input: Record<string, unknown>; toolOccurrenceId?: string }
 
+export type TaskReconciliationResolution = 'applied' | 'not_applied' | 'abandon';
+
+export interface TaskReconciliationRecord {
+  phase: 'pending' | 'complete';
+  resolution: TaskReconciliationResolution;
+  dispatchSequence?: number;
+  receiptId: string;
+  toolCallId?: string;
+  toolOccurrenceId?: string;
+  actionHash?: string;
+  toolName?: string;
+  sideEffect?: 'write' | 'external';
+  note?: string;
+  actor: Pick<Principal, 'id' | 'level' | 'applicationId' | 'issuer' | 'subject'>;
+  acceptedAt: string;
+  targetState: TaskState;
+  resumePrincipal: Principal;
+  grantExpiresAt: string;
+}
+
+export interface TaskReconciliationRestoration {
+  receiptId: string;
+  childTaskId: string;
+  resolution: TaskReconciliationResolution;
+}
+
 export interface Task {
   conversationId: string;
   workspaceId?: string;
@@ -72,6 +98,8 @@ export interface Task {
   orchestration?: TaskOrchestration;
   authorizationKind?: 'account_automation';
   automationSource?: { type: 'schedule' | 'event_trigger'; id: string; version: number };
+  reconciliation?: TaskReconciliationRecord;
+  reconciliationRestoration?: TaskReconciliationRestoration;
 }
 
 export interface TaskEvent {

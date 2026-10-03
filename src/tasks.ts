@@ -2,10 +2,22 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { Artifact } from './artifacts.js';
 import { markAutomationAuthorizationFailed } from './automation-authorization.js';
 import { DomainError, type Principal, type Workspace } from './contracts.js';
-import type { Conversation, Message, NotificationDestination, PendingAction, Task, TaskEvent, TaskState } from './domain.js';
+import type {
+  Conversation,
+  Message,
+  NotificationDestination,
+  PendingAction,
+  Task,
+  TaskEvent,
+  TaskReconciliationRecord,
+  TaskReconciliationResolution,
+  TaskState,
+} from './domain.js';
 import type { NotificationInput, NotificationService } from './notifications.js';
 import type { Entity, Store } from './storage/store.js';
 import { snapshotEnabledPluginVersions } from './plugins.js';
+import { reconcileToolCall, type ChatMessage } from './runtime/index.js';
+import { WorkspaceWriteLeaseService } from './workspace-write-lease.js';
 
 export interface ExecutionResult {
   text: string;
@@ -25,6 +37,15 @@ export interface TaskExecution {
 }
 
 export type TaskRunner = (input: TaskExecution) => Promise<ExecutionResult>;
+
+export interface TaskReconciliation {
+  resolution: TaskReconciliationResolution;
+  dispatchSequence?: number;
+  toolCallId?: string;
+  toolOccurrenceId?: string;
+  actionHash?: string;
+  note?: string;
+}
 
 export interface TaskServiceOptions {
   now?: () => number;
@@ -50,6 +71,17 @@ interface EventSequence {
 
 interface MessageSequence {
   next: number;
+}
+
+interface SideEffectDispatch {
+  sequence: number;
+  toolCallId?: string;
+  toolOccurrenceId?: string;
+  actionHash?: string;
+  toolName?: string;
+  toolArguments?: Record<string, unknown>;
+  sideEffect: 'write' | 'external';
+  resolved: boolean;
 }
 
 type RuntimeEvent = { type: string; [key: string]: unknown };
@@ -486,6 +518,259 @@ export class TaskService {
     return row;
   }
 
+  public async reconcileOutcome(
+    actor: Principal,
+    id: string,
+    input: TaskReconciliation,
+  ): Promise<Entity<Task>> {
+    if (!scopeCovered(actor.scopes, 'approval:write')) {
+      throw new DomainError('forbidden', 'Missing capability: approval:write', 403);
+    }
+    const ownerId = actor.id;
+    let task = await this.store.get<Task>('task', id, ownerId);
+    if (!task) throw new DomainError('not_found', 'Task not found', 404);
+    resumedPrincipal(task.data, actor, this.now(), this.options.durableGrants === true);
+    const previousDecision = task.data.reconciliation;
+    if (previousDecision?.phase === 'pending') {
+      assertSameReconciliation(previousDecision, input, actor);
+      return this.finishReconciliation(task);
+    }
+    let dispatches: SideEffectDispatch[] | undefined;
+    if (previousDecision?.phase === 'complete') {
+      if (explicitlyTargetsReconciliation(previousDecision, input)
+        || (!hasReconciliationSelector(input) && previousDecision.dispatchSequence === undefined)) {
+        assertSameReconciliation(previousDecision, input, actor);
+        return task;
+      }
+      if (task.data.state === 'unknown' && input.toolCallId !== undefined
+        && reconciliationSelectorMatches(previousDecision, input)) {
+        dispatches = await this.sideEffectDispatches(ownerId, id);
+        if (!dispatches.some((dispatch) => !dispatch.resolved && dispatch.toolCallId === input.toolCallId)) {
+          assertSameReconciliation(previousDecision, input, actor);
+          return task;
+        }
+        throw new DomainError(
+          'reconciliation_conflict',
+          'The selector could name either the completed receipt or a new unresolved dispatch',
+          409,
+        );
+      }
+    }
+    if (task.data.state !== 'unknown') throw notReconcilable();
+    if (input.resolution !== 'abandon' && !hasReconciliationSelector(input)) {
+      throw new DomainError('invalid_input', 'Name the exact dispatched action to reconcile', 400);
+    }
+    if (this.active.has(id) || (task.data.workerId && Date.parse(task.data.leaseExpiresAt ?? '') > this.now())) {
+      throw new DomainError('task_busy', 'The task executor must stop before its outcome can be reconciled', 409);
+    }
+    const principal = resumedPrincipal(task.data, actor, this.now(), this.options.durableGrants === true);
+    const dispatch = hasReconciliationSelector(input)
+      ? reconciliationTarget(dispatches ?? await this.sideEffectDispatches(ownerId, id), input)
+      : undefined;
+    const conversation = await this.store.get<Conversation>('conversation', task.data.conversationId, ownerId);
+    if (!conversation) throw new DomainError('not_found', 'Conversation not found', 404);
+    const targetState = reconciliationTargetState(task.data, conversation.data, input.resolution);
+    if (!task.data.cancelRequested && input.resolution !== 'abandon' && !conversation.data.internalOperation) {
+      if (!dispatch) throw new DomainError('invalid_reconciliation', 'A resumable reconciliation requires a dispatch', 409);
+      const checkpoint = checkpointForDispatch(task.data.runtimeMessages, dispatch);
+      if (!checkpoint || !reconcileToolCall(checkpoint, {
+        ...(dispatch.toolCallId ? { toolCallId: dispatch.toolCallId } : {}),
+        ...(dispatch.toolOccurrenceId ? { toolOccurrenceId: dispatch.toolOccurrenceId } : {}),
+        ...(dispatch.actionHash ? { actionHash: dispatch.actionHash } : {}),
+        resolution: input.resolution,
+        ...(input.note ? { note: input.note } : {}),
+      })) {
+        throw new DomainError('not_resumable', 'This task has no matching checkpoint to continue from; use abandon', 409);
+      }
+    }
+    if (input.resolution !== 'abandon' && task.data.workspaceId) {
+      await new WorkspaceWriteLeaseService(this.store, () => this.now())
+        .verifyTaskRelease(ownerId, task.data.workspaceId, task.id);
+    }
+    const acceptedAt = new Date(this.now()).toISOString();
+    const receiptId = dispatch
+      ? `${task.id}:${String(dispatch.sequence).padStart(12, '0')}:reconciled`
+      : `${task.id}:reconciled:abandon`;
+    const reconciliation: TaskReconciliationRecord = {
+      phase: 'pending',
+      resolution: input.resolution,
+      receiptId,
+      ...(dispatch ? { dispatchSequence: dispatch.sequence, sideEffect: dispatch.sideEffect } : {}),
+      ...(dispatch?.toolCallId ? { toolCallId: dispatch.toolCallId } : {}),
+      ...(dispatch?.toolOccurrenceId ? { toolOccurrenceId: dispatch.toolOccurrenceId } : {}),
+      ...(dispatch?.actionHash ? { actionHash: dispatch.actionHash } : {}),
+      ...(dispatch?.toolName ? { toolName: dispatch.toolName } : {}),
+      ...(input.note ? { note: input.note } : {}),
+      actor: reconciliationActor(actor),
+      acceptedAt,
+      targetState,
+      resumePrincipal: principal,
+      grantExpiresAt: renewedGrantExpiry(principal, this.now()),
+    };
+    try {
+      task = await this.store.put('task', task.id, ownerId, { ...task.data, reconciliation }, task.revision);
+    } catch (error) {
+      if (!(error instanceof DomainError && error.code === 'conflict')) throw error;
+      task = await this.store.get<Task>('task', id, ownerId) ?? task;
+      if (!task.data.reconciliation) throw new DomainError('busy', 'Task is busy; retry', 409);
+      if (previousDecision && sameReconciliationDecision(task.data.reconciliation, previousDecision)) {
+        throw new DomainError('busy', 'Task is busy; retry', 409);
+      }
+      assertSameReconciliation(task.data.reconciliation, input, actor);
+    }
+    return this.finishReconciliation(task);
+  }
+
+  private async finishReconciliation(start: Entity<Task>): Promise<Entity<Task>> {
+    let task = await this.store.get<Task>('task', start.id, start.ownerId) ?? start;
+    const decision = task.data.reconciliation;
+    if (!decision) throw new DomainError('invalid_reconciliation', 'Task has no accepted reconciliation', 409);
+    if (decision.phase === 'complete') return task;
+    if (decision.dispatchSequence !== undefined && decision.sideEffect) {
+      const receiptPayload = reconciliationReceipt(task.id, decision);
+      await this.fixedEvent(task, decision.receiptId, receiptPayload, decision.acceptedAt);
+    }
+    const unresolved = decision.resolution !== 'abandon'
+      && await this.hasUnresolvedSideEffect(task.ownerId, task.id);
+    const targetState: TaskState = unresolved ? 'unknown' : decision.targetState;
+    if (!unresolved && decision.resolution !== 'abandon' && task.data.workspaceId) {
+      await new WorkspaceWriteLeaseService(this.store, () => this.now()).releaseForTask(
+        task.ownerId,
+        task.data.workspaceId,
+        task.id,
+        {
+          receiptId: decision.receiptId,
+          resolution: decision.resolution,
+          note: decision.note ?? `Task outcome reconciled as ${decision.resolution}`,
+        },
+      );
+    }
+    if (!unresolved && decision.resolution !== 'abandon') await this.restoreReconciledParents(task, decision);
+    await this.fixedEvent(task, `${decision.receiptId}:audit`, {
+      type: 'reconcile',
+      receiptId: decision.receiptId,
+      state: targetState,
+      resolution: decision.resolution,
+      ...(decision.dispatchSequence !== undefined ? { dispatchSequence: decision.dispatchSequence } : {}),
+      ...(decision.toolCallId ? { toolCallId: decision.toolCallId } : {}),
+      ...(decision.toolOccurrenceId ? { toolOccurrenceId: decision.toolOccurrenceId } : {}),
+      ...(decision.actionHash ? { actionHash: decision.actionHash } : {}),
+      ...(decision.toolName ? { toolName: decision.toolName } : {}),
+      ...(decision.note ? { note: decision.note } : {}),
+      actor: decision.actor,
+      acceptedAt: decision.acceptedAt,
+    }, decision.acceptedAt);
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      task = await this.store.get<Task>('task', task.id, task.ownerId) ?? task;
+      const current = task.data.reconciliation;
+      if (!current || !sameReconciliationDecision(current, decision)) {
+        throw new DomainError('reconciliation_conflict', 'Task reconciliation changed', 409);
+      }
+      if (current.phase === 'complete') return task;
+      const final = await this.reconciledTaskData(task, decision, targetState);
+      try {
+        return await this.store.put('task', task.id, task.ownerId, {
+          ...final,
+          reconciliation: { ...decision, phase: 'complete' },
+        }, task.revision);
+      } catch (error) {
+        if (!(error instanceof DomainError && error.code === 'conflict')) throw error;
+      }
+    }
+    throw new DomainError('busy', 'Task reconciliation is busy; retry', 409);
+  }
+
+  private async reconciledTaskData(
+    task: Entity<Task>,
+    decision: TaskReconciliationRecord,
+    targetState: TaskState,
+  ): Promise<Task> {
+    const conversation = await this.store.get<Conversation>('conversation', task.data.conversationId, task.ownerId);
+    if (!conversation) throw new DomainError('not_found', 'Conversation not found', 404);
+    const base: Task = {
+      ...task.data,
+      state: targetState,
+      principal: decision.resumePrincipal,
+      grantExpiresAt: decision.grantExpiresAt,
+      pauseRequested: false,
+      nextAttemptAt: undefined,
+      workerId: undefined,
+      leaseExpiresAt: undefined,
+    };
+    if (targetState === 'cancelled') return { ...base, cancelRequested: true };
+    if (conversation.data.internalOperation) {
+      if (targetState === 'unknown') {
+        return {
+          ...base,
+          result: undefined,
+          error: 'Another dispatched side effect still requires reconciliation.',
+        };
+      }
+      if (decision.resolution === 'applied') {
+        return {
+          ...base,
+          result: JSON.stringify({
+            reconciled: 'applied',
+            ...(decision.toolCallId ? { toolCallId: decision.toolCallId } : {}),
+            ...(decision.toolOccurrenceId ? { toolOccurrenceId: decision.toolOccurrenceId } : {}),
+            message: 'Operator confirmed that the operation was applied.',
+            ...(decision.note ? { note: decision.note } : {}),
+          }),
+          error: undefined,
+        };
+      }
+      return { ...base, result: undefined, error: 'Operator confirmed that the operation was not applied.' };
+    }
+    const dispatch = reconciliationDispatch(decision);
+    const checkpoint = checkpointForDispatch(task.data.runtimeMessages, dispatch);
+    const messages = checkpoint && reconcileToolCall(checkpoint, {
+      ...(decision.toolCallId ? { toolCallId: decision.toolCallId } : {}),
+      ...(decision.toolOccurrenceId ? { toolOccurrenceId: decision.toolOccurrenceId } : {}),
+      ...(decision.actionHash ? { actionHash: decision.actionHash } : {}),
+      resolution: decision.resolution === 'abandon' ? 'not_applied' : decision.resolution,
+      ...(decision.note ? { note: decision.note } : {}),
+    });
+    if (!messages) throw new DomainError('not_resumable', 'The accepted checkpoint can no longer be reconciled', 409);
+    return {
+      ...base,
+      runtimeMessages: messages,
+      error: targetState === 'unknown'
+        ? 'Another dispatched side effect still requires reconciliation.'
+        : undefined,
+      approvedActionHashes: decision.resolution === 'not_applied' && decision.actionHash
+        ? task.data.approvedActionHashes.filter((hash) => hash !== decision.actionHash)
+        : task.data.approvedActionHashes,
+    };
+  }
+
+  private async fixedEvent(
+    task: Pick<Entity<Task>, 'id' | 'ownerId'>,
+    id: string,
+    payload: { type: string; [key: string]: unknown },
+    at: string,
+  ): Promise<void> {
+    const existing = await this.store.get<TaskEvent>('event', id, task.ownerId);
+    if (existing) {
+      assertFixedEvent(existing, task.id, payload, at);
+      return;
+    }
+    const data: TaskEvent = {
+      taskId: task.id,
+      sequence: await this.nextEventSequence(task.ownerId, task.id),
+      type: payload.type,
+      payload,
+      at,
+    };
+    try {
+      await this.store.create('event', task.ownerId, data, id);
+    } catch (error) {
+      if (!(error instanceof DomainError && error.code === 'conflict')) throw error;
+      const raced = await this.store.get<TaskEvent>('event', id, task.ownerId);
+      if (!raced) throw new DomainError('reconciliation_integrity', 'Reconciliation event conflict could not be verified', 409);
+      assertFixedEvent(raced, task.id, payload, at);
+    }
+  }
+
   public start(intervalMs = 1_000): void {
     if (this.timer) {
       return;
@@ -528,8 +813,17 @@ export class TaskService {
 
   private async tickInternal(): Promise<void> {
     await this.options.notifications?.reconcile();
-    await this.reconciler?.();
     let tasks = await this.store.scan<Task>('task');
+    for (const task of tasks) {
+      if (task.data.reconciliation?.phase !== 'pending') continue;
+      try {
+        await this.finishReconciliation(task);
+      } catch (error) {
+        this.options.onError?.(error);
+      }
+    }
+    await this.reconciler?.();
+    tasks = await this.store.scan<Task>('task');
     for (const task of tasks) {
       if (task.data.state === 'running'
         && !this.active.has(task.id)
@@ -905,31 +1199,118 @@ export class TaskService {
   }
 
   private async hasUnresolvedSideEffect(ownerId: string, taskId: string): Promise<boolean> {
-    const unresolved = new Set<string>();
+    return (await this.sideEffectDispatches(ownerId, taskId)).some((dispatch) => !dispatch.resolved);
+  }
+
+  private async sideEffectDispatches(ownerId: string, taskId: string): Promise<SideEffectDispatch[]> {
+    const dispatches: SideEffectDispatch[] = [];
     for (const row of await this.events(ownerId, taskId)) {
       const payload = row.data.payload as {
-        type?: string;
         toolCallId?: string;
         toolOccurrenceId?: string;
         actionHash?: string;
         sideEffect?: string;
         outcome?: string;
-        toolCall?: { id?: string };
+        toolCall?: { id?: string; occurrenceId?: string; name?: string; arguments?: Record<string, unknown> };
       };
-      const key = payload.toolOccurrenceId ?? payload.actionHash ?? payload.toolCallId ?? payload.toolCall?.id;
-      if (!key) {
-        continue;
-      }
       if (row.data.type === 'tool_dispatched'
         && (payload.sideEffect === 'write' || payload.sideEffect === 'external')) {
-        unresolved.add(key);
+        const toolCallId = payload.toolCallId ?? payload.toolCall?.id;
+        const toolOccurrenceId = payload.toolOccurrenceId ?? payload.toolCall?.occurrenceId;
+        dispatches.push({
+          sequence: row.data.sequence,
+          ...(toolCallId ? { toolCallId } : {}),
+          ...(toolOccurrenceId ? { toolOccurrenceId } : {}),
+          ...(payload.actionHash ? { actionHash: payload.actionHash } : {}),
+          ...(payload.toolCall?.name ? { toolName: payload.toolCall.name } : {}),
+          ...(payload.toolCall?.arguments ? { toolArguments: payload.toolCall.arguments } : {}),
+          sideEffect: payload.sideEffect,
+          resolved: false,
+        });
       }
       if (row.data.type === 'tool_result'
         && ['confirmed', 'failed', 'not_replayed'].includes(payload.outcome ?? '')) {
-        unresolved.delete(key);
+        const occurrence = payload.toolOccurrenceId ?? payload.toolCall?.occurrenceId;
+        let dispatch: SideEffectDispatch | undefined;
+        if (occurrence) {
+          dispatch = [...dispatches].reverse().find((candidate) => !candidate.resolved
+            && candidate.toolOccurrenceId === occurrence);
+        } else {
+          const rawId = payload.toolCallId ?? payload.toolCall?.id;
+          if (rawId) {
+            dispatch = [...dispatches].reverse().find((candidate) => !candidate.resolved
+              && !candidate.toolOccurrenceId && candidate.toolCallId === rawId
+              && (payload.actionHash === undefined || candidate.actionHash === payload.actionHash));
+          } else if (payload.actionHash) {
+            dispatch = [...dispatches].reverse().find((candidate) => !candidate.resolved
+              && candidate.actionHash === payload.actionHash);
+          }
+        }
+        if (dispatch) dispatch.resolved = true;
       }
     }
-    return unresolved.size > 0;
+    return dispatches;
+  }
+
+  private async restoreReconciledParents(child: Entity<Task>, decision: TaskReconciliationRecord): Promise<void> {
+    let childId = child.id;
+    let parentId = child.data.orchestration?.parentTaskId;
+    while (parentId) {
+      let parent: Entity<Task> | undefined;
+      const marker = { receiptId: decision.receiptId, childTaskId: childId, resolution: decision.resolution };
+      for (let attempt = 0; attempt < 16; attempt += 1) {
+        parent = await this.store.get<Task>('task', parentId, child.ownerId);
+        if (!parent) return;
+        const plan = parent.data.orchestration
+          ? await this.store.get<{ childIds: string[] }>('agent_plan', parent.data.orchestration.planId, child.ownerId)
+          : undefined;
+        if (!plan?.data.childIds.includes(childId)
+          || parent.data.cancelRequested
+          || parent.data.orchestration?.role !== 'parent'
+          || parent.data.orchestration.phase !== 'children'
+          || !['unknown', 'waiting_for_children'].includes(parent.data.state)
+          || (parent.data.state === 'unknown'
+            && !parent.data.error?.startsWith('Delegated work requires attention:'))
+          || await this.hasUnresolvedSideEffect(parent.ownerId, parent.id)
+          || !await this.planChildrenHaveAcceptedReceipts(parent.ownerId, plan.data.childIds)) return;
+        if (parent.data.state === 'waiting_for_children'
+          && sameValue(parent.data.reconciliationRestoration, marker)) break;
+        try {
+          parent = await this.store.put('task', parent.id, parent.ownerId, {
+            ...parent.data,
+            state: 'waiting_for_children',
+            error: undefined,
+            reconciliationRestoration: marker,
+          }, parent.revision);
+          break;
+        } catch (error) {
+          if (!(error instanceof DomainError && error.code === 'conflict')) throw error;
+        }
+        parent = undefined;
+      }
+      if (!parent) throw new DomainError('busy', 'Parent reconciliation restoration is busy; retry', 409);
+      await this.fixedEvent(parent, `${decision.receiptId}:parent:${parent.id}`, {
+        type: 'child_reconciled',
+        receiptId: decision.receiptId,
+        childTaskId: childId,
+        resolution: decision.resolution,
+        state: 'waiting_for_children',
+      }, decision.acceptedAt);
+      childId = parent.id;
+      parentId = parent.data.orchestration?.parentTaskId;
+    }
+  }
+
+  private async planChildrenHaveAcceptedReceipts(ownerId: string, childIds: string[]): Promise<boolean> {
+    for (const childId of childIds) {
+      const child = await this.store.get<Task>('task', childId, ownerId);
+      if (!child || child.data.reconciliation?.resolution === 'abandon') return false;
+      if (child.data.state !== 'unknown') continue;
+      const receiptId = child.data.reconciliation?.receiptId;
+      if (!receiptId || !await this.store.get<TaskEvent>('event', receiptId, ownerId)
+        || await this.hasUnresolvedSideEffect(ownerId, child.id)) return false;
+    }
+    return true;
   }
 
   private async confirmedResultArtifactIds(ownerId: string, taskId: string): Promise<string[]> {
@@ -1016,6 +1397,191 @@ const automationPermanentCodes = new Set([
   'grant_revoked',
   'invalid_automation_identity',
 ]);
+
+function notReconcilable(): DomainError {
+  return new DomainError('not_reconcilable', 'Only a task whose outcome is unknown can be reconciled', 409);
+}
+
+function hasReconciliationSelector(input: TaskReconciliation): boolean {
+  return input.dispatchSequence !== undefined || input.toolCallId !== undefined
+    || input.toolOccurrenceId !== undefined || input.actionHash !== undefined;
+}
+
+function reconciliationSelectorMatches(
+  decision: TaskReconciliationRecord,
+  input: TaskReconciliation,
+): boolean {
+  return hasReconciliationSelector(input)
+    && (input.dispatchSequence === undefined || decision.dispatchSequence === input.dispatchSequence)
+    && (input.toolCallId === undefined || decision.toolCallId === input.toolCallId)
+    && (input.toolOccurrenceId === undefined || decision.toolOccurrenceId === input.toolOccurrenceId)
+    && (input.actionHash === undefined || decision.actionHash === input.actionHash);
+}
+
+function explicitlyTargetsReconciliation(
+  decision: TaskReconciliationRecord,
+  input: TaskReconciliation,
+): boolean {
+  return reconciliationSelectorMatches(decision, input)
+    && (input.dispatchSequence !== undefined
+      || input.toolOccurrenceId !== undefined
+      || input.actionHash !== undefined);
+}
+
+function reconciliationTarget(dispatches: SideEffectDispatch[], input: TaskReconciliation): SideEffectDispatch {
+  let candidates = dispatches.filter((dispatch) => !dispatch.resolved);
+  if (input.dispatchSequence !== undefined) {
+    candidates = candidates.filter((dispatch) => dispatch.sequence === input.dispatchSequence);
+  }
+  if (input.toolOccurrenceId !== undefined) {
+    candidates = candidates.filter((dispatch) => dispatch.toolOccurrenceId === input.toolOccurrenceId);
+  }
+  if (input.actionHash !== undefined) {
+    candidates = candidates.filter((dispatch) => dispatch.actionHash === input.actionHash);
+  }
+  if (input.toolCallId !== undefined) {
+    candidates = candidates.filter((dispatch) => dispatch.toolCallId === input.toolCallId);
+  }
+  if (candidates.length !== 1) {
+    throw new DomainError(
+      candidates.length > 1 ? 'ambiguous_reconciliation' : 'invalid_reconciliation',
+      candidates.length > 1
+        ? 'The selector matches more than one unresolved dispatch; use its occurrence or sequence'
+        : 'The selector does not name an unresolved dispatch of this task',
+      409,
+    );
+  }
+  return candidates[0]!;
+}
+
+function reconciliationTargetState(
+  task: Task,
+  conversation: Conversation,
+  resolution: TaskReconciliationResolution,
+): TaskState {
+  if (task.cancelRequested || resolution === 'abandon') return 'cancelled';
+  if (conversation.internalOperation) return resolution === 'applied' ? 'completed' : 'failed';
+  return task.orchestration?.role === 'parent' && task.orchestration.phase === 'children'
+    ? 'waiting_for_children'
+    : 'queued';
+}
+
+function reconciliationActor(actor: Principal): TaskReconciliationRecord['actor'] {
+  return {
+    id: actor.id,
+    level: actor.level,
+    ...(actor.applicationId ? { applicationId: actor.applicationId } : {}),
+    ...(actor.issuer ? { issuer: actor.issuer } : {}),
+    ...(actor.subject ? { subject: actor.subject } : {}),
+  };
+}
+
+function assertSameReconciliation(
+  decision: TaskReconciliationRecord,
+  input: TaskReconciliation,
+  actor: Principal,
+): void {
+  const matches = decision.resolution === input.resolution
+    && decision.note === input.note
+    && (decision.dispatchSequence === undefined || hasReconciliationSelector(input))
+    && (input.dispatchSequence === undefined || decision.dispatchSequence === input.dispatchSequence)
+    && (input.toolCallId === undefined || decision.toolCallId === input.toolCallId)
+    && (input.toolOccurrenceId === undefined || decision.toolOccurrenceId === input.toolOccurrenceId)
+    && (input.actionHash === undefined || decision.actionHash === input.actionHash)
+    && sameValue(decision.actor, reconciliationActor(actor));
+  if (!matches) throw new DomainError('reconciliation_conflict', 'A different reconciliation decision was already accepted', 409);
+}
+
+function sameReconciliationDecision(left: TaskReconciliationRecord, right: TaskReconciliationRecord): boolean {
+  return sameValue({ ...left, phase: 'pending' }, { ...right, phase: 'pending' });
+}
+
+function reconciliationDispatch(decision: TaskReconciliationRecord): SideEffectDispatch {
+  if (decision.dispatchSequence === undefined || !decision.sideEffect) {
+    throw new DomainError('reconciliation_integrity', 'Reconciliation dispatch metadata is incomplete', 409);
+  }
+  return {
+    sequence: decision.dispatchSequence,
+    ...(decision.toolCallId ? { toolCallId: decision.toolCallId } : {}),
+    ...(decision.toolOccurrenceId ? { toolOccurrenceId: decision.toolOccurrenceId } : {}),
+    ...(decision.actionHash ? { actionHash: decision.actionHash } : {}),
+    ...(decision.toolName ? { toolName: decision.toolName } : {}),
+    sideEffect: decision.sideEffect,
+    resolved: false,
+  };
+}
+
+function checkpointForDispatch(messages: unknown[] | undefined, dispatch: SideEffectDispatch): ChatMessage[] | undefined {
+  if (!messages) return undefined;
+  const checkpoint = structuredClone(messages) as ChatMessage[];
+  const calls: Array<{ id: string; occurrenceId?: string; name: string; arguments: Record<string, unknown>; actionHash?: string }> = [];
+  for (const message of checkpoint) {
+    if (message.role !== 'assistant') continue;
+    for (const call of message.toolCalls ?? []) {
+      if (dispatch.toolOccurrenceId ? call.occurrenceId === dispatch.toolOccurrenceId : call.id === dispatch.toolCallId) {
+        calls.push(call);
+      }
+    }
+  }
+  const call = dispatch.toolOccurrenceId ? calls[0] : calls.at(-1);
+  if (!call || (dispatch.toolOccurrenceId && calls.length !== 1)
+    || (dispatch.toolName && call.name !== dispatch.toolName)
+    || (dispatch.toolArguments && !sameValue(call.arguments, dispatch.toolArguments))
+    || (call.actionHash !== undefined && call.actionHash !== dispatch.actionHash)) return undefined;
+  if (dispatch.actionHash) call.actionHash = dispatch.actionHash;
+  return checkpoint;
+}
+
+function reconciliationReceipt(taskId: string, decision: TaskReconciliationRecord): { type: string; [key: string]: unknown } {
+  if (decision.dispatchSequence === undefined || !decision.sideEffect) {
+    throw new DomainError('reconciliation_integrity', 'Reconciliation receipt metadata is incomplete', 409);
+  }
+  return {
+    type: 'tool_result',
+    taskId,
+    receiptId: decision.receiptId,
+    resolution: decision.resolution,
+    dispatchSequence: decision.dispatchSequence,
+    ...(decision.toolCallId ? { toolCallId: decision.toolCallId } : {}),
+    ...(decision.toolOccurrenceId ? { toolOccurrenceId: decision.toolOccurrenceId } : {}),
+    ...(decision.actionHash ? { actionHash: decision.actionHash } : {}),
+    sideEffect: decision.sideEffect,
+    isError: decision.resolution !== 'applied',
+    outcome: decision.resolution === 'applied' ? 'confirmed'
+      : decision.resolution === 'not_applied' ? 'failed' : 'unknown',
+    reconciled: decision.resolution,
+    ...(decision.note ? { note: decision.note } : {}),
+    actor: decision.actor,
+    acceptedAt: decision.acceptedAt,
+  };
+}
+
+function assertFixedEvent(
+  event: Entity<TaskEvent>,
+  taskId: string,
+  payload: { type: string; [key: string]: unknown },
+  at: string,
+): void {
+  if (event.data.taskId !== taskId || event.data.type !== payload.type
+    || event.data.at !== at || !sameValue(event.data.payload, payload)) {
+    throw new DomainError('reconciliation_integrity', 'A deterministic reconciliation event has different content', 409);
+  }
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return canonicalValue(left) === canonicalValue(right);
+}
+
+function canonicalValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalValue).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalValue(entry)}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
 
 function scopeCovered(grants: string[], requested: string): boolean {
   const namespace = requested.split(':')[0];

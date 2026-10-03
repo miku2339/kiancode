@@ -14,7 +14,13 @@ export interface WorkspaceWriteLeaseRecord extends WorkspaceWriteLease {
   workspaceId: string;
   taskId: string;
   state: 'active' | 'released' | 'unknown';
-  verification?: { note: string; verifiedAt: string };
+  verification?: { note: string; verifiedAt: string; receiptId?: string; resolution?: 'applied' | 'not_applied' };
+}
+
+export interface TaskLeaseReconciliation {
+  receiptId: string;
+  resolution: 'applied' | 'not_applied';
+  note: string;
 }
 
 export class WorkspaceWriteLeaseService {
@@ -70,6 +76,7 @@ export class WorkspaceWriteLeaseService {
     const row = await this.get(ownerId, workspaceId);
     if (!row) throw new DomainError('not_found', 'Workspace writer lease not found', 404);
     if (row.revision !== revision) throw new DomainError('conflict', 'Workspace writer lease changed', 409);
+    if (row.data.state === 'released') throw new DomainError('conflict', 'Workspace writer lease is already released', 409);
     if (row.data.state === 'active' && Date.parse(row.data.expiresAt) > this.now()) {
       throw new DomainError('workspace_busy', 'Workspace writer is still active', 409);
     }
@@ -79,12 +86,76 @@ export class WorkspaceWriteLeaseService {
     }
     const jobs = await this.store.scan<{ job: { workspaceWriteLease?: WorkspaceWriteLease }; state: string }>('device_job', ownerId);
     if (jobs.some((job) => job.data.job.workspaceWriteLease?.holderId === row.data.holderId
-      && ['queued', 'dispatched', 'unknown'].includes(job.data.state))) {
+      && ['queued', 'dispatched'].includes(job.data.state))) {
       throw new DomainError('outcome_unknown', 'Device operation still requires a confirmed outcome', 409);
     }
     return this.store.put('workspace_write_lease', row.id, ownerId, {
       ...row.data, state: 'released', verification: { note, verifiedAt: new Date(this.now()).toISOString() },
     }, revision);
+  }
+
+  async verifyTaskRelease(ownerId: string, workspaceId: string, taskId: string): Promise<boolean> {
+    const row = await this.get(ownerId, workspaceId);
+    if (!row || row.data.taskId !== taskId || row.data.state === 'released') return false;
+    if (row.data.state === 'active' && Date.parse(row.data.expiresAt) > this.now()) {
+      throw new DomainError('workspace_busy', 'Workspace writer is still active', 409);
+    }
+    const task = await this.store.get<{ state: string }>('task', taskId, ownerId);
+    if (task?.data.state === 'running') {
+      throw new DomainError('workspace_busy', 'Stop or recover the writing task before reconciling its lease', 409);
+    }
+    const jobs = await this.store.scan<{ job: { workspaceWriteLease?: WorkspaceWriteLease }; state: string }>('device_job', ownerId);
+    if (jobs.some((job) => job.data.job.workspaceWriteLease?.holderId === row.data.holderId
+      && ['queued', 'dispatched'].includes(job.data.state))) {
+      throw new DomainError('outcome_unknown', 'Device operation is still active', 409);
+    }
+    return true;
+  }
+
+  async releaseForTask(
+    ownerId: string,
+    workspaceId: string,
+    taskId: string,
+    reconciliation: TaskLeaseReconciliation,
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      const row = await this.get(ownerId, workspaceId);
+      if (!row || row.data.taskId !== taskId) return false;
+      if (row.data.state === 'released') {
+        if (row.data.verification?.receiptId === reconciliation.receiptId) {
+          if (row.data.verification.resolution !== reconciliation.resolution
+            || row.data.verification.note !== reconciliation.note) {
+            throw new DomainError('reconciliation_integrity', 'Workspace writer receipt has different reconciliation content', 409);
+          }
+          return true;
+        }
+        return false;
+      }
+      await this.verifyTaskRelease(ownerId, workspaceId, taskId);
+      const receipt = await this.store.get<{ taskId: string; type: string; payload: unknown }>('event', reconciliation.receiptId, ownerId);
+      const payload = receipt?.data.payload as { receiptId?: string; resolution?: string; reconciled?: string } | undefined;
+      if (!receipt || receipt.data.taskId !== taskId || receipt.data.type !== 'tool_result'
+        || payload?.receiptId !== reconciliation.receiptId
+        || (payload.resolution ?? payload.reconciled) !== reconciliation.resolution) {
+        throw new DomainError('invalid_reconciliation', 'A persisted reconciliation receipt is required before releasing the writer', 409);
+      }
+      try {
+        await this.store.put('workspace_write_lease', row.id, ownerId, {
+          ...row.data,
+          state: 'released',
+          verification: {
+            note: reconciliation.note,
+            verifiedAt: new Date(this.now()).toISOString(),
+            receiptId: reconciliation.receiptId,
+            resolution: reconciliation.resolution,
+          },
+        }, row.revision);
+        return true;
+      } catch (error) {
+        if (!(error instanceof DomainError && error.code === 'conflict')) throw error;
+      }
+    }
+    throw new DomainError('busy', 'Workspace writer lease is busy; retry', 409);
   }
 
   private async update(context: ToolContext, lease: WorkspaceWriteLease, state: WorkspaceWriteLeaseRecord['state']): Promise<void> {

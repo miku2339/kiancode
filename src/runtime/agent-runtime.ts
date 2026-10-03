@@ -684,7 +684,8 @@ class BudgetLedger {
 function pendingToolCalls(messages: ChatMessage[]): ToolCall[] {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message?.role === 'assistant' && message.toolCalls?.length) {
+    if (message?.role === 'assistant') {
+      if (!message.toolCalls?.length) return [];
       const receipts = messages.slice(index + 1).filter((candidate) => candidate.role === 'tool');
       return message.toolCalls.filter((call) => !receipts.some((receipt) => call.occurrenceId
         ? receipt.toolOccurrenceId === call.occurrenceId
@@ -692,6 +693,82 @@ function pendingToolCalls(messages: ChatMessage[]): ToolCall[] {
     }
   }
   return [];
+}
+
+export interface ToolCallReconciliation {
+  toolCallId?: string;
+  toolOccurrenceId?: string;
+  actionHash?: string;
+  resolution: 'applied' | 'not_applied';
+  note?: string;
+}
+
+export function reconcileToolCall(
+  messages: ChatMessage[],
+  reconciliation: ToolCallReconciliation,
+): ChatMessage[] | undefined {
+  if ((reconciliation.resolution !== 'applied' && reconciliation.resolution !== 'not_applied')
+    || (reconciliation.note !== undefined && typeof reconciliation.note !== 'string')
+    || (reconciliation.toolCallId === undefined
+      && reconciliation.toolOccurrenceId === undefined
+      && reconciliation.actionHash === undefined)) return undefined;
+  let turnIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === 'assistant') {
+      turnIndex = index;
+      break;
+    }
+  }
+  const turn = turnIndex >= 0 ? messages[turnIndex] : undefined;
+  if (!turn?.toolCalls?.length) return undefined;
+  const hasLocationSelector = reconciliation.toolCallId !== undefined
+    || reconciliation.toolOccurrenceId !== undefined;
+  const matchesSelectors = (call: ToolCall): boolean => {
+    if (reconciliation.toolCallId !== undefined && call.id !== reconciliation.toolCallId) return false;
+    if (reconciliation.toolOccurrenceId !== undefined
+      && call.occurrenceId !== reconciliation.toolOccurrenceId) return false;
+    if (reconciliation.actionHash !== undefined) {
+      if (call.actionHash !== undefined && call.actionHash !== reconciliation.actionHash) return false;
+      if (call.actionHash === undefined && !hasLocationSelector) return false;
+    }
+    return true;
+  };
+  const pendingMatches = pendingToolCalls(messages).filter(matchesSelectors);
+  const matches = pendingMatches.length > 0
+    ? pendingMatches
+    : turn.toolCalls.filter(matchesSelectors);
+  if (matches.length !== 1) return undefined;
+
+  const call = matches[0];
+  if (!call) return undefined;
+  const selectedActionHash = reconciliation.actionHash ?? call.actionHash;
+  const applied = reconciliation.resolution === 'applied';
+  const lines = [applied
+    ? 'Reconciled by an operator: this action was applied. Its original output is unavailable; inspect the result before relying on it.'
+    : 'Reconciled by an operator: this action was not applied and was not retried. Request it again if it is still required; a new approval is needed.'];
+  const note = reconciliation.note?.trim().slice(0, 2_000);
+  if (note) lines.push(`Operator note: ${note}`);
+  const receipt: ChatMessage = {
+    role: 'tool',
+    content: lines.join('\n'),
+    name: call.name,
+    toolCallId: call.id,
+    ...(call.occurrenceId ? { toolOccurrenceId: call.occurrenceId } : {}),
+    ...(applied && selectedActionHash ? { actionHash: selectedActionHash } : {}),
+    toolOutcome: applied ? 'confirmed' : 'failed',
+  };
+  if (pendingMatches.length === 0) {
+    const receipts = messages.slice(turnIndex + 1).filter((message) => message.role === 'tool'
+      && (call.occurrenceId
+        ? message.toolOccurrenceId === call.occurrenceId
+        : message.toolCallId === call.id));
+    return receipts.length === 1 && stableJson(receipts[0]) === stableJson(receipt)
+      ? [...messages]
+      : undefined;
+  }
+  if (selectedActionHash && messages.some((message) => message.role === 'tool'
+    && message.actionHash === selectedActionHash)) return undefined;
+  return [...messages, receipt];
 }
 
 function normalizeProviderMessage(message: ChatMessage): ChatMessage {

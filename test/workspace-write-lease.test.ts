@@ -49,13 +49,43 @@ test('a crashed or unknown writer blocks writes until stopped operation is verif
     await assert.rejects(restarted.reconcile('owner', 'workspace', row.revision, 'checked'), /Stop or recover/);
     await store.put('task', task.id, task.ownerId, { state: 'unknown' }, task.revision);
     await store.create('device_job', 'owner', { job: { workspaceWriteLease: stale }, state: 'unknown' }, 'unknown-job');
-    await assert.rejects(restarted.reconcile('owner', 'workspace', row.revision, 'checked'), /confirmed outcome/);
-    const job = (await store.get<{ job: { workspaceWriteLease: typeof stale }; state: string }>('device_job', 'unknown-job', 'owner'))!;
-    await store.put('device_job', job.id, job.ownerId, { ...job.data, state: 'confirmed' }, job.revision);
     await restarted.reconcile('owner', 'workspace', row.revision, 'Confirmed device receipt and read back the file');
     const next = await restarted.acquire(context('next'));
     assert.equal(next.epoch, 2);
     assert.equal(await restarted.validate('owner', 'workspace', 'crashed', stale), false);
+  } finally { await store.close(); }
+});
+
+test('task reconciliation releases only its stopped writer after its receipt is durable', async () => {
+  const store = new SqliteStore(); let now = Date.now();
+  const service = new WorkspaceWriteLeaseService(store, () => now, 100);
+  try {
+    const lease = await service.acquire(context('task'));
+    const task = await store.create('task', 'owner', { state: 'unknown' }, 'task');
+    const reconciliation = { receiptId: 'task:receipt', resolution: 'applied' as const, note: 'Checked file' };
+    await assert.rejects(service.releaseForTask('owner', 'workspace', task.id, reconciliation), /still active/);
+    now += 101;
+    let job = await store.create('device_job', 'owner', { job: { workspaceWriteLease: lease }, state: 'queued' }, 'active-job');
+    await assert.rejects(service.releaseForTask('owner', 'workspace', task.id, reconciliation), /still active/);
+    job = await store.put('device_job', job.id, job.ownerId, { ...job.data, state: 'dispatched' }, job.revision);
+    await assert.rejects(service.releaseForTask('owner', 'workspace', task.id, reconciliation), /still active/);
+    await store.put('device_job', job.id, job.ownerId, { ...job.data, state: 'unknown' }, job.revision);
+    await assert.rejects(service.releaseForTask('owner', 'workspace', task.id, reconciliation), /receipt is required/);
+    await store.create('event', 'owner', {
+      taskId: task.id,
+      sequence: 1,
+      type: 'tool_result',
+      payload: { type: 'tool_result', receiptId: reconciliation.receiptId, resolution: 'applied' },
+      at: new Date(now).toISOString(),
+    }, reconciliation.receiptId);
+    assert.equal(await service.releaseForTask('owner', 'workspace', task.id, reconciliation), true);
+    assert.equal(await service.releaseForTask('owner', 'workspace', task.id, reconciliation), true);
+    assert.deepEqual((await service.get('owner', 'workspace'))?.data.verification, {
+      note: 'Checked file',
+      verifiedAt: new Date(now).toISOString(),
+      receiptId: reconciliation.receiptId,
+      resolution: 'applied',
+    });
   } finally { await store.close(); }
 });
 
