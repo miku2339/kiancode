@@ -40,6 +40,7 @@ export interface OrchestrationPlan {
   fingerprint: string;
   aggregationClaimed: boolean;
   parentTransition?: 'coordinator' | 'runner';
+  integrationBoundary?: { parentEventSequence: number };
   verification?: { at: string; evidence: string };
 }
 
@@ -66,6 +67,28 @@ export interface OrchestrationResults {
   verificationRequired: boolean;
 }
 
+export interface ChildWorkspaceChange {
+  path?: string;
+  tool: string;
+  actionHash: string;
+  at: string;
+}
+
+export interface ChildExternalAction {
+  taskId: string;
+  tool: string;
+  actionHash: string;
+  arguments: Record<string, unknown>;
+  confirmation?: 'owner_reconciled';
+  confirmationActor?: Record<string, unknown>;
+  approval?: 'missing';
+}
+
+export interface ChildSideEffects {
+  changes: ChildWorkspaceChange[];
+  externalActions: ChildExternalAction[];
+}
+
 interface ChildSlots {
   children: Record<string, { planId: string; reservedAt: string }>;
 }
@@ -76,6 +99,10 @@ interface ParentPlanClaim {
   fingerprint: string;
   generation: number;
   claimedAt: string;
+}
+
+interface EventSequence {
+  next: number;
 }
 
 interface PreparedChildren {
@@ -91,16 +118,23 @@ interface PreparedChildren {
 }
 
 interface ConfirmedAction {
+  taskId: string;
   actionHash: string;
   tool: string;
   arguments: Record<string, unknown>;
   sideEffect?: string;
   result?: unknown;
+  at: string;
+  dispatchSequence: number;
+  resultSequence: number;
+  reconciled: boolean;
+  reconciliationActor?: Record<string, unknown>;
 }
 
 const terminalStates = new Set<TaskState>(['completed', 'failed', 'cancelled', 'unknown']);
 const terminalPlanStates = new Set<OrchestrationPlan['state']>(['completed', 'cancelled']);
 const planKeyPattern = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
+const workspaceMutationTools = new Set(['workspace.write', 'workspace.patch', 'workspace.restore']);
 
 function digest(value: string): string {
   return createHash('sha256').update(value).digest('hex');
@@ -130,7 +164,8 @@ function confirmedActions(
 ): ConfirmedAction[] {
   const dispatched = new Map<string, ConfirmedAction>();
   const confirmed: ConfirmedAction[] = [];
-  for (const event of events.filter(include).sort((left, right) => left.data.sequence - right.data.sequence)) {
+  for (const event of events.filter(include).sort((left, right) => left.data.taskId.localeCompare(right.data.taskId)
+    || left.data.sequence - right.data.sequence)) {
     const payload = event.data.payload as {
       actionHash?: string;
       toolCallId?: string;
@@ -139,19 +174,36 @@ function confirmedActions(
       outcome?: string;
       isError?: boolean;
       result?: unknown;
+      reconciled?: string;
+      actor?: unknown;
     };
-    const key = payload.actionHash ?? payload.toolCallId ?? payload.toolCall?.id;
-    if (!key) continue;
+    const actionKey = payload.actionHash ?? payload.toolCallId ?? payload.toolCall?.id;
+    if (!actionKey) continue;
+    const key = `${event.data.taskId}\0${actionKey}`;
     if (event.data.type === 'tool_dispatched' && payload.toolCall?.name) {
       dispatched.set(key, {
-        actionHash: key,
+        taskId: event.data.taskId,
+        actionHash: actionKey,
         tool: payload.toolCall.name,
         arguments: payload.toolCall.arguments ?? {},
         sideEffect: payload.sideEffect,
+        at: event.data.at,
+        dispatchSequence: event.data.sequence,
+        resultSequence: event.data.sequence,
+        reconciled: false,
       });
     } else if (event.data.type === 'tool_result' && payload.outcome === 'confirmed' && !payload.isError) {
       const action = dispatched.get(key);
-      if (action) confirmed.push({ ...action, result: payload.result });
+      if (action) confirmed.push({
+        ...action,
+        result: payload.result,
+        at: event.data.at,
+        resultSequence: event.data.sequence,
+        reconciled: payload.reconciled === 'applied',
+        ...(payload.reconciled === 'applied' && payload.actor && typeof payload.actor === 'object'
+          ? { reconciliationActor: payload.actor as Record<string, unknown> }
+          : {}),
+      });
     }
   }
   return confirmed;
@@ -169,7 +221,8 @@ function resultPath(result: unknown): string | undefined {
   const content = (result as { content?: unknown }).content;
   if (typeof content !== 'string') return undefined;
   try {
-    return normalizedWorkspacePath((JSON.parse(content) as { path?: unknown }).path);
+    const parsed = JSON.parse(content) as { path?: unknown; restored?: unknown };
+    return normalizedWorkspacePath(parsed.path) ?? normalizedWorkspacePath(parsed.restored);
   } catch {
     return undefined;
   }
@@ -181,13 +234,163 @@ function changedWorkspacePath(action: ConfirmedAction): string | undefined {
   return undefined;
 }
 
+function parsedResult(action: ConfirmedAction): Record<string, unknown> | undefined {
+  if (!action.result || typeof action.result !== 'object') return undefined;
+  const content = (action.result as { content?: unknown }).content;
+  if (typeof content !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeCommandSegments(command: string): string[] | undefined {
+  const trimmed = command.trim();
+  if (!trimmed || trimmed.includes('\n') || trimmed.includes('\r')) return undefined;
+  const withoutRedirections = trimmed.replace(/\b\d*>&\d+\b/g, '');
+  if (/[;|`$<>]/.test(withoutRedirections)) return undefined;
+  const segments = withoutRedirections.split('&&').map((segment) => segment.trim());
+  if (segments.some((segment) => !segment || segment.includes('&'))) return undefined;
+  return segments;
+}
+
+function successfulTerminalAction(action: ConfirmedAction): boolean {
+  if (action.tool !== 'terminal.run' || action.reconciled || typeof action.arguments.command !== 'string') return false;
+  const cwd = action.arguments.cwd;
+  if (cwd !== undefined && (typeof cwd !== 'string'
+    || path.posix.normalize(cwd.trim().replaceAll('\\', '/')) !== '.')) return false;
+  const result = parsedResult(action);
+  return result?.exitCode === 0
+    && (result.signal === undefined || result.signal === null)
+    && result.timedOut !== true
+    && result.aborted !== true;
+}
+
+const environmentPrefix = '(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s;&|`$()]+\\s+)*';
+const testRunnerCommand = new RegExp(`^${environmentPrefix}(?:npm\\s+(?:test|run\\s+test(?::[A-Za-z0-9._-]+)?)|swift\\s+test|pytest|cargo\\s+test)$`);
+
+function runsWorkspaceTests(action: ConfirmedAction): boolean {
+  if (!successfulTerminalAction(action)) return false;
+  const segments = safeCommandSegments(action.arguments.command as string);
+  return segments !== undefined && segments.every((segment) => testRunnerCommand.test(segment));
+}
+
 function verifiesWorkspacePath(action: ConfirmedAction, resource: string): boolean {
-  if (action.tool === 'workspace.read') return normalizedWorkspacePath(action.arguments.path) === resource;
-  if (action.tool !== 'terminal.run' || typeof action.arguments.command !== 'string') return false;
-  const command = action.arguments.command;
-  const escaped = resource.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(^|[\\s'\"]|\\./)${escaped}([\\s'\"]|$)`).test(command)
-    && /(^|[;&|]\s*|\b)(cat|test|git\s+(diff|status)|npm\s+(test|run\s+test)|swift\s+test|pytest|cargo\s+test)\b/.test(command);
+  if (action.tool === 'workspace.read') {
+    const result = parsedResult(action);
+    return normalizedWorkspacePath(action.arguments.path) === resource
+      && normalizedWorkspacePath(result?.path) === resource
+      && typeof result?.sha256 === 'string'
+      && /^[a-f0-9]{64}$/.test(result.sha256);
+  }
+  return false;
+}
+
+function verifiesChange(check: ConfirmedAction, change: ChildWorkspaceChange): boolean {
+  return runsWorkspaceTests(check) || (change.path !== undefined && verifiesWorkspacePath(check, change.path));
+}
+
+function verificationFailureMessage(missing: ChildWorkspaceChange[]): string {
+  const labels = missing.map(childChangeLabel);
+  const more = labels.length > 20 ? ` and ${labels.length - 20} more` : '';
+  return `Delegated work is unverified. Before its final answer the parent must read each child-changed workspace path with workspace.read or run a passing test command in the workspace. Not verified: ${labels.slice(0, 20).join(', ')}${more}`.slice(0, 2_000);
+}
+
+function collectChildSideEffects(
+  events: Array<Entity<TaskEvent>>,
+  childIds: string[],
+  approvedActionHashes: Map<string, Set<string>>,
+): ChildSideEffects {
+  const children = new Set(childIds);
+  const changes = new Map<string, { change: ChildWorkspaceChange; taskId: string; sequence: number }>();
+  const externalActions: ChildExternalAction[] = [];
+  for (const action of confirmedActions(events, (event) => children.has(event.data.taskId))) {
+    if (action.sideEffect !== 'write' && action.sideEffect !== 'external') continue;
+    if (!workspaceMutationTools.has(action.tool)) {
+      externalActions.push({
+        taskId: action.taskId,
+        tool: action.tool,
+        actionHash: action.actionHash,
+        arguments: action.arguments,
+        ...(action.reconciled ? { confirmation: 'owner_reconciled' as const } : {}),
+        ...(action.reconciliationActor ? { confirmationActor: action.reconciliationActor } : {}),
+        ...(!approvedActionHashes.get(action.taskId)?.has(action.actionHash) ? { approval: 'missing' as const } : {}),
+      });
+      continue;
+    }
+    const resource = changedWorkspacePath(action);
+    const key = resource ?? `\0${action.actionHash}`;
+    const previous = changes.get(key);
+    if (previous && (previous.taskId !== action.taskId || previous.sequence > action.resultSequence)) continue;
+    changes.set(key, {
+      change: {
+        ...(resource ? { path: resource } : {}),
+        tool: action.tool,
+        actionHash: action.actionHash,
+        at: action.at,
+      },
+      taskId: action.taskId,
+      sequence: action.resultSequence,
+    });
+  }
+  return {
+    changes: [...changes.values()].map(({ change }) => change)
+      .sort((left, right) => childChangeLabel(left).localeCompare(childChangeLabel(right))),
+    externalActions,
+  };
+}
+
+export function childChangeLabel(change: ChildWorkspaceChange): string {
+  return change.path ?? `${change.tool} (path not reported)`;
+}
+
+function tasksWithUnresolvedSideEffects(events: Array<Entity<TaskEvent>>, taskIds: string[]): Set<string> {
+  const tasks = new Set(taskIds);
+  const unresolved = new Map<string, Array<{
+    toolCallId?: string;
+    toolOccurrenceId?: string;
+    actionHash?: string;
+  }>>();
+  for (const event of events
+    .filter((candidate) => tasks.has(candidate.data.taskId))
+    .sort((left, right) => left.data.taskId.localeCompare(right.data.taskId)
+      || left.data.sequence - right.data.sequence)) {
+    const payload = event.data.payload as {
+      toolCallId?: string;
+      toolOccurrenceId?: string;
+      actionHash?: string;
+      sideEffect?: string;
+      outcome?: string;
+      toolCall?: { id?: string; occurrenceId?: string };
+    };
+    const pending = unresolved.get(event.data.taskId) ?? [];
+    if (event.data.type === 'tool_dispatched'
+      && (payload.sideEffect === 'write' || payload.sideEffect === 'external')) {
+      pending.push({
+        ...(payload.toolCallId ?? payload.toolCall?.id ? { toolCallId: payload.toolCallId ?? payload.toolCall?.id } : {}),
+        ...(payload.toolOccurrenceId ?? payload.toolCall?.occurrenceId
+          ? { toolOccurrenceId: payload.toolOccurrenceId ?? payload.toolCall?.occurrenceId }
+          : {}),
+        ...(payload.actionHash ? { actionHash: payload.actionHash } : {}),
+      });
+      unresolved.set(event.data.taskId, pending);
+      continue;
+    }
+    if (event.data.type !== 'tool_result'
+      || !['confirmed', 'failed', 'not_replayed'].includes(payload.outcome ?? '')) continue;
+    const occurrence = payload.toolOccurrenceId ?? payload.toolCall?.occurrenceId;
+    const rawId = payload.toolCallId ?? payload.toolCall?.id;
+    const index = [...pending].reverse().findIndex((dispatch) => occurrence
+      ? dispatch.toolOccurrenceId === occurrence
+      : rawId
+        ? !dispatch.toolOccurrenceId && dispatch.toolCallId === rawId
+          && (payload.actionHash === undefined || dispatch.actionHash === payload.actionHash)
+        : payload.actionHash !== undefined && dispatch.actionHash === payload.actionHash);
+    if (index >= 0) pending.splice(pending.length - index - 1, 1);
+  }
+  return new Set([...unresolved.entries()].filter(([, pending]) => pending.length > 0).map(([taskId]) => taskId));
 }
 
 function validateRequest(request: PrepareChildrenRequest): ChildStrategy {
@@ -321,6 +524,8 @@ export class AgentCoordinator {
   public async results(ownerId: string, planId: string): Promise<OrchestrationResults> {
     const plan = await this.requirePlan(ownerId, planId);
     const tasks = await Promise.all(plan.data.childIds.map((id) => this.requireTask(ownerId, id)));
+    const events = await this.store.scan<TaskEvent>('event', ownerId);
+    const unresolved = tasksWithUnresolvedSideEffects(events, plan.data.childIds);
     await this.cleanSlots(ownerId);
     const children = tasks.map((task): ChildResult => ({
       id: task.id,
@@ -330,13 +535,17 @@ export class AgentCoordinator {
       error: task.data.error,
       attachmentIds: task.data.attachmentIds ?? [],
     }));
-    const ready = tasks.every((task) => task.data.reconciliation?.phase !== 'pending')
+    const ready = tasks.every((task) => task.data.reconciliation?.phase !== 'pending'
+      && !(task.data.reconciliation?.phase === 'complete' && unresolved.has(task.id)))
       && children.every((child) => terminalStates.has(child.state));
+    const successful = ready
+      && children.every((child) => child.state === 'completed')
+      && tasks.every((task) => !unresolved.has(task.id));
     return {
       plan,
       children,
       ready,
-      successful: ready && children.every((child) => child.state === 'completed'),
+      successful,
       aggregateRequired: ready && plan.data.strategy === 'moa',
       verificationRequired: plan.data.state !== 'completed',
     };
@@ -375,16 +584,66 @@ export class AgentCoordinator {
     const outcome = await this.results(ownerId, planId);
     if (!outcome.ready) throw new DomainError('children_running', 'Child tasks have not finished', 409);
     if (!outcome.successful) throw new DomainError('child_failed', 'All children must complete before parent integration', 409);
-    if (plan.data.strategy === 'moa') {
-      plan = await this.changePlan(ownerId, plan.id, (current) => {
-        if (current.aggregationClaimed) return current;
-        return { ...current, aggregationClaimed: true, state: 'integrating' };
-      });
-    } else if (plan.data.state !== 'integrating') {
-      plan = await this.changePlan(ownerId, plan.id, (current) => ({ ...current, state: 'integrating' }));
+    const parent = await this.requireTask(ownerId, plan.data.parentTaskId);
+    if (['completed', 'cancelled'].includes(plan.data.state)) {
+      throw new DomainError('plan_not_runnable', 'Child plan has already stopped', 409);
     }
+    if (!['waiting', 'integrating'].includes(plan.data.state)) {
+      throw new DomainError('plan_not_runnable', 'Child plan is not ready for integration', 409);
+    }
+    const sameChildrenPhase = parent.data.orchestration?.planId === plan.id
+      && parent.data.orchestration.phase === 'children';
+    const canCreateBoundary = sameChildrenPhase && (parent.data.state === 'waiting_for_children'
+      || (plan.data.parentTransition === 'runner' && parent.data.state === 'running'));
+    if (!plan.data.integrationBoundary && !canCreateBoundary) {
+      throw new DomainError('integration_incomplete', 'Legacy integration has no safe event boundary and must be checked again', 409);
+    }
+    const parentEvents = (await this.store.scan<TaskEvent>('event', ownerId))
+      .filter((event) => event.data.taskId === plan.data.parentTaskId);
+    const cursor = await this.store.get<EventSequence>('event_sequence', plan.data.parentTaskId, ownerId);
+    const parentEventSequence = Math.max(
+      0,
+      cursor ? cursor.data.next - 1 : 0,
+      ...parentEvents.map((event) => event.data.sequence),
+    );
+    plan = await this.changePlan(ownerId, plan.id, (current) => {
+      if (current.state === 'completed' || current.state === 'cancelled') {
+        throw new DomainError('plan_not_runnable', 'Child plan has already stopped', 409);
+      }
+      if (!current.integrationBoundary && !canCreateBoundary) {
+        throw new DomainError('integration_incomplete', 'Legacy integration has no safe event boundary and must be checked again', 409);
+      }
+      if (current.state !== 'waiting' && current.state !== 'integrating') {
+        throw new DomainError('plan_not_runnable', 'Child plan is not ready for integration', 409);
+      }
+      return {
+        ...current,
+        state: 'integrating',
+        aggregationClaimed: current.aggregationClaimed || current.strategy === 'moa',
+        integrationBoundary: current.integrationBoundary ?? { parentEventSequence },
+      };
+    });
     return this.changeTask(ownerId, plan.data.parentTaskId, (task) => {
-      if (['queued', 'running', 'completed'].includes(task.state)) return task;
+      if (task.state === 'running') {
+        if (parent.data.state === 'running' && task.workerId !== parent.data.workerId) {
+          throw new DomainError('integration_incomplete', 'Parent execution changed before integration could be queued', 409);
+        }
+        if (task.orchestration?.planId !== plan.id) {
+          throw new DomainError('integration_incomplete', 'Parent orchestration no longer matches the child plan', 409);
+        }
+        return task.orchestration.phase === 'integration'
+          ? task
+          : { ...task, orchestration: { ...task.orchestration, phase: 'integration', verification: 'pending' } };
+      }
+      if (task.state === 'queued') {
+        if (task.orchestration?.planId !== plan.id) {
+          throw new DomainError('integration_incomplete', 'Parent orchestration no longer matches the child plan', 409);
+        }
+        return task.orchestration.phase === 'integration'
+          ? task
+          : { ...task, orchestration: { ...task.orchestration, phase: 'integration', verification: 'pending' } };
+      }
+      if (task.state === 'completed') throw new DomainError('terminal_task', 'Parent task already stopped', 409);
       if (terminalStates.has(task.state)) throw new DomainError('terminal_task', 'Parent task already stopped', 409);
       if (task.state !== 'waiting_for_children') {
         throw new DomainError('parent_not_waiting', 'Parent task is not waiting for child results', 409);
@@ -403,51 +662,126 @@ export class AgentCoordinator {
     });
   }
 
+  public async childSideEffects(ownerId: string, planId: string): Promise<ChildSideEffects> {
+    const plan = await this.requirePlan(ownerId, planId);
+    const tasks = await Promise.all(plan.data.childIds.map((childId) => this.requireTask(ownerId, childId)));
+    const approved = new Map(tasks.map((task) => [task.id, new Set(task.data.approvedActionHashes)]));
+    return collectChildSideEffects(await this.store.scan<TaskEvent>('event', ownerId), plan.data.childIds, approved);
+  }
+
   public async verifyIntegration(ownerId: string, planId: string, _claimedEvidence?: string): Promise<Entity<OrchestrationPlan>> {
     const plan = await this.requirePlan(ownerId, planId);
-    const parent = await this.requireTask(ownerId, plan.data.parentTaskId);
-    if (!['integrating', 'completed'].includes(plan.data.state) || parent.data.state !== 'completed') {
-      throw new DomainError('integration_incomplete', 'Parent integration must complete before verification', 409);
+    let parent = await this.requireTask(ownerId, plan.data.parentTaskId);
+    if (!['integrating', 'completed'].includes(plan.data.state) || !['running', 'completed'].includes(parent.data.state)) {
+      throw new DomainError('integration_incomplete', 'Parent integration must be running or complete before verification', 409);
+    }
+    if (plan.data.state === 'integrating' && plan.data.integrationBoundary
+      && parent.data.state === 'running' && parent.data.orchestration?.planId === plan.id
+      && parent.data.orchestration.phase === 'children') {
+      const expectedWorker = parent.data.workerId;
+      parent = await this.changeTask(ownerId, parent.id, (task) => {
+        if (task.state !== 'running' || task.workerId !== expectedWorker
+          || task.orchestration?.planId !== plan.id || task.orchestration.phase !== 'children') {
+          throw new DomainError('integration_incomplete', 'Recovered parent execution changed before verification', 409);
+        }
+        return { ...task, orchestration: { ...task.orchestration, phase: 'integration', verification: 'pending' } };
+      });
+    }
+    const outcome = await this.results(ownerId, plan.id);
+    if (!outcome.ready || !outcome.successful) {
+      const error = new DomainError('verification_failed', 'Delegated work changed after integration started or still has an unresolved outcome', 409);
+      if (parent.data.state === 'running') await this.markParentVerification(ownerId, plan.id, parent, 'failed');
+      throw error;
     }
     if (plan.data.state === 'completed' && plan.data.verification) {
-      await this.markParentVerified(ownerId, parent.id);
+      await this.markParentVerification(ownerId, plan.id, parent, 'passed');
       return plan;
     }
-    const evidence = await this.integrationEvidence(ownerId, plan);
-    const verified = await this.changePlan(ownerId, plan.id, (current) => current.state === 'completed'
-      ? current
-      : { ...current, state: 'completed', verification: { at: new Date(this.now()).toISOString(), evidence } });
-    await this.markParentVerified(ownerId, parent.id);
+    if (plan.data.state === 'completed') {
+      throw new DomainError('verification_failed', 'Completed integration has no persisted verification proof', 409);
+    }
+    let evidence: string;
+    try {
+      evidence = await this.integrationEvidence(ownerId, plan);
+    } catch (error) {
+      if (error instanceof DomainError && error.code === 'verification_failed' && parent.data.state === 'running') {
+        await this.markParentVerification(ownerId, plan.id, parent, 'failed');
+      }
+      throw error;
+    }
+    const verified = await this.changePlan(ownerId, plan.id, (current) => {
+      if (current.state === 'completed' && current.verification) return current;
+      if (current.state !== 'integrating'
+        || current.integrationBoundary?.parentEventSequence !== plan.data.integrationBoundary?.parentEventSequence) {
+        throw new DomainError('integration_incomplete', 'Integration plan changed before verification could be saved', 409);
+      }
+      return { ...current, state: 'completed', verification: { at: new Date(this.now()).toISOString(), evidence } };
+    });
+    await this.markParentVerification(ownerId, plan.id, parent, 'passed');
     return verified;
   }
 
   private async integrationEvidence(ownerId: string, plan: Entity<OrchestrationPlan>): Promise<string> {
+    const boundary = plan.data.integrationBoundary?.parentEventSequence;
+    if (boundary === undefined) {
+      throw new DomainError('verification_failed', 'Delegated work is unverified because its integration event boundary is missing; re-run integration checks', 409);
+    }
     const events = await this.store.scan<TaskEvent>('event', ownerId);
-    const childIds = new Set(plan.data.childIds);
-    const mutations = confirmedActions(events, (event) => childIds.has(event.data.taskId))
-      .filter((action) => action.sideEffect === 'write' || action.sideEffect === 'external');
-    if (mutations.length === 0) return 'No confirmed child side effects required resource verification.';
-    const resources = new Map<string, string>();
-    for (const mutation of mutations) {
-      const resource = changedWorkspacePath(mutation);
-      if (!resource) {
-        throw new DomainError('verification_required', 'A confirmed child side effect has no resource evidence for parent verification', 409);
-      }
-      resources.set(resource, mutation.actionHash);
+    const tasks = await Promise.all(plan.data.childIds.map((childId) => this.requireTask(ownerId, childId)));
+    const approved = new Map(tasks.map((task) => [task.id, new Set(task.data.approvedActionHashes)]));
+    const effects = collectChildSideEffects(events, plan.data.childIds, approved);
+    const missingApprovals = effects.externalActions.filter((action) => action.approval === 'missing');
+    if (missingApprovals.length) {
+      throw new DomainError(
+        'verification_failed',
+        `Delegated work has confirmed external receipts without the child's exact approval record: ${missingApprovals.map((action) => `${action.tool} (${action.actionHash})`).join(', ')}`.slice(0, 2_000),
+        409,
+      );
+    }
+    const actualExternal = effects.externalActions
+      .filter((action) => action.confirmation !== 'owner_reconciled')
+      .map((action) => `${action.tool} (${action.actionHash})`);
+    const reconciledExternal = effects.externalActions
+      .filter((action) => action.confirmation === 'owner_reconciled')
+      .map((action) => `${action.tool} (${action.actionHash})`);
+    const recorded = [
+      ...(actualExternal.length ? [
+        `Confirmed external child actions, individually approved and not re-verified: ${actualExternal.join(', ')}`,
+      ] : []),
+      ...(reconciledExternal.length ? [
+        `Owner-confirmed reconciled child actions, not treated as runtime receipts: ${reconciledExternal.join(', ')}`,
+      ] : []),
+    ].join('. ').slice(0, 1_000);
+    if (effects.changes.length === 0) {
+      return recorded
+        ? `No child workspace changes required verification. ${recorded}`
+        : 'No confirmed child side effects required resource verification.';
     }
     const checks = confirmedActions(events, (event) => event.data.taskId === plan.data.parentTaskId
-      && event.data.at >= plan.updatedAt);
-    const verified = [...resources.entries()].filter(([resource]) => checks.some((check) => verifiesWorkspacePath(check, resource)));
-    if (verified.length !== resources.size) {
-      throw new DomainError('verification_required', 'Parent verification must inspect or test every confirmed child resource', 409);
-    }
-    return `Parent verified child resources: ${verified.map(([resource, actionHash]) => `${resource} (${actionHash})`).join(', ').slice(0, 3_900)}`;
+      && event.data.sequence > boundary);
+    const missing = effects.changes.filter((change) => !checks.some((check) => verifiesChange(check, change)));
+    if (missing.length > 0) throw new DomainError('verification_failed', verificationFailureMessage(missing), 409);
+    const resources = effects.changes.map((change) => `${childChangeLabel(change)} (${change.actionHash})`).join(', ');
+    return `${`Parent verified child resources: ${resources}`.slice(0, 2_900)}${recorded ? `. ${recorded}` : ''}`;
   }
 
-  private async markParentVerified(ownerId: string, parentId: string): Promise<void> {
-    await this.changeTask(ownerId, parentId, (task) => task.orchestration
-      ? { ...task, orchestration: { ...task.orchestration, verification: 'passed' } }
-      : task);
+  private async markParentVerification(
+    ownerId: string,
+    planId: string,
+    expected: Entity<Task>,
+    verification: 'passed' | 'failed',
+  ): Promise<void> {
+    await this.changeTask(ownerId, expected.id, (task) => {
+      if (!task.orchestration || task.orchestration.planId !== planId || task.orchestration.phase !== 'integration') {
+        throw new DomainError('integration_incomplete', 'Parent orchestration metadata no longer matches integration', 409);
+      }
+      const sameRun = expected.data.state === 'running'
+        ? task.state === 'running' && task.workerId === expected.data.workerId
+        : task.state === 'completed';
+      if (!sameRun) throw new DomainError('integration_incomplete', 'Parent execution stopped before verification could be saved', 409);
+      if (task.orchestration.verification === verification) return task;
+      return { ...task, orchestration: { ...task.orchestration, verification } };
+    });
   }
 
   private async adoptParentUsage(
@@ -541,6 +875,7 @@ export class AgentCoordinator {
   ): Promise<void> {
     const plans = (await this.store.scan<OrchestrationPlan>('agent_plan', ownerId))
       .filter((plan) => plan.data.parentTaskId === parentTaskId && !['completed', 'cancelled'].includes(plan.data.state));
+    const parent = plans.length ? await this.store.get<Task>('task', parentTaskId, ownerId) : undefined;
     for (const plan of plans) {
       for (const childId of plan.data.childIds) {
         const child = await this.requireTask(ownerId, childId);
@@ -562,10 +897,14 @@ export class AgentCoordinator {
         }
         await this.propagateControl(ownerId, child.id, action, actor);
       }
-      await this.changePlan(ownerId, plan.id, (current) => ({
-        ...current,
-        state: action === 'cancel' ? 'cancelled' : action === 'resume' ? 'waiting' : 'paused',
-      }));
+      const integrating = parent?.data.orchestration?.planId === plan.id
+        && parent.data.orchestration.phase === 'integration';
+      const state = action === 'cancel'
+        ? 'cancelled'
+        : integrating ? 'integrating' : action === 'resume' ? 'waiting' : 'paused';
+      await this.changePlan(ownerId, plan.id, (current) => current.state === state
+        ? current
+        : { ...current, state });
     }
     await this.cleanSlots(ownerId);
   }

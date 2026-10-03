@@ -235,7 +235,7 @@ test('an unknown child outcome propagates to the parent without blind retry', as
   } finally { await tasks.close(); await store.close(); }
 });
 
-test('automatic integration verification requires a correlated inspection after child side effects', async () => {
+test('integration verification requires a correlated inspection after child side effects', async () => {
   const store = new SqliteStore();
   const coordinator = new AgentCoordinator(store);
   const tasks = new TaskService(store, async ({ task, onEvent }) => {
@@ -297,7 +297,7 @@ test('automatic integration verification requires a correlated inspection after 
     assert.equal((await coordinator.results(principal.id, plan.id)).plan.data.state, 'integrating');
     await assert.rejects(
       coordinator.verifyIntegration(principal.id, plan.id, 'A list command completed.'),
-      (error: unknown) => error instanceof Error && 'code' in error && error.code === 'verification_required',
+      (error: unknown) => error instanceof Error && 'code' in error && error.code === 'verification_failed',
     );
 
     await store.create('event', principal.id, {
@@ -318,54 +318,13 @@ test('automatic integration verification requires a correlated inspection after 
       type: 'tool_result',
       payload: {
         type: 'tool_result', actionHash: 'inspection', toolCallId: 'inspection', outcome: 'confirmed', isError: false,
+        result: { content: JSON.stringify({ path: 'result.txt', sha256: 'a'.repeat(64) }) },
       },
       at: startedAt,
     }, `${root.id}:inspection-result`);
     await reconcileAgentTasks(store, coordinator);
+    assert.equal((await coordinator.results(principal.id, plan.id)).plan.data.state, 'integrating');
+    await coordinator.verifyIntegration(principal.id, plan.id);
     assert.equal((await coordinator.results(principal.id, plan.id)).plan.data.state, 'completed');
   } finally { await tasks.close(); await store.close(); }
-});
-
-test('reconciliation finishes a parent verification interrupted after the plan commit', async () => {
-  const store = new SqliteStore();
-  const coordinator = new AgentCoordinator(store);
-  const tasks = new TaskService(store, async () => ({ text: 'done' }));
-  try {
-    const conversation = await store.create<Conversation>('conversation', principal.id, {
-      title: 'Recover verification',
-      scope: 'private',
-      modelPolicy: 'cloud',
-      strategy: 'single',
-      mode: 'ask',
-      archived: false,
-    });
-    const parent = await tasks.enqueue(principal, conversation.id, 'Coordinate');
-    const plan = await coordinator.prepare(principal.id, parent.id, {
-      key: 'recover-verification',
-      budget: { maxCalls: 2, maxTokens: 100 },
-      children: [{ key: 'worker', prompt: 'Inspect' }],
-    });
-    const currentPlan = (await store.get<typeof plan.data>('agent_plan', plan.id, principal.id))!;
-    await store.put('agent_plan', plan.id, principal.id, {
-      ...currentPlan.data,
-      state: 'completed',
-      verification: { at: new Date().toISOString(), evidence: 'Verified before interruption.' },
-    }, currentPlan.revision);
-    const currentParent = (await store.get<Task>('task', parent.id, principal.id))!;
-    await store.put('task', parent.id, principal.id, {
-      ...currentParent.data,
-      state: 'completed',
-      orchestration: { ...currentParent.data.orchestration!, phase: 'integration', verification: 'pending' },
-    }, currentParent.revision);
-
-    await reconcileAgentTasks(store, coordinator);
-
-    assert.equal(
-      (await store.get<Task>('task', parent.id, principal.id))?.data.orchestration?.verification,
-      'passed',
-    );
-  } finally {
-    await tasks.close();
-    await store.close();
-  }
 });

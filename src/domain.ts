@@ -41,7 +41,7 @@ export interface TaskOrchestration {
   profileId?: string;
   budgetId: string;
   phase: 'children' | 'integration';
-  verification: 'pending' | 'passed';
+  verification: 'pending' | 'passed' | 'failed';
 }
 
 export interface PendingAction { hash: string; tool: string; input: Record<string, unknown>; toolOccurrenceId?: string }
