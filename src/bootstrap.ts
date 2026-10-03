@@ -246,7 +246,7 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
       reauthorize,
       automations: config.automations,
       ...(outage ? { outage } : {}),
-      logger: false,
+      logger: { level: 'warn' },
     });
     taskControl = (ownerId, taskId, action, actor) => server.tasks.control(ownerId, taskId, action, [], actor);
     server.tasks.setReconciler(async () => {

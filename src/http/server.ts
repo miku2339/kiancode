@@ -52,12 +52,21 @@ const agentSchema = z.object({
   experts: z.array(z.object({ name: z.string().min(1).max(100), instruction: text }).strict()).max(8).default([]),
   candidateCount: z.number().int().min(1).max(3).default(3),
 }).strict();
+
+const tickDegradedAfter = 3;
+const tickLogEvery = 60;
+
+export interface ServerLoggerOptions {
+  level: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace';
+  stream?: { write(line: string): void };
+}
+
 export interface ServerOptions {
   store: Store;
   authenticate: Authenticator;
   runner: TaskRunner;
   models?: Array<{ id: string; locality: string; capabilities: string[]; enabled?: boolean }>;
-  logger?: boolean;
+  logger?: boolean | ServerLoggerOptions;
   artifacts?: ArtifactService;
   tools?: ToolDefinition[];
   access?: AccessService;
@@ -87,6 +96,21 @@ export async function createServer(options: ServerOptions) {
   const unattended = options.access?.unattendedAuthorization();
   const tasks = new TaskService(store, options.runner, {
     onError: (error) => app.log.error(error),
+    onTickError: (failure) => {
+      if (failure.consecutiveFailures !== 1 && failure.consecutiveFailures % tickLogEvery !== 0) return;
+      app.log.error({
+        event: 'task_tick_failed',
+        phase: failure.phase,
+        code: failure.code,
+        consecutiveFailures: failure.consecutiveFailures,
+      }, failure.message);
+    },
+    onTickRecovered: (recovery) => {
+      app.log.warn({
+        event: 'task_tick_recovered',
+        failedTicks: recovery.failedTicks,
+      }, 'Task tick recovered.');
+    },
     notifications,
     ...(reauthorize ? { reauthorize } : {}),
     ...(unattended === 'durable' ? { durableGrants: true } : {}),
@@ -248,17 +272,33 @@ export async function createServer(options: ServerOptions) {
       return { status: 'degraded', degraded: true, storage: 'unavailable', outage: await options.outage.stats() };
     }
   });
-  // Readiness is based on the durable store, independently of the process liveness probe.
   app.get('/health/ready', { config: { public: true } }, async () => {
+    const tick = tasks.tickStatus();
+    const tickStalled = tick.consecutiveFailures >= tickDegradedAfter;
+    const taskTick = tickStalled
+      ? { taskTick: { consecutiveFailures: tick.consecutiveFailures, lastErrorAt: tick.lastErrorAt } }
+      : {};
     try {
       await store.scan('health');
       const outageStats = await options.outage?.stats();
       degraded = Boolean(outageStats?.unsyncedRecords);
-      return { status: degraded ? 'degraded' : 'ready', degraded, ...(outageStats ? { outage: outageStats } : {}) };
+      const notReady = degraded || tickStalled;
+      return {
+        status: notReady ? 'degraded' : 'ready',
+        degraded: notReady,
+        ...(outageStats ? { outage: outageStats } : {}),
+        ...taskTick,
+      };
     } catch (error) {
       if (!options.outage || !unavailable(error)) throw error;
       degraded = true;
-      return { status: 'degraded', degraded: true, storage: 'unavailable', outage: await options.outage.stats() };
+      return {
+        status: 'degraded',
+        degraded: true,
+        storage: 'unavailable',
+        outage: await options.outage.stats(),
+        ...taskTick,
+      };
     }
   });
   app.get('/v1/session', async (request) => ({ data: principal(request) }));

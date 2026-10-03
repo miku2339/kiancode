@@ -3,9 +3,20 @@ import test from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { ArtifactService, extractDocument } from '../src/artifacts.js';
-import { LocalBlobStore } from '../src/storage/blobs.js';
+import { LocalBlobStore, sha256 } from '../src/storage/blobs.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
+
+function testPdf(text: string): Buffer {
+  const objects = ['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>', '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'];
+  const content = `BT /F1 12 Tf 30 100 Td (${text}) Tj ET`;
+  objects.push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+  let pdf = '%PDF-1.4\n'; const offsets = [0];
+  for (const [i, object] of objects.entries()) { offsets.push(Buffer.byteLength(pdf)); pdf += `${i + 1} 0 obj\n${object}\nendobj\n`; }
+  const xref = Buffer.byteLength(pdf); pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n` + offsets.slice(1).map((offset) => `${offset.toString().padStart(10, '0')} 00000 n \n`).join('') + `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return Buffer.from(pdf);
+}
 
 test('attachments retain checksum and sources and reject another account', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'kiancode-artifact-')); const store = new SqliteStore();
@@ -21,14 +32,65 @@ test('attachments retain checksum and sources and reject another account', async
 });
 
 test('PDF extraction returns real page text with page provenance', async () => {
-  const objects = ['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>', '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'];
-  const content = 'BT /F1 12 Tf 30 100 Td (Kian reference document) Tj ET';
-  objects.push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
-  let pdf = '%PDF-1.4\n'; const offsets = [0];
-  for (const [i, object] of objects.entries()) { offsets.push(Buffer.byteLength(pdf)); pdf += `${i + 1} 0 obj\n${object}\nendobj\n`; }
-  const xref = Buffer.byteLength(pdf); pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n` + offsets.slice(1).map((offset) => `${offset.toString().padStart(10, '0')} 00000 n \n`).join('') + `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
-  const pages = await extractDocument(Buffer.from(pdf), 'application/pdf');
+  const pages = await extractDocument(testPdf('Kian reference document'), 'application/pdf');
   assert.equal(pages[0]?.page, 1); assert.match(pages[0]?.text ?? '', /Kian reference document/);
+});
+
+test('document extraction times out a child, bounds its queue and continues with the next PDF', async () => {
+  const pdf = testPdf('Queued document');
+  const first = extractDocument(pdf, 'application/pdf', {
+    workerUrl: new URL('./fixtures/document-worker-hang.mjs', import.meta.url),
+    timeoutMs: 80,
+  });
+  await delay(10);
+  const second = extractDocument(pdf, 'application/pdf');
+  await assert.rejects(extractDocument(pdf, 'application/pdf'), { code: 'extraction_busy' });
+  await assert.rejects(first, { code: 'extraction_timeout' });
+  assert.match((await second)[0]?.text ?? '', /Queued document/);
+});
+
+test('document extraction contains crashes, invalid output and service environment', async () => {
+  const pdf = testPdf('Healthy after child failure');
+  await assert.rejects(extractDocument(pdf, 'application/pdf', {
+    workerUrl: new URL('./fixtures/document-worker-crash.mjs', import.meta.url),
+  }), { code: 'extraction_failed' });
+  await assert.rejects(extractDocument(pdf, 'application/pdf', {
+    workerUrl: new URL('./fixtures/document-worker-invalid.mjs', import.meta.url),
+  }), { code: 'extraction_failed' });
+
+  const key = 'KIANCODE_DOCUMENT_TEST_SECRET';
+  const previous = process.env[key];
+  process.env[key] = 'must-not-reach-parser';
+  try {
+    const pages = await extractDocument(pdf, 'application/pdf', {
+      workerUrl: new URL('./fixtures/document-worker-environment.mjs', import.meta.url),
+    });
+    assert.equal(pages[0]?.text, 'absent');
+  } finally {
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+  }
+  assert.match((await extractDocument(pdf, 'application/pdf'))[0]?.text ?? '', /Healthy after child failure/);
+});
+
+test('a failed PDF extraction preserves the original bytes and checksum before a later PDF succeeds', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'kiancode-artifact-extraction-'));
+  const store = new SqliteStore();
+  const service = new ArtifactService(store, new LocalBlobStore(directory));
+  try {
+    const broken = Buffer.from('%PDF-broken');
+    const failed = await service.upload('alice', 'broken.pdf', 'application/pdf', broken);
+    assert.ok(failed.data.extractionError);
+    assert.equal(failed.data.sha256, sha256(broken));
+    assert.deepEqual(Buffer.from((await service.read('alice', failed.id)).bytes), broken);
+
+    const healthy = await service.upload('alice', 'healthy.pdf', 'application/pdf', testPdf('Later document'));
+    assert.equal(healthy.data.extractionError, undefined);
+    assert.match(healthy.data.pages?.[0]?.text ?? '', /Later document/);
+  } finally {
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('concurrent attachment writes cannot overwrite an acknowledged identifier', async () => {

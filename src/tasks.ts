@@ -51,12 +51,37 @@ export interface TaskServiceOptions {
   now?: () => number;
   concurrency?: number;
   onError?: (error: unknown) => void;
+  onTickError?: (failure: TaskTickFailure) => void;
+  onTickRecovered?: (recovery: TaskTickRecovery) => void;
   reauthorize?: (principal: Principal) => Promise<Principal>;
   durableGrants?: boolean;
   isQuietTime?: (ownerId: string, at: Date) => boolean | Promise<boolean>;
   notifications?: Pick<NotificationService, 'publishTask' | 'reconcile'>;
   leaseMs?: number;
   heartbeatMs?: number;
+}
+
+export type TaskTickPhase = 'notifications' | 'reconciliations' | 'reconciler' | 'tasks';
+
+export interface TaskTickStatus {
+  consecutiveFailures: number;
+  lastErrorAt?: string;
+}
+
+export interface TaskTickFailure {
+  phase: TaskTickPhase;
+  code: string;
+  message: string;
+  consecutiveFailures: number;
+}
+
+export interface TaskTickRecovery {
+  failedTicks: number;
+}
+
+interface TickPhaseFailure {
+  phase: TaskTickPhase;
+  error: unknown;
 }
 
 interface ActiveRun {
@@ -246,6 +271,8 @@ export class TaskService {
   private ticking?: Promise<void>;
   private stopped = false;
   private reconciler?: () => Promise<void>;
+  private tickFailures = 0;
+  private tickLastErrorAt?: string;
 
   public constructor(
     private readonly store: Store,
@@ -366,6 +393,13 @@ export class TaskService {
 
   public setReconciler(reconciler: (() => Promise<void>) | undefined): void {
     this.reconciler = reconciler;
+  }
+
+  public tickStatus(): TaskTickStatus {
+    return {
+      consecutiveFailures: this.tickFailures,
+      ...(this.tickLastErrorAt ? { lastErrorAt: this.tickLastErrorAt } : {}),
+    };
   }
 
   public async events(ownerId: string, taskId: string, after = 0): Promise<Array<Entity<TaskEvent>>> {
@@ -777,7 +811,7 @@ export class TaskService {
     }
     this.stopped = false;
     const runTick = (): void => {
-      void this.tick().catch((error) => this.options.onError?.(error));
+      void this.tick().catch(() => undefined);
     };
     runTick();
     this.timer = setInterval(runTick, intervalMs);
@@ -812,18 +846,63 @@ export class TaskService {
   }
 
   private async tickInternal(): Promise<void> {
-    await this.options.notifications?.reconcile();
-    let tasks = await this.store.scan<Task>('task');
+    const failure = await this.runPhases();
+    if (!failure) {
+      if (!this.stopped && this.tickFailures > 0) {
+        const failedTicks = this.tickFailures;
+        this.tickFailures = 0;
+        this.options.onTickRecovered?.({ failedTicks });
+      }
+      return;
+    }
+    if (!this.stopped) {
+      this.tickFailures += 1;
+      this.tickLastErrorAt = new Date(this.now()).toISOString();
+      if (this.options.onTickError) {
+        this.options.onTickError({
+          phase: failure.phase,
+          ...describeTickError(failure.error),
+          consecutiveFailures: this.tickFailures,
+        });
+      } else {
+        this.options.onError?.(failure.error);
+      }
+    }
+    throw failure.error;
+  }
+
+  private async runPhases(): Promise<TickPhaseFailure | undefined> {
+    let failure: TickPhaseFailure | undefined;
+    const phase = async (name: TaskTickPhase, run: () => Promise<unknown>): Promise<void> => {
+      try {
+        await run();
+      } catch (error) {
+        failure ??= { phase: name, error };
+      }
+    };
+    await phase('notifications', async () => this.options.notifications?.reconcile());
+    await phase('reconciliations', () => this.finishPendingReconciliations());
+    await phase('reconciler', async () => this.reconciler?.());
+    await phase('tasks', () => this.claimTasks());
+    return failure;
+  }
+
+  private async finishPendingReconciliations(): Promise<void> {
+    const tasks = await this.store.scan<Task>('task');
+    let failure: { error: unknown } | undefined;
     for (const task of tasks) {
       if (task.data.reconciliation?.phase !== 'pending') continue;
       try {
         await this.finishReconciliation(task);
       } catch (error) {
-        this.options.onError?.(error);
+        failure ??= { error };
       }
     }
-    await this.reconciler?.();
-    tasks = await this.store.scan<Task>('task');
+    if (failure) throw failure.error;
+  }
+
+  private async claimTasks(): Promise<void> {
+    let tasks = await this.store.scan<Task>('task');
     for (const task of tasks) {
       if (task.data.state === 'running'
         && !this.active.has(task.id)
@@ -1672,6 +1751,13 @@ function normalizePluginVersions(value: Record<string, string>): Record<string, 
     }
   }
   return Object.fromEntries(entries);
+}
+
+function describeTickError(error: unknown): { code: string; message: string } {
+  return {
+    code: error instanceof DomainError ? 'domain_error' : 'internal_error',
+    message: 'Task tick failed.',
+  };
 }
 
 function sameRecord(left: Record<string, string>, right: Record<string, string>): boolean {

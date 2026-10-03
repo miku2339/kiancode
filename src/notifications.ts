@@ -70,6 +70,8 @@ const tokenPattern = /^(?:[0-9a-fA-F]{2}){16,128}$/;
 
 export class NotificationService {
   private readonly now: () => Date;
+  private reconciledIds?: Set<string>;
+  private reconcileSeed?: Promise<Set<string>>;
 
   public constructor(
     private readonly store: Store,
@@ -406,15 +408,16 @@ export class NotificationService {
   }
 
   public async reconcile(): Promise<void> {
+    await this.seedReconciledIds();
     const tasks = await this.store.scan<Task>('task');
     for (const task of tasks) {
       const input = taskNotification(task);
-      if (input) await this.publishTask(task.ownerId, input, new Date(task.updatedAt), task.data.notificationDestination);
+      if (input) await this.publishOnce(task.ownerId, input, new Date(task.updatedAt), task.data.notificationDestination);
     }
     for (const schedule of await this.store.scan<AutomationScheduleNotification>('automation_schedule')) {
       if (!schedule.data.authorizationFailedAt) continue;
       const failure = schedule.data.authorizationFailedVersion ?? schedule.data.authorizationFailedAt;
-      await this.publishTask(schedule.ownerId, {
+      await this.publishOnce(schedule.ownerId, {
         type: 'schedule_authorization_failed',
         dedupeKey: `schedule:${schedule.id}:authorization:${failure}`,
         scheduleId: schedule.id,
@@ -423,12 +426,38 @@ export class NotificationService {
     for (const trigger of await this.store.scan<AutomationScheduleNotification>('event_trigger')) {
       if (!trigger.data.authorizationFailedAt) continue;
       const failure = trigger.data.authorizationFailedVersion ?? trigger.data.authorizationFailedAt;
-      await this.publishTask(trigger.ownerId, {
+      await this.publishOnce(trigger.ownerId, {
         type: 'schedule_authorization_failed',
         dedupeKey: `event-trigger:${trigger.id}:authorization:${failure}`,
         eventTriggerId: trigger.id,
       }, new Date(trigger.data.authorizationFailedAt), trigger.data.settings.notification);
     }
+  }
+
+  private async seedReconciledIds(): Promise<Set<string>> {
+    if (this.reconciledIds) return this.reconciledIds;
+    if (!this.reconcileSeed) {
+      this.reconcileSeed = this.store.scan<Notification>('notification').then((stored) => {
+        this.reconciledIds ??= new Set(stored.map((row) => row.id));
+        return this.reconciledIds;
+      }).finally(() => {
+        this.reconcileSeed = undefined;
+      });
+    }
+    return this.reconcileSeed;
+  }
+
+  private async publishOnce(
+    ownerId: string,
+    input: NotificationInput,
+    occurredAt: Date,
+    destination?: NotificationDestination,
+  ): Promise<void> {
+    const ids = await this.seedReconciledIds();
+    const id = digest(ownerId, input.dedupeKey);
+    if (ids.has(id)) return;
+    await this.publishTask(ownerId, input, occurredAt, destination);
+    ids.add(id);
   }
 }
 

@@ -65,6 +65,7 @@ Remote MCP header values use `{ "envRef": "ENVIRONMENT_VARIABLE" }`. Keep origin
 - Core assigns each tool attempt a durable occurrence ID. A new side-effecting attempt requires a new approval even when a provider reuses its tool ID; checkpoint recovery preserves the existing occurrence. Tool adapters may throw `notDispatched(...)` only when no action was dispatched. An unmarked failure after a write or external action remains unknown until verified. Helper error responses may explicitly return `notDispatched: true`; transport failures, timeouts and crashes after process or device dispatch must not use that flag.
 - After the executor has stopped, an authorized owner can use `POST /v1/tasks/:id/reconcile` with `resolution` (`applied`, `not_applied` or `abandon`), an exact `toolOccurrenceId`, `dispatchSequence` or `actionHash`, and an optional `note`. Core persists the decision before completing its receipt, write-lease release, parent recovery and audit. Work remains unknown until every dispatched side effect is resolved. An applied action is not replayed; a confirmed non-application permits a new, separately approved attempt. Abandon cancels continuation and retains an uncertain workspace lock. Conflicting decisions return HTTP 409.
 - Memory records retain scope, provenance, validity and replacement links. Document import retains artifact/page citations. Summaries do not replace the message history.
+- PDF and DOCX text extraction runs in a separate child process with a 192 MiB heap, bounded input and output, a 15-second timeout, one active extraction and one waiting extraction. Extraction failure is recorded on the artifact while the original bytes and checksum remain available.
 - MCP and skill versions are pinned. Operators define fixed stdio command profiles and allowed remote origins; plugin credentials come from named environment variables.
 - Account owners can save provider and model overrides. Provider credentials use AES-GCM with the key named by `providerManagement.credentialKeyEnv`; a changed provider or model must pass capability probing before it can run.
 - Notifications retain owner timezone and quiet hours. Task completion, failure, unknown outcomes and approval requests are durable; push delivery is handled by a separate APNs adapter without exposing device tokens through the API.
@@ -81,6 +82,10 @@ node dist/cli.js config-check --config /etc/kiancode/config.json
 ```
 
 Production startup fails closed when that PostgreSQL environment variable is absent. `database.sqlitePath` is for development and tests only.
+
+`GET /health/ready` remains HTTP 200 but reports `status: "degraded"`, `degraded: true` and a `taskTick` count and timestamp after three consecutive task-tick failures. The next successful tick returns the body to ready. Notification, pending-reconciliation or agent-reconciliation failures do not prevent later tick phases from running.
+
+The service writes warnings and errors as JSON lines. It logs `task_tick_failed` for the first failure and every 60th consecutive failure, and logs `task_tick_recovered` once after recovery. Bootstrap uses warn level, so routine HTTP requests, URLs and authorization headers are not logged.
 
 For Account authentication, keep `auth.issuer` set to the public canonical issuer. Set `auth.accountApiUrl` only when Core should call Account through a separate HTTPS or loopback HTTP service endpoint; identity IDs continue to derive from `auth.issuer`.
 
