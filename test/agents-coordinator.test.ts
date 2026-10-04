@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { AgentCoordinator, type OrchestrationPlan } from '../src/agents/coordinator.js';
-import type { Principal, ToolDefinition } from '../src/contracts.js';
+import { DomainError, type Principal, type ToolDefinition } from '../src/contracts.js';
 import type { Conversation, Task, TaskEvent } from '../src/domain.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
 import { TaskService, type TaskRunner } from '../src/tasks.js';
@@ -632,6 +632,120 @@ test('parent cancellation propagates through TaskService and aborts a running ch
     await waitFor(async () => (await store.get<Task>('task', plan.data.childIds[0]!, principal.id))?.data.state === 'cancelled');
     assert.equal((await store.get<Task>('task', parent.id, principal.id))?.data.state, 'cancelled');
     assert.equal((await coordinator.results(principal.id, plan.id)).children[0]?.state, 'cancelled');
+  } finally {
+    await service.close();
+    await store.close();
+  }
+});
+
+test('parent cancellation records a durable cancel event for a child waiting for approval', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async ({ task }) => task.data.orchestration?.role === 'child'
+    ? {
+        text: '',
+        status: 'waiting_for_approval',
+        pendingActions: [{ hash: 'a'.repeat(64), tool: 'workspace.write', input: { path: 'result.txt' } }],
+      }
+    : { text: 'parent' });
+  const coordinator = new AgentCoordinator(
+    store,
+    (ownerId, taskId, action, actor) => service.control(ownerId, taskId, action, [], actor),
+  );
+  try {
+    const parent = await rootTask(store, service);
+    const plan = await coordinator.prepare(principal.id, parent.id, {
+      key: 'cancel-waiting-approval',
+      children: [{ key: 'worker', prompt: 'Wait for approval' }],
+      budget: { maxCalls: 2, maxTokens: 100 },
+    });
+    const childId = plan.data.childIds[0]!;
+    await service.drain();
+    assert.equal((await store.get<Task>('task', childId, principal.id))?.data.state, 'waiting_for_approval');
+
+    await service.control(principal.id, parent.id, 'cancel', [], principal);
+    await coordinator.propagateControl(principal.id, parent.id, 'cancel', principal);
+
+    assert.equal((await store.get<Task>('task', childId, principal.id))?.data.state, 'cancelled');
+    const childEvents = await service.events(principal.id, childId);
+    assert.equal(childEvents.filter((event) => event.data.type === 'cancel').length, 1);
+    assert.equal(childEvents.at(-1)?.data.type, 'cancel');
+  } finally {
+    await service.close();
+    await store.close();
+  }
+});
+
+test('parent cancellation preserves an unresolved child side effect as unknown', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async ({ task, onEvent }) => {
+    if (task.data.orchestration?.role !== 'child') return { text: 'parent' };
+    await onEvent({
+      type: 'tool_dispatched',
+      taskId: task.id,
+      toolCall: { id: 'external-call', name: 'external.send', arguments: { value: 'once' } },
+      actionHash: 'b'.repeat(64),
+      sideEffect: 'external',
+    });
+    throw new DomainError('waiting_for_device', 'External device is offline', 503);
+  }, { reauthorize: async (identity) => identity });
+  const coordinator = new AgentCoordinator(
+    store,
+    (ownerId, taskId, action, actor) => service.control(ownerId, taskId, action, [], actor),
+  );
+  try {
+    const parent = await rootTask(store, service);
+    const plan = await coordinator.prepare(principal.id, parent.id, {
+      key: 'cancel-unresolved-child',
+      children: [{ key: 'worker', prompt: 'Dispatch once' }],
+      budget: { maxCalls: 2, maxTokens: 100 },
+    });
+    const childId = plan.data.childIds[0]!;
+    await service.drain();
+    assert.equal((await store.get<Task>('task', childId, principal.id))?.data.state, 'waiting_for_device');
+
+    await service.control(principal.id, parent.id, 'cancel', [], principal);
+    await coordinator.propagateControl(principal.id, parent.id, 'cancel', principal);
+
+    const child = await store.get<Task>('task', childId, principal.id);
+    assert.equal(child?.data.state, 'unknown');
+    const childEvents = await service.events(principal.id, childId);
+    assert.equal(childEvents.filter((event) => event.data.type === 'cancel').length, 1);
+    assert.equal((childEvents.at(-1)?.data.payload as { state?: string }).state, 'unknown');
+  } finally {
+    await service.close();
+    await store.close();
+  }
+});
+
+test('root cancellation records one cancel event at each descendant depth', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async () => ({ text: 'unused' }));
+  const coordinator = new AgentCoordinator(
+    store,
+    (ownerId, taskId, action, actor) => service.control(ownerId, taskId, action, [], actor),
+  );
+  try {
+    const parent = await rootTask(store, service);
+    const first = await coordinator.prepare(principal.id, parent.id, {
+      key: 'cancel-depth-one',
+      children: [{ key: 'child', prompt: 'Delegate once' }],
+      budget: { maxCalls: 3, maxTokens: 100 },
+    });
+    const childId = first.data.childIds[0]!;
+    const second = await coordinator.prepare(principal.id, childId, {
+      key: 'cancel-depth-two',
+      children: [{ key: 'grandchild', prompt: 'Wait' }],
+    });
+    const grandchildId = second.data.childIds[0]!;
+
+    await service.control(principal.id, parent.id, 'cancel', [], principal);
+    await coordinator.propagateControl(principal.id, parent.id, 'cancel', principal);
+
+    for (const taskId of [childId, grandchildId]) {
+      assert.equal((await store.get<Task>('task', taskId, principal.id))?.data.state, 'cancelled');
+      const events = await service.events(principal.id, taskId);
+      assert.equal(events.filter((event) => event.data.type === 'cancel').length, 1);
+    }
   } finally {
     await service.close();
     await store.close();

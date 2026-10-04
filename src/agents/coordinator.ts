@@ -1019,11 +1019,10 @@ export class AgentCoordinator {
         if (terminalStates.has(child.data.state)) continue;
         if (action === 'resume' && child.data.state !== 'paused') continue;
         if (action === 'pause' && child.data.state === 'paused') continue;
-        if (child.data.state === 'running' || action === 'resume') {
-          if (!this.controlTask) {
-            throw new DomainError('control_adapter_required', 'Running children require TaskService control propagation', 503);
-          }
+        if (this.controlTask) {
           await this.controlTask(ownerId, child.id, action, actor);
+        } else if (child.data.state === 'running' || action === 'resume') {
+          throw new DomainError('control_adapter_required', 'Running children require TaskService control propagation', 503);
         } else {
           await this.changeTask(ownerId, child.id, (task) => ({
             ...task,
