@@ -262,6 +262,7 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
       if (!outage || reconciling) return reconciling;
       reconciling = (async () => {
         try {
+          await outage.pruneExpiredContexts();
           await outage.resumeQueued();
           const replay = await outage.reconcile();
           await store.scan('health');

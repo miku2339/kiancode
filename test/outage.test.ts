@@ -12,6 +12,7 @@ import {
   type OutageContext,
   type OutageReplayRecord,
   type OutageReplaySink,
+  type OutageTask,
   type SimpleChat,
 } from '../src/outage/index.js';
 
@@ -159,6 +160,217 @@ test('expired cached sessions and group conversations are denied without model c
   }
 });
 
+test('cached context TTL fails closed at the boundary and survives restart without renewing authorization', async () => {
+  const directory = await temporaryDirectory();
+  const key = randomBytes(32);
+  let now = Date.now();
+  let modelCalls = 0;
+  const simpleChat: SimpleChat = async () => { modelCalls += 1; return { content: 'saved once' }; };
+  try {
+    const service = new OutageService({ directory, key, simpleChat, now: () => now });
+    await service.cacheContext(context(now + 72 * 60 * 60 * 1_000));
+    const input = { token, conversationId: 'conversation-1', prompt: 'hello', requestId: 'same' };
+    const task = await service.run(input);
+    now += 24 * 60 * 60 * 1_000 - 1;
+    assert.equal((await service.get(token, task.id)).result, 'saved once');
+    const restarted = new OutageService({ directory, key, simpleChat, now: () => now });
+    now += 1;
+    for (const request of [
+      () => restarted.run(input),
+      () => restarted.get(token, task.id),
+      () => restarted.conversation(token, 'conversation-1'),
+      () => restarted.messages(token, 'conversation-1'),
+      () => restarted.list(token, 'conversation-1'),
+      () => restarted.listAll(token),
+    ]) {
+      await assert.rejects(request(), (error: unknown) => error instanceof DomainError && error.code === 'session_expired');
+    }
+    assert.equal(modelCalls, 1);
+    assert.equal((await restarted.stats()).unsyncedRecords, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('pruning expired contexts preserves unacknowledged encrypted records for replay after restart', async () => {
+  const directory = await temporaryDirectory();
+  const key = randomBytes(32);
+  let now = Date.now();
+  let modelCalls = 0;
+  let confirmed = false;
+  const simpleChat: SimpleChat = async () => { modelCalls += 1; return { content: 'saved once' }; };
+  const sink: OutageReplaySink = {
+    async replay(record) {
+      return { recordId: confirmed ? record.recordId : 'wrong-record', durable: true, deduplicated: true };
+    },
+  };
+  try {
+    const service = new OutageService({ directory, key, simpleChat, replaySink: sink, now: () => now, maxAgeMs: 1_000 });
+    await service.cacheContext(context(now + 60_000));
+    const task = await service.run({ token, conversationId: 'conversation-1', prompt: 'unique input', requestId: 'same' });
+    const recordPath = path.join(directory, 'records', `${task.id}.enc`);
+    const recordBefore = await readFile(recordPath);
+    now += 500;
+    const fresh = context(now + 60_000);
+    fresh.conversation.id = 'conversation-fresh';
+    await service.cacheContext(fresh);
+    now += 500;
+    assert.equal(await service.pruneExpiredContexts(), 1);
+    assert.equal((await readdir(path.join(directory, 'contexts'))).length, 1);
+    assert.deepEqual(await readFile(recordPath), recordBefore);
+    assert.equal((await service.stats()).unsyncedRecords, 1);
+    assert.equal((await service.conversation(token, fresh.conversation.id)).conversation.id, fresh.conversation.id);
+    await assert.rejects(service.get(token, task.id), (error: unknown) => error instanceof DomainError && error.statusCode === 401);
+    assert.deepEqual(await service.reconcile(), { acknowledged: 0, remaining: 1 });
+    assert.deepEqual(await readFile(recordPath), recordBefore);
+
+    const restarted = new OutageService({ directory, key, simpleChat, replaySink: sink, now: () => now, maxAgeMs: 1_000 });
+    confirmed = true;
+    assert.deepEqual(await restarted.reconcile(), { acknowledged: 1, remaining: 0 });
+    assert.equal((await readdir(path.join(directory, 'records'))).length, 0);
+    assert.equal(await restarted.pruneExpiredContexts(), 0);
+    assert.equal((await restarted.conversation(token, fresh.conversation.id)).conversation.id, fresh.conversation.id);
+    assert.equal(modelCalls, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('caching prunes expired context before capacity checks and concurrent pruning preserves the fresh cache', async () => {
+  const directory = await temporaryDirectory();
+  const key = randomBytes(32);
+  let now = Date.now();
+  const simpleChat: SimpleChat = async () => ({ content: 'unused' });
+  try {
+    const initial = new OutageService({ directory, key, simpleChat, now: () => now, maxAgeMs: 1_000 });
+    await initial.cacheContext(context(now + 1_000));
+    const bytes = (await initial.stats()).bytesUsed;
+    const service = new OutageService({ directory, key, simpleChat, now: () => now,
+      maxAgeMs: 1_000, maxBytes: bytes + 256, maxResponseBytes: 128 });
+    now += 1_000;
+    await Promise.all([
+      service.cacheContext(context(now + 60_000)),
+      service.pruneExpiredContexts(),
+    ]);
+    assert.equal((await readdir(path.join(directory, 'contexts'))).length, 1);
+    now += 999;
+    assert.equal((await service.conversation(token, 'conversation-1')).conversation.id, 'conversation-1');
+    now += 1;
+    assert.equal(await service.pruneExpiredContexts(), 1);
+    assert.equal((await readdir(path.join(directory, 'contexts'))).length, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('invalid or corrupt cached contexts fail closed and remain intact while queued records can still recover', async () => {
+  for (const invalid of ['missing', 'missing-expired', 'invalid', 'number', 'corrupt', 'unknown']) {
+    const directory = await temporaryDirectory();
+    const key = randomBytes(32);
+    const now = Date.now();
+    let modelCalls = 0;
+    const simpleChat: SimpleChat = async () => {
+      modelCalls += 1;
+      throw new DomainError('waiting_for_device', 'Mac is offline', 503);
+    };
+    const replayed: OutageReplayRecord[] = [];
+    const sink: OutageReplaySink = {
+      async replay(record) {
+        replayed.push(record);
+        return { recordId: record.recordId, durable: true, deduplicated: true };
+      },
+    };
+    try {
+      const service = new OutageService({ directory, key, simpleChat, now: () => now });
+      await service.cacheContext(context(now + 60_000));
+      const task = await service.run({ token, conversationId: 'conversation-1', prompt: 'unique pending input', requestId: 'same' });
+      assert.equal(task.state, 'waiting_for_device');
+      const buffer = new EncryptedBuffer(directory, { key });
+      const contextName = (await buffer.list('contexts'))[0]!;
+      const contextPath = path.join(directory, contextName);
+      if (invalid === 'corrupt') await writeFile(contextPath, 'corrupt context envelope');
+      else if (invalid === 'unknown') await buffer.write(contextName, { unrecognized: true });
+      else {
+        const cached = await buffer.read<OutageContext>(contextName);
+        assert.ok(cached);
+        if (invalid === 'missing' || invalid === 'missing-expired') delete cached.cachedAt;
+        else if (invalid === 'number') (cached as unknown as { cachedAt: number }).cachedAt = 0;
+        else cached.cachedAt = 'invalid';
+        if (invalid === 'missing-expired') cached.sessionExpiresAt = new Date(now - 1).toISOString();
+        await buffer.write(contextName, cached);
+      }
+      const contextBefore = await readFile(contextPath);
+      const recordPath = path.join(directory, 'records', `${task.id}.enc`);
+      const recordBefore = await readFile(recordPath);
+      assert.equal(await service.pruneExpiredContexts(), 0);
+      assert.deepEqual(await readFile(contextPath), contextBefore);
+      assert.deepEqual(await readFile(recordPath), recordBefore);
+      for (const request of [
+        () => service.run({ token, conversationId: 'conversation-1', prompt: 'not dispatched' }),
+        () => service.listAll(token),
+      ]) await assert.rejects(request(), (error: unknown) => error instanceof DomainError);
+      const resumed = await service.resumeQueued();
+      assert.equal(resumed[0]?.state, 'failed');
+      assert.equal(modelCalls, 1);
+      assert.deepEqual(await readFile(contextPath), contextBefore);
+      assert.equal((await service.stats()).unsyncedRecords, 1);
+      const restarted = new OutageService({ directory, key, simpleChat, replaySink: sink, now: () => now });
+      assert.deepEqual(await restarted.reconcile(), { acknowledged: 1, remaining: 0 });
+      assert.equal(replayed[0]?.task.prompt, 'unique pending input');
+      assert.equal(replayed[0]?.messages[0]?.content, 'unique pending input');
+      assert.deepEqual(await readFile(contextPath), contextBefore);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test('pruned contexts cannot resume queued or waiting generation and its unique input remains recoverable', async () => {
+  for (const state of ['queued', 'waiting_for_device'] as const) {
+    const directory = await temporaryDirectory();
+    const key = randomBytes(32);
+    let now = Date.now();
+    let modelCalls = 0;
+    const simpleChat: SimpleChat = async () => {
+      modelCalls += 1;
+      throw new DomainError('waiting_for_device', 'Mac is offline', 503);
+    };
+    const replayed: OutageReplayRecord[] = [];
+    const sink: OutageReplaySink = {
+      async replay(record) {
+        replayed.push(record);
+        return { recordId: record.recordId, durable: true, deduplicated: true };
+      },
+    };
+    try {
+      const service = new OutageService({ directory, key, simpleChat, now: () => now, maxAgeMs: 1_000 });
+      await service.cacheContext(context(now + 60_000));
+      const task = await service.run({ token, conversationId: 'conversation-1', prompt: 'pending unique input', requestId: 'same' });
+      const buffer = new EncryptedBuffer(directory, { key });
+      const recordName = `records/${task.id}.enc`;
+      if (state === 'queued') {
+        const queued = await buffer.read<OutageTask>(recordName);
+        assert.ok(queued);
+        await buffer.write(recordName, { ...queued, state });
+      }
+      const recordBefore = await readFile(path.join(directory, recordName));
+      now += 1_000;
+      assert.equal(await service.pruneExpiredContexts(), 1);
+      assert.deepEqual(await readFile(path.join(directory, recordName)), recordBefore);
+      const restarted = new OutageService({ directory, key, simpleChat, replaySink: sink, now: () => now, maxAgeMs: 1_000 });
+      assert.equal((await restarted.resumeQueued())[0]?.state, 'failed');
+      assert.equal(modelCalls, 1);
+      assert.equal((await restarted.stats()).unsyncedRecords, 1);
+      assert.deepEqual(await restarted.reconcile(), { acknowledged: 1, remaining: 0 });
+      assert.equal(replayed[0]?.task.prompt, 'pending unique input');
+      assert.equal(replayed[0]?.messages[0]?.content, 'pending unique input');
+      assert.equal(replayed[0]?.messages.length, 1);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
 test('privacy policy forces local without cloud fallback and request IDs prevent duplicate generation', async () => {
   const directory = await temporaryDirectory();
   const key = randomBytes(32);
@@ -244,7 +456,9 @@ test('size and first-unsynced age caps reject new data without deleting old unsy
     });
     await ageLimited.cacheContext(context(now + 72 * 60 * 60 * 1_000));
     await ageLimited.run({ token, conversationId: 'conversation-1', prompt: 'first' });
-    now += 49 * 60 * 60 * 1_000;
+    now += 600;
+    await ageLimited.cacheContext(context(now + 72 * 60 * 60 * 1_000));
+    now += 400;
     await assert.rejects(
       ageLimited.run({ token, conversationId: 'conversation-1', prompt: 'second' }),
       (error: unknown) => error instanceof Error && 'code' in error && error.code === 'outage_window_expired',

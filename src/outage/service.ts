@@ -66,6 +66,7 @@ export class OutageService {
       cachedAt: new Date(this.now()).toISOString(),
     };
     await this.mutex.use(async () => {
+      await this.pruneExpiredContextsUnlocked();
       const relativePath = contextPath(context.principal.id, context.conversation.id);
       const stats = await this.statsUnlocked();
       this.assertAccepting(stats);
@@ -150,17 +151,20 @@ export class OutageService {
     const results: OutageRunResult[] = [];
     for (const task of await this.tasks()) {
       if (!['queued', 'waiting_for_device'].includes(task.state)) continue;
-      const context = await this.context(task.ownerId, task.conversation.id);
-      if (!context) {
-        const failed = await this.saveFailure(task, 'Cached session expired before local generation resumed.');
-        results.push(publicTask(failed));
-        continue;
-      }
       try {
-        validateContext(context, this.now());
+        const context = await this.context(task.ownerId, task.conversation.id);
+        if (!context) {
+          const failed = await this.saveFailure(task, 'Cached session expired before local generation resumed.');
+          results.push(publicTask(failed));
+          continue;
+        }
+        validateContext(context, this.now(), this.maxAgeMs);
       } catch (error) {
-        if (!(error instanceof DomainError) || error.code !== 'session_expired') throw error;
-        const failed = await this.saveFailure(task, 'Cached session expired before generation resumed.');
+        if (!(error instanceof DomainError) || ![
+          'session_expired', 'invalid_cached_session', 'invalid_cached_context',
+          'outage_buffer_corrupt', 'outage_private_only', 'forbidden',
+        ].includes(error.code)) throw error;
+        const failed = await this.saveFailure(task, 'Cached session expired or was invalid before generation resumed.');
         results.push(publicTask(failed));
         continue;
       }
@@ -205,6 +209,10 @@ export class OutageService {
 
   public async stats(): Promise<OutageStats> {
     return this.mutex.use(() => this.statsUnlocked());
+  }
+
+  public async pruneExpiredContexts(): Promise<number> {
+    return this.mutex.use(() => this.pruneExpiredContextsUnlocked());
   }
 
   public async reconcile(): Promise<{ acknowledged: number; remaining: number }> {
@@ -348,9 +356,9 @@ export class OutageService {
     const expected = tokenHash(token);
     for (const relativePath of await this.buffer.list('contexts')) {
       const context = await this.buffer.read<OutageContext>(relativePath);
-      if (!context || context.conversation.id !== conversationId
+      if (!context || context.conversation?.id !== conversationId
         || !equalHash(context.tokenHash, expected)) continue;
-      validateContext(context, this.now());
+      validateContext(context, this.now(), this.maxAgeMs);
       return context;
     }
     throw new DomainError('unauthorized', 'Cached session is unavailable.', 401);
@@ -366,7 +374,7 @@ export class OutageService {
       const context = await this.buffer.read<OutageContext>(relativePath);
       if (!context || !equalHash(context.tokenHash, expected)) continue;
       try {
-        validateContext(context, this.now());
+        validateContext(context, this.now(), this.maxAgeMs);
         return context.principal;
       } catch (error) {
         if (error instanceof DomainError && error.code === 'session_expired') expired = true;
@@ -405,6 +413,23 @@ export class OutageService {
       if (task) tasks.push(task);
     }
     return tasks.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+  }
+
+  private async pruneExpiredContextsUnlocked(): Promise<number> {
+    const now = this.now();
+    let removed = 0;
+    for (const relativePath of await this.buffer.list('contexts')) {
+      try {
+        const context = await this.buffer.read<OutageContext>(relativePath);
+        if (!context) continue;
+        validateContext(context, now, this.maxAgeMs);
+      } catch (error) {
+        if (!(error instanceof DomainError) || error.code !== 'session_expired') continue;
+        await this.buffer.remove(relativePath);
+        removed += 1;
+      }
+    }
+    return removed;
   }
 
   private async statsUnlocked(): Promise<OutageStats> {
@@ -448,7 +473,11 @@ export function tokenHash(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function validateContext(context: OutageContext, now: number): void {
+function validateContext(context: OutageContext, now: number, maxAgeMs?: number): void {
+  if (!context || typeof context !== 'object' || !context.conversation || !context.principal
+    || typeof context.conversation !== 'object' || typeof context.principal !== 'object') {
+    throw new DomainError('invalid_cached_session', 'Cached principal or conversation is invalid.', 400);
+  }
   if (context.conversation.scope !== 'private') {
     throw new DomainError('outage_private_only', 'Outage mode supports private conversations only.', 403);
   }
@@ -478,8 +507,16 @@ function validateContext(context: OutageContext, now: number): void {
     || (principalExpiresAt !== undefined && !Number.isFinite(principalExpiresAt))) {
     throw new DomainError('invalid_cached_session', 'Cached session expiry is invalid.', 400);
   }
-  if (sessionExpiresAt <= now || (principalExpiresAt !== undefined && principalExpiresAt <= now)) {
-    throw new DomainError('session_expired', 'Cached session has expired.', 401);
+  let cachedAt: number | undefined;
+  if (maxAgeMs !== undefined) {
+    cachedAt = typeof context.cachedAt === 'string' ? Date.parse(context.cachedAt) : Number.NaN;
+    if (!Number.isFinite(cachedAt) || cachedAt > now) {
+      throw new DomainError('invalid_cached_session', 'Cached context timestamp is invalid.', 400);
+    }
+  }
+  if (sessionExpiresAt <= now || (principalExpiresAt !== undefined && principalExpiresAt <= now)
+    || (cachedAt !== undefined && maxAgeMs !== undefined && now - cachedAt >= maxAgeMs)) {
+    throw new DomainError('session_expired', 'Cached session or context has expired.', 401);
   }
 }
 
