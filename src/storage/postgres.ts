@@ -121,31 +121,45 @@ export class PostgresStore implements Store {
     END)`;
     const result = await this.pool.query<ScoredRow>(`
       WITH scoped AS MATERIALIZED (
-        SELECT e.*
+        SELECT e.id, e.updated_at,
+          e.data->>'type' AS memory_type,
+          e.data->>'replacesId' AS replaces_id,
+          CASE WHEN e.data->>'type' IN ('persona', 'preference') THEN ''
+            ELSE lower(coalesce(e.data->>'text', ''))
+          END AS normalized_text
         FROM kiancode_entities e
         WHERE e.kind = 'memory' AND e.owner_id = $1
           AND coalesce(e.data->>'reviewStatus', 'approved') = 'approved'
           AND ${active('e')} AND ${visible('e')}
-      ), unreplaced AS (
-        SELECT memory.*
+      ), replacements AS MATERIALIZED (
+        SELECT DISTINCT replaces_id AS id
+        FROM scoped
+        WHERE replaces_id IS NOT NULL
+      ), unreplaced AS MATERIALIZED (
+        SELECT memory.id, memory.updated_at, memory.memory_type, memory.normalized_text
         FROM scoped memory
-        LEFT JOIN (
-          SELECT DISTINCT data->>'replacesId' AS id
-          FROM scoped
-          WHERE data->>'replacesId' IS NOT NULL
-        ) replacement ON replacement.id = memory.id
-        WHERE replacement.id IS NULL
+        WHERE NOT EXISTS (
+          SELECT 1 FROM replacements replacement WHERE replacement.id = memory.id
+        )
       ), ranked AS (
-        SELECT e.*,
-          CASE WHEN e.data->>'type' IN ('persona', 'preference') THEN 100
+        SELECT candidate.id, candidate.updated_at,
+          CASE WHEN candidate.memory_type IN ('persona', 'preference') THEN 100
             ELSE (SELECT count(*)::int FROM unnest($7::text[]) AS term
-              WHERE strpos(lower(coalesce(e.data->>'text', '')), term) > 0)
+              WHERE strpos(candidate.normalized_text, term) > 0)
           END AS score
-        FROM unreplaced e
+        FROM unreplaced candidate
+      ), selected AS MATERIALIZED (
+        SELECT id, updated_at, score
+        FROM ranked
+        WHERE score > 0
+        ORDER BY score DESC, date_trunc('milliseconds', updated_at) DESC, id DESC
+        LIMIT $8
       )
-      SELECT * FROM ranked WHERE score > 0
-      ORDER BY score DESC, date_trunc('milliseconds', updated_at) DESC, id DESC
-      LIMIT $8
+      SELECT source.*, selected.score
+      FROM selected
+      JOIN kiancode_entities source
+        ON source.kind = 'memory' AND source.id = selected.id AND source.owner_id = $1
+      ORDER BY selected.score DESC, date_trunc('milliseconds', selected.updated_at) DESC, selected.id DESC
     `, values);
     return { rows: result.rows.map(decode<Memory>) };
   }
