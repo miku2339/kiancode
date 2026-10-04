@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { type AccountTaskGrantAdmission, isAccountIdentity } from './account-task-grant.js';
 import { canonicalAccountIssuer, requireOwner, requireScope, scopeAllows, secureAccountApiOrigin } from './auth.js';
 import { DomainError, type Principal } from './contracts.js';
 import type { Store } from './storage/store.js';
@@ -57,6 +57,22 @@ export class AccessService {
     if (this.identityMode === 'account') return 'durable';
     if (this.identityMode === 'oidc') return 'unsupported';
     return undefined;
+  }
+  accountTaskGrant(identity: Principal): AccountTaskGrantAdmission | undefined {
+    if (this.identityMode !== 'account') return undefined;
+    this.validateAccountAutomationIdentity(identity);
+    const expiresAt = identity.expiresAt ? Date.parse(identity.expiresAt) : Number.NaN;
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      throw new DomainError('unauthorized', 'The signed-in Account session has expired', 401);
+    }
+    return {
+      issuer: identity.issuer!,
+      subject: identity.subject!,
+      applicationId: identity.applicationId!,
+      audience: identity.audience!,
+      credentialVersion: identity.credentialVersion!,
+      scopes: [...identity.scopes],
+    };
   }
   async authorize(identity: Principal): Promise<Principal> {
     if (this.identityMode === 'development') return identity;
@@ -128,24 +144,8 @@ export class AccessService {
   }
 
   private validateAccountAutomationIdentity(principal: Principal): void {
-    const subject = principal.subject;
-    const issuer = principal.issuer;
-    let canonicalIssuer: string | undefined;
-    try {
-      canonicalIssuer = issuer ? canonicalAccountIssuer(issuer) : undefined;
-    } catch {
-      canonicalIssuer = undefined;
+    if (!isAccountIdentity(principal, this.identityBinding)) {
+      throw new DomainError('invalid_automation_identity', 'Automation identity is invalid', 403);
     }
-    const valid = Boolean(subject?.match(/^acct_[0-9a-f]{32}$/)
-      && issuer
-      && issuer === canonicalIssuer
-      && principal.id === createHash('sha256').update(`${issuer}\0${subject}`).digest('hex')
-      && principal.applicationId
-      && principal.audience
-      && Number.isInteger(principal.credentialVersion)
-      && principal.credentialVersion! >= 0
-      && (!this.identityBinding || (issuer === this.identityBinding.expectedIssuer
-        && principal.audience === this.identityBinding.expectedAudience)));
-    if (!valid) throw new DomainError('invalid_automation_identity', 'Automation identity is invalid', 403);
   }
 }

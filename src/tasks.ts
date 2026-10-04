@@ -1,9 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
+import {
+  accountTaskGrantIdentityMatches,
+  accountTaskGrantMatches,
+  bindAccountTaskGrant,
+  repairableAccountTaskGrant,
+  type AccountTaskGrantAdmission,
+} from './account-task-grant.js';
 import type { Artifact } from './artifacts.js';
 import { markAutomationAuthorizationFailed } from './automation-authorization.js';
 import { DomainError, type Principal, type Workspace } from './contracts.js';
 import type {
   Conversation,
+  AccountTaskGrant,
   Message,
   NotificationDestination,
   PendingAction,
@@ -60,6 +68,10 @@ export interface TaskServiceOptions {
   leaseMs?: number;
   heartbeatMs?: number;
 }
+
+export type TaskEnqueueAuthorization = Pick<Task, 'authorizationKind' | 'automationSource'> & {
+  accountTaskGrant?: AccountTaskGrantAdmission;
+};
 
 export type TaskTickPhase = 'notifications' | 'reconciliations' | 'reconciler' | 'tasks';
 
@@ -293,7 +305,7 @@ export class TaskService {
     dependencyIds: string[] = [],
     notificationDestination?: NotificationDestination,
     pluginVersions?: Record<string, string>,
-    authorization?: Pick<Task, 'authorizationKind' | 'automationSource'>,
+    authorization?: TaskEnqueueAuthorization,
   ): Promise<Entity<Task>> {
     const conversation = await this.store.get<Conversation>('conversation', conversationId, principal.id);
     if (!conversation || conversation.data.archived) {
@@ -333,7 +345,7 @@ export class TaskService {
         || !sameStrings(previous.data.dependencyIds ?? [], dependencies)
         || !sameNotificationDestination(previous.data.notificationDestination, notificationDestination)
         || (pluginVersions !== undefined && !sameRecord(previous.data.pluginVersions ?? {}, normalizePluginVersions(pluginVersions)))
-        || !sameAutomationAuthorization(previous.data, authorization)) {
+        || !sameTaskAuthorization(previous, authorization)) {
         throw new DomainError('idempotency_conflict', 'Request ID already belongs to another task input', 409);
       }
       return previous;
@@ -341,21 +353,26 @@ export class TaskService {
     const capturedPluginVersions = pluginVersions === undefined
       ? await snapshotEnabledPluginVersions(this.store, principal.id)
       : normalizePluginVersions(pluginVersions);
+    const accountAuthorization = authorization?.accountTaskGrant
+      ? bindAccountTaskGrant(principal, authorization.accountTaskGrant, id)
+      : undefined;
+    const taskPrincipal = accountAuthorization?.principal ?? principal;
     let task: Entity<Task>;
     try {
       task = await this.store.create<Task>('task', principal.id, {
         conversationId,
         ...(conversation.data.workspaceId ? { workspaceId: conversation.data.workspaceId } : {}),
         prompt,
-        principal,
+        principal: taskPrincipal,
         state: 'queued',
-        grantExpiresAt: renewedGrantExpiry(principal, this.now()),
+        grantExpiresAt: renewedGrantExpiry(taskPrincipal, this.now()),
         pendingActions: [],
         approvedActionHashes: [],
         pluginVersions: capturedPluginVersions,
         ...(attachments.length ? { attachmentIds: attachments } : {}),
         ...(dependencies.length ? { dependencyIds: dependencies } : {}),
         ...(notificationDestination ? { notificationDestination } : {}),
+        ...(accountAuthorization ? { accountTaskGrant: accountAuthorization.grant } : {}),
         ...(authorization?.authorizationKind ? { authorizationKind: authorization.authorizationKind } : {}),
         ...(authorization?.automationSource ? { automationSource: authorization.automationSource } : {}),
       }, id);
@@ -524,7 +541,7 @@ export class TaskService {
         throw new DomainError('approval_required', 'Approve the exact pending actions first', 409);
       }
       const principal = actor
-        ? resumedPrincipal(task, actor, this.now(), this.options.durableGrants === true)
+        ? resumedPrincipal(task, id, actor, this.now(), this.options.durableGrants === true)
         : task.principal;
       return {
         ...task,
@@ -534,7 +551,11 @@ export class TaskService {
           : 'queued',
         pauseRequested: false,
         nextAttemptAt: undefined,
-        grantExpiresAt: renewedGrantExpiry(principal, this.now()),
+        grantExpiresAt: renewedGrantExpiry(
+          principal,
+          this.now(),
+          task.accountTaskGrant?.delegationExpiresAt,
+        ),
         approvedActionHashes: [...approved],
       };
     });
@@ -563,7 +584,7 @@ export class TaskService {
     const ownerId = actor.id;
     let task = await this.store.get<Task>('task', id, ownerId);
     if (!task) throw new DomainError('not_found', 'Task not found', 404);
-    resumedPrincipal(task.data, actor, this.now(), this.options.durableGrants === true);
+    resumedPrincipal(task.data, task.id, actor, this.now(), this.options.durableGrants === true);
     const previousDecision = task.data.reconciliation;
     if (previousDecision?.phase === 'pending') {
       assertSameReconciliation(previousDecision, input, actor);
@@ -597,7 +618,7 @@ export class TaskService {
     if (this.active.has(id) || (task.data.workerId && Date.parse(task.data.leaseExpiresAt ?? '') > this.now())) {
       throw new DomainError('task_busy', 'The task executor must stop before its outcome can be reconciled', 409);
     }
-    const principal = resumedPrincipal(task.data, actor, this.now(), this.options.durableGrants === true);
+    const principal = resumedPrincipal(task.data, task.id, actor, this.now(), this.options.durableGrants === true);
     const dispatch = hasReconciliationSelector(input)
       ? reconciliationTarget(dispatches ?? await this.sideEffectDispatches(ownerId, id), input)
       : undefined;
@@ -639,7 +660,11 @@ export class TaskService {
       acceptedAt,
       targetState,
       resumePrincipal: principal,
-      grantExpiresAt: renewedGrantExpiry(principal, this.now()),
+      grantExpiresAt: renewedGrantExpiry(
+        principal,
+        this.now(),
+        task.data.accountTaskGrant?.delegationExpiresAt,
+      ),
     };
     try {
       task = await this.store.put('task', task.id, ownerId, { ...task.data, reconciliation }, task.revision);
@@ -1011,16 +1036,30 @@ export class TaskService {
             );
           }
         } else {
-          const principal = revalidatedPrincipal(
-            fresh.data.principal,
+          if (accountDelegationExpired(fresh.data, this.now())) {
+            throw new DomainError('grant_expired', 'Delegated task authorization expired', 403);
+          }
+          const principal = revalidatedTaskPrincipal(
+            fresh,
             await this.options.reauthorize(fresh.data.principal),
-            task.ownerId,
           );
+          const durableAccount = isDurableAccountTask(fresh);
+          const delegationExpiresAt = fresh.data.accountTaskGrant?.delegationExpiresAt;
           fresh = await this.change(task.ownerId, task.id, (current) => {
             if (current.state !== 'running' || current.workerId !== this.workerId) {
               throw new DomainError('lease_lost', 'Execution lease lost', 409);
             }
-            return { ...current, principal };
+            return {
+              ...current,
+              principal,
+              ...(durableAccount ? {
+                grantExpiresAt: renewedGrantExpiry(
+                  principal,
+                  this.now(),
+                  delegationExpiresAt,
+                ),
+              } : {}),
+            };
           });
         }
       }
@@ -1054,22 +1093,27 @@ export class TaskService {
     }, this.options.heartbeatMs ?? 15_000);
     leaseTimer.unref();
     try {
+      if (hasMalformedAccountTaskGrant(task)) {
+        throw new DomainError('invalid_account_task_grant', 'Account task authorization context is invalid', 403);
+      }
       if (hasMalformedAutomationAuthorization(task.data)) {
         throw new DomainError('invalid_automation_identity', 'Automation authorization context is invalid', 403);
+      }
+      if (accountDelegationExpired(task.data, this.now())) {
+        throw new DomainError('grant_expired', 'Delegated task authorization expired', 403);
       }
       const grantLapsed = Date.parse(task.data.grantExpiresAt) <= this.now();
       const durable = this.options.durableGrants === true
         && this.options.reauthorize !== undefined
-        && isDurableAutomationTask(task.data);
+        && (isDurableAutomationTask(task.data) || isDurableAccountTask(task));
       if (grantLapsed && !durable) {
         throw new DomainError('grant_expired', 'Task authorization expired; resume from a signed-in client', 403);
       }
       let executionTask = task;
       if (this.options.reauthorize) {
-        const principal = revalidatedPrincipal(
-          task.data.principal,
+        const principal = revalidatedTaskPrincipal(
+          task,
           await this.options.reauthorize(task.data.principal),
-          task.ownerId,
         );
         executionTask = await this.change(task.ownerId, task.id, (current) => {
           if (current.state !== 'running' || current.workerId !== this.workerId) {
@@ -1078,7 +1122,13 @@ export class TaskService {
           return {
             ...current,
             principal,
-            ...(grantLapsed ? { grantExpiresAt: renewedGrantExpiry(principal, this.now()) } : {}),
+            ...(grantLapsed ? {
+              grantExpiresAt: renewedGrantExpiry(
+                principal,
+                this.now(),
+                task.data.accountTaskGrant?.delegationExpiresAt,
+              ),
+            } : {}),
           };
         });
       }
@@ -1466,6 +1516,7 @@ const authorizationPauseCodes = new Set([
   'authorization_revalidation_required',
   'grant_expired',
   'grant_revoked',
+  'invalid_account_task_grant',
   'invalid_automation_identity',
   'unauthorized',
 ]);
@@ -1687,9 +1738,30 @@ function revalidatedPrincipal(granted: Principal, current: Principal, ownerId: s
   };
 }
 
-function resumedPrincipal(task: Task, actor: Principal, now: number, durableGrants: boolean): Principal {
+function resumedPrincipal(
+  task: Task,
+  taskId: string,
+  actor: Principal,
+  now: number,
+  durableGrants: boolean,
+): Principal {
   if (actor.expiresAt && (!Number.isFinite(Date.parse(actor.expiresAt)) || Date.parse(actor.expiresAt) <= now)) {
     throw new DomainError('unauthorized', 'The signed-in session has expired', 401);
+  }
+  if (durableGrants && task.accountTaskGrant) {
+    if (accountDelegationExpired(task, now)) {
+      throw new DomainError('grant_expired', 'Delegated task authorization expired', 403);
+    }
+    if (!repairableAccountTaskGrant(task.accountTaskGrant, task.principal, taskRootId(task, taskId))
+      || !accountTaskGrantIdentityMatches(task.accountTaskGrant, actor)) {
+      throw new DomainError('grant_revoked', 'Account task authorization has changed', 403);
+    }
+    const current = revalidatedPrincipal(task.principal, actor, task.principal.id);
+    const { expiresAt: _expiresAt, ...durable } = current;
+    if (!accountTaskGrantMatches(task.accountTaskGrant, durable, taskRootId(task, taskId))) {
+      throw new DomainError('grant_revoked', 'Account task authorization has changed', 403);
+    }
+    return durable;
   }
   if (durableGrants && isDurableAutomationTask(task)) {
     const { expiresAt: _expiresAt, ...durable } = revalidatedPrincipal(task.principal, actor, task.principal.id);
@@ -1697,6 +1769,33 @@ function resumedPrincipal(task: Task, actor: Principal, now: number, durableGran
   }
   if (!task.orchestration) return { ...actor, scopes: [...actor.scopes] };
   return revalidatedPrincipal(task.principal, actor, task.principal.id);
+}
+
+function revalidatedTaskPrincipal(task: Entity<Task>, current: Principal): Principal {
+  const principal = revalidatedPrincipal(task.data.principal, current, task.ownerId);
+  if (task.data.accountTaskGrant
+    && !accountTaskGrantMatches(task.data.accountTaskGrant, principal, taskRootId(task.data, task.id))) {
+    throw new DomainError('invalid_account_task_grant', 'Account task authorization context is invalid', 403);
+  }
+  return principal;
+}
+
+function isDurableAccountTask(task: Pick<Entity<Task>, 'id' | 'data'>): boolean {
+  return task.data.accountTaskGrant !== undefined
+    && accountTaskGrantMatches(task.data.accountTaskGrant, task.data.principal, taskRootId(task.data, task.id));
+}
+
+function hasMalformedAccountTaskGrant(task: Pick<Entity<Task>, 'id' | 'data'>): boolean {
+  return task.data.accountTaskGrant !== undefined && !isDurableAccountTask(task);
+}
+
+function taskRootId(task: Task, taskId: string): string {
+  return task.orchestration?.rootTaskId ?? taskId;
+}
+
+function accountDelegationExpired(task: Task, now: number): boolean {
+  const expiresAt = task.accountTaskGrant?.delegationExpiresAt;
+  return expiresAt !== undefined && Date.parse(expiresAt) <= now;
 }
 
 function isDurableAutomationTask(task: Task): boolean {
@@ -1713,9 +1812,10 @@ function hasMalformedAutomationAuthorization(task: Task): boolean {
     && !isDurableAutomationTask(task);
 }
 
-function renewedGrantExpiry(principal: Principal, now: number): string {
+function renewedGrantExpiry(principal: Principal, now: number, delegationExpiresAt?: string): string {
   const sessionExpiry = principal.expiresAt ? Date.parse(principal.expiresAt) : Number.POSITIVE_INFINITY;
-  return new Date(Math.min(now + 3_600_000, sessionExpiry)).toISOString();
+  const delegationExpiry = delegationExpiresAt ? Date.parse(delegationExpiresAt) : Number.POSITIVE_INFINITY;
+  return new Date(Math.min(now + 3_600_000, sessionExpiry, delegationExpiry)).toISOString();
 }
 
 function sameStrings(left: string[], right: string[]): boolean {
@@ -1731,15 +1831,23 @@ function sameNotificationDestination(
     && (left?.type !== 'channel' || right?.type !== 'channel' || left.destinationId === right.destinationId);
 }
 
-function sameAutomationAuthorization(
-  task: Task,
-  authorization: Pick<Task, 'authorizationKind' | 'automationSource'> | undefined,
+function sameTaskAuthorization(
+  task: Entity<Task>,
+  authorization: TaskEnqueueAuthorization | undefined,
 ): boolean {
-  return task.authorizationKind === authorization?.authorizationKind
-    && (task.automationSource !== undefined) === (authorization?.automationSource !== undefined)
-    && task.automationSource?.type === authorization?.automationSource?.type
-    && task.automationSource?.id === authorization?.automationSource?.id
-    && task.automationSource?.version === authorization?.automationSource?.version;
+  if (task.data.authorizationKind !== authorization?.authorizationKind
+    || (task.data.automationSource !== undefined) !== (authorization?.automationSource !== undefined)
+    || task.data.automationSource?.type !== authorization?.automationSource?.type
+    || task.data.automationSource?.id !== authorization?.automationSource?.id
+    || task.data.automationSource?.version !== authorization?.automationSource?.version) return false;
+  if (!task.data.accountTaskGrant) return true;
+  if (!authorization?.accountTaskGrant) return false;
+  const expected: AccountTaskGrant = {
+    ...authorization.accountTaskGrant,
+    scopes: [...new Set(authorization.accountTaskGrant.scopes)].sort(),
+    rootTaskId: task.id,
+  };
+  return sameValue(task.data.accountTaskGrant, expected);
 }
 
 function normalizePluginVersions(value: Record<string, string>): Record<string, string> {

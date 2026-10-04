@@ -94,6 +94,10 @@ export async function createServer(options: ServerOptions) {
     return options.access!.authorize(identity);
   } : undefined);
   const unattended = options.access?.unattendedAuthorization();
+  const accountTaskAuthorization = (owner: Principal) => {
+    const accountTaskGrant = options.access?.accountTaskGrant(owner);
+    return accountTaskGrant ? { accountTaskGrant } : undefined;
+  };
   const tasks = new TaskService(store, options.runner, {
     onError: (error) => app.log.error(error),
     onTickError: (failure) => {
@@ -439,7 +443,19 @@ export async function createServer(options: ServerOptions) {
     }
     if (conversation.data.internalOperation) throw new DomainError('operation_conversation', 'Use the workspace operation endpoint', 409);
     await cacheOutageContext(request, owner, conversation);
-    return reply.code(202).send({ data: await tasks.enqueue(owner, params(request).id, body.content, body.requestId, body.attachmentIds) });
+    return reply.code(202).send({
+      data: await tasks.enqueue(
+        owner,
+        params(request).id,
+        body.content,
+        body.requestId,
+        body.attachmentIds,
+        [],
+        undefined,
+        undefined,
+        accountTaskAuthorization(owner),
+      ),
+    });
   });
   app.get('/v1/tasks', { config: { outageFallback: true } }, async (request) => {
     const query = taskQuerySchema.parse(request.query);
@@ -685,7 +701,19 @@ export async function createServer(options: ServerOptions) {
       catch (error) { if (!(error instanceof DomainError && error.code === 'conflict')) throw error; conversation = await store.get<Conversation>('conversation', conversationId, owner.id); }
     }
     if (JSON.stringify(conversation?.data.internalOperation) !== JSON.stringify(operation)) throw new DomainError('idempotency_conflict', 'Request ID belongs to another operation', 409);
-    return reply.code(202).send({ data: await tasks.enqueue(owner, conversationId, tool.name, body.requestId) });
+    return reply.code(202).send({
+      data: await tasks.enqueue(
+        owner,
+        conversationId,
+        tool.name,
+        body.requestId,
+        [],
+        [],
+        undefined,
+        undefined,
+        accountTaskAuthorization(owner),
+      ),
+    });
   });
   app.post('/v1/workspaces', async (request, reply) => {
     const owner = principal(request); requireOwner(owner); requireScope(owner, 'workspace:write');

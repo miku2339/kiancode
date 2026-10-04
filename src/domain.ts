@@ -72,6 +72,17 @@ export interface TaskReconciliationRestoration {
   resolution: TaskReconciliationResolution;
 }
 
+export interface AccountTaskGrant {
+  issuer: string;
+  subject: string;
+  applicationId: string;
+  audience: string;
+  credentialVersion: number;
+  scopes: string[];
+  rootTaskId: string;
+  delegationExpiresAt?: string;
+}
+
 export interface Task {
   conversationId: string;
   workspaceId?: string;
@@ -96,6 +107,7 @@ export interface Task {
   dependencyIds?: string[];
   notificationDestination?: NotificationDestination;
   orchestration?: TaskOrchestration;
+  accountTaskGrant?: AccountTaskGrant;
   authorizationKind?: 'account_automation';
   automationSource?: { type: 'schedule' | 'event_trigger'; id: string; version: number };
   reconciliation?: TaskReconciliationRecord;

@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import { accountTaskGrantMatches, narrowAccountTaskGrant } from '../account-task-grant.js';
 import { DomainError, type ExecutionStrategy, type Principal } from '../contracts.js';
-import type { Conversation, Message, Task, TaskEvent, TaskOrchestration, TaskState } from '../domain.js';
+import type { AccountTaskGrant, Conversation, Message, Task, TaskEvent, TaskOrchestration, TaskState } from '../domain.js';
 import type { AgentProfile, RunUsage } from '../runtime/index.js';
 import type { Entity, Store } from '../storage/store.js';
 import { BudgetLedger, type BudgetLimits } from './budget-ledger.js';
@@ -112,6 +113,7 @@ interface PreparedChildren {
     spec: ChildSpec;
     principal: Principal;
     grantExpiresAt: string;
+    accountTaskGrant?: AccountTaskGrant;
     authorizationKind?: Task['authorizationKind'];
     automationSource?: Task['automationSource'];
   }>;
@@ -1050,6 +1052,11 @@ export class AgentCoordinator {
   ): Promise<PreparedChildren> {
     const parentConversation = await this.store.get<Conversation>('conversation', parent.data.conversationId, parent.ownerId);
     if (!parentConversation) throw new DomainError('not_found', 'Parent conversation not found', 404);
+    const rootTaskId = parent.data.orchestration?.rootTaskId ?? parent.id;
+    if (parent.data.accountTaskGrant
+      && !accountTaskGrantMatches(parent.data.accountTaskGrant, parent.data.principal, rootTaskId)) {
+      throw new DomainError('invalid_account_task_grant', 'Account task authorization context is invalid', 403);
+    }
     const depth = (parent.data.orchestration?.depth ?? 0) + 1;
     const children = [] as PreparedChildren['children'];
     for (const spec of request.children) {
@@ -1060,6 +1067,9 @@ export class AgentCoordinator {
       const parentExpiry = Math.min(
         Date.parse(parent.data.grantExpiresAt),
         parent.data.principal.expiresAt ? Date.parse(parent.data.principal.expiresAt) : Number.POSITIVE_INFINITY,
+        parent.data.accountTaskGrant?.delegationExpiresAt
+          ? Date.parse(parent.data.accountTaskGrant.delegationExpiresAt)
+          : Number.POSITIVE_INFINITY,
       );
       const requestedExpiry = spec.grantExpiresAt ? Date.parse(spec.grantExpiresAt) : parentExpiry;
       if (!Number.isFinite(requestedExpiry) || requestedExpiry > parentExpiry) {
@@ -1069,6 +1079,15 @@ export class AgentCoordinator {
         spec,
         principal,
         grantExpiresAt: new Date(requestedExpiry).toISOString(),
+        ...(parent.data.accountTaskGrant
+          ? {
+            accountTaskGrant: narrowAccountTaskGrant(
+              parent.data.accountTaskGrant,
+              principal,
+              spec.grantExpiresAt ? new Date(requestedExpiry).toISOString() : undefined,
+            ),
+          }
+          : {}),
         authorizationKind: parent.data.authorizationKind,
         automationSource: parent.data.automationSource,
       });
@@ -1084,7 +1103,14 @@ export class AgentCoordinator {
   ): Promise<Entity<OrchestrationPlan>> {
     await this.reserveSlots(parent.ownerId, plan.id, plan.data.childIds);
     for (let index = 0; index < prepared.children.length; index += 1) {
-      const { spec, principal, grantExpiresAt, authorizationKind, automationSource } = prepared.children[index]!;
+      const {
+        spec,
+        principal,
+        grantExpiresAt,
+        accountTaskGrant,
+        authorizationKind,
+        automationSource,
+      } = prepared.children[index]!;
       const childId = plan.data.childIds[index]!;
       const conversationId = `${childId}:conversation`;
       await this.createOnce<Conversation>('conversation', conversationId, parent.ownerId, {
@@ -1133,6 +1159,7 @@ export class AgentCoordinator {
         approvedActionHashes: [],
         attachmentIds: parent.data.attachmentIds,
         pluginVersions: parent.data.pluginVersions,
+        ...(accountTaskGrant ? { accountTaskGrant } : {}),
         ...(authorizationKind ? { authorizationKind } : {}),
         ...(automationSource ? { automationSource } : {}),
         orchestration,
@@ -1245,6 +1272,7 @@ export class AgentCoordinator {
         principal: data.principal,
         grantExpiresAt: data.grantExpiresAt,
         pluginVersions: data.pluginVersions,
+        accountTaskGrant: data.accountTaskGrant,
         authorizationKind: data.authorizationKind,
         automationSource: data.automationSource,
         orchestration: data.orchestration,
@@ -1255,6 +1283,7 @@ export class AgentCoordinator {
         principal: existing.data.principal,
         grantExpiresAt: existing.data.grantExpiresAt,
         pluginVersions: existing.data.pluginVersions,
+        accountTaskGrant: existing.data.accountTaskGrant,
         authorizationKind: existing.data.authorizationKind,
         automationSource: existing.data.automationSource,
         orchestration: existing.data.orchestration,
