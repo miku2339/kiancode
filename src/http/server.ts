@@ -1,6 +1,7 @@
 import Fastify, { type FastifyRequest } from 'fastify';
 import websocket from '@fastify/websocket';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { z, ZodError } from 'zod';
 import { bearer, type Authenticator, requireOwner, requireScope, tokenHash } from '../auth.js';
 import { DomainError, type Principal, type ToolDefinition, type Workspace } from '../contracts.js';
@@ -700,7 +701,7 @@ export async function createServer(options: ServerOptions) {
       try { conversation = await store.create<Conversation>('conversation', owner.id, { title: tool.name, scope: 'private', mode: 'act', strategy: 'single', modelPolicy: 'local', workspaceId: workspace.id, archived: false, internalOperation: operation }, conversationId); }
       catch (error) { if (!(error instanceof DomainError && error.code === 'conflict')) throw error; conversation = await store.get<Conversation>('conversation', conversationId, owner.id); }
     }
-    if (JSON.stringify(conversation?.data.internalOperation) !== JSON.stringify(operation)) throw new DomainError('idempotency_conflict', 'Request ID belongs to another operation', 409);
+    if (!isDeepStrictEqual(conversation?.data.internalOperation, operation)) throw new DomainError('idempotency_conflict', 'Request ID belongs to another operation', 409);
     return reply.code(202).send({
       data: await tasks.enqueue(
         owner,

@@ -5,8 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Pool } from 'pg';
+import { developmentAuth } from '../src/auth.js';
 import { DomainError, notDispatched, type Principal, type ToolDefinition, type Workspace } from '../src/contracts.js';
 import type { Conversation, Task } from '../src/domain.js';
+import { createServer } from '../src/http/server.js';
 import { createTaskRunner } from '../src/runtime-adapter.js';
 import { AgentRuntime, type ChatMessage, type ModelProvider } from '../src/runtime/index.js';
 import { PostgresStore } from '../src/storage/postgres.js';
@@ -166,3 +168,109 @@ for (const backend of ['SQLite', 'PostgreSQL'] as const) {
     }
   });
 }
+
+test('PostgreSQL workspace operation idempotency compares structured input values', {
+  skip: databaseUrl ? false : 'KIANCODE_TEST_DATABASE_URL is not set',
+}, async () => {
+  const schema = `kiancode_test_${randomBytes(16).toString('hex')}`;
+  const admin = new Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 5000 });
+  const token = 'postgres-operation-development-token-thirty-two';
+  let store: PostgresStore | undefined;
+  let server: Awaited<ReturnType<typeof createServer>> | undefined;
+  let executions = 0;
+  let alternateExecutions = 0;
+  const operationTool: ToolDefinition = {
+    name: 'terminal.run',
+    description: 'Execute a synthetic terminal operation',
+    inputSchema: { type: 'object' },
+    requiredCapabilities: ['workspace:read'],
+    requiresWorkspace: true,
+    sideEffect: 'external',
+    async execute() {
+      executions += 1;
+      return { content: 'done' };
+    },
+  };
+  const alternateTool: ToolDefinition = {
+    ...operationTool,
+    name: 'terminal.other',
+    async execute() {
+      alternateExecutions += 1;
+      return { content: 'other' };
+    },
+  };
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    store = await PostgresStore.connect(databaseUrl, { schema });
+    const tools = [operationTool, alternateTool];
+    server = await createServer({
+      store,
+      authenticate: developmentAuth(token),
+      tools,
+      runner: createTaskRunner(store, { run: async () => { throw new Error('model must not run'); } }, tools),
+      reauthorize: async (current) => current,
+    });
+    const workspace = await store.create<Workspace>('workspace', 'local-owner', {
+      id: 'operation-workspace',
+      ownerId: 'local-owner',
+      name: 'Operation',
+      root: '/project',
+      deviceId: 'server',
+      capabilities: ['workspace:read'],
+      allowCloud: false,
+    }, 'operation-workspace');
+    const headers = { authorization: `Bearer ${token}` };
+    const requestId = 'postgres-operation-1';
+    const post = (tool: string, input: Record<string, unknown>) => server!.app.inject({
+      method: 'POST',
+      url: `/v1/workspaces/${workspace.id}/operations`,
+      headers,
+      payload: { tool, input, requestId },
+    });
+    const firstInput = {
+      command: 'printf done',
+      shell: '/bin/sh',
+      cwd: '/project',
+      timeoutMs: 30_000,
+      options: { environment: { B: '2', A: '1' }, flags: ['first', 'second'] },
+    };
+
+    const first = await post(operationTool.name, firstInput);
+    assert.equal(first.statusCode, 202, first.body);
+    await server.tasks.drain();
+    assert.equal(executions, 1);
+
+    const replay = await post(operationTool.name, {
+      options: { flags: ['first', 'second'], environment: { A: '1', B: '2' } },
+      timeoutMs: 30_000,
+      cwd: '/project',
+      shell: '/bin/sh',
+      command: 'printf done',
+    });
+    assert.equal(replay.statusCode, 202, replay.body);
+    assert.equal(replay.json().data.id, first.json().data.id);
+    await server.tasks.drain();
+    assert.equal(executions, 1);
+
+    for (const changed of [
+      { tool: operationTool.name, input: { ...firstInput, timeoutMs: 30_001 } },
+      { tool: operationTool.name, input: { ...firstInput, options: { ...firstInput.options, flags: ['second', 'first'] } } },
+      { tool: alternateTool.name, input: firstInput },
+    ]) {
+      const conflict = await post(changed.tool, changed.input);
+      assert.equal(conflict.statusCode, 409, conflict.body);
+      assert.equal(conflict.json().error.code, 'idempotency_conflict');
+      await server.tasks.drain();
+      assert.equal(executions, 1);
+      assert.equal(alternateExecutions, 0);
+    }
+  } finally {
+    try {
+      if (server) await server.close();
+      else await store?.close();
+    } finally {
+      try { await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); }
+      finally { await admin.end(); }
+    }
+  }
+});
