@@ -46,6 +46,8 @@ export class PostgresStore implements Store {
       statement_timeout: 10000,
       ...(options.schema ? { options: `-c search_path=${options.schema}` } : {}),
     });
+    // pg-pool removes failed idle clients; query failures still reach callers.
+    pool.on('error', () => undefined);
     try {
       const schema = await pool.query<{ table_exists: boolean; index_exists: boolean }>(`
         SELECT to_regclass('kiancode_entities') IS NOT NULL AS table_exists,
