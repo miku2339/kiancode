@@ -68,11 +68,12 @@ test('bootstrap task runner wrappers isolate model context from persisted task b
       checkpointDirectory: path.join(directory, 'checkpoints'),
       database: { sqlitePath: path.join(directory, 'core.sqlite') },
       auth: { developmentTokenEnv: tokenName },
-      providers: [{ id: 'fake', type: 'ollama', locality: 'local', baseUrl: `http://127.0.0.1:${address.port}` }],
+      providers: [{ id: 'fake', type: 'ollama', locality: 'local', baseUrl: `http://127.0.0.1:${address.port}`, timeoutMs: 120_000 }],
       models: [{ id: 'fake-model', providerId: 'fake', locality: 'local', capabilities: ['text'] }],
       attachments: { localDirectory: path.join(directory, 'attachments') },
     }), options);
     const { store, tasks: service } = server;
+    assert.equal((await server.modelManagement.providers(principal.id))[0]?.timeoutMs, 120_000);
     assert.equal(injectedStore, store);
     const conversation = await store.create<Conversation>('conversation', principal.id, {
       title: 'Wrapped task',

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { z } from 'zod';
 
 const modelSchema = z.object({ id: z.string().min(1), providerId: z.string().min(1), model: z.string().optional(), locality: z.enum(['cloud', 'local']), deviceId: z.string().optional(), capabilities: z.array(z.string()).min(1), enabled: z.boolean().default(true), priority: z.number().default(0) }).strict();
-const providerSchema = z.object({ id: z.string().min(1), type: z.enum(['openai-compatible', 'ollama', 'device']), locality: z.enum(['cloud', 'local']), baseUrl: z.url().optional(), apiKeyEnv: z.string().regex(/^[A-Z][A-Z0-9_]*$/).optional() }).strict();
+const providerSchema = z.object({ id: z.string().min(1), type: z.enum(['openai-compatible', 'ollama', 'device']), locality: z.enum(['cloud', 'local']), baseUrl: z.url().optional(), apiKeyEnv: z.string().regex(/^[A-Z][A-Z0-9_]*$/).optional(), timeoutMs: z.number().int().min(1_000).max(120_000).optional() }).strict();
 const defaultTerminalReadOnlyPaths = ['/usr'];
 const budgetSchema = (maxCalls: number, maxTokens: number) => z.object({
   maxCalls: z.number().int().min(1).max(500).default(maxCalls),
@@ -158,6 +158,7 @@ export const configSchema = z.object({
   for (const provider of config.providers) {
     if (provider.type !== 'device' && !provider.baseUrl) context.addIssue({ code: 'custom', message: `Provider ${provider.id} requires baseUrl` });
     if (provider.type === 'device' && provider.locality !== 'local') context.addIssue({ code: 'custom', message: 'Device model providers must be local' });
+    if (provider.type === 'device' && provider.timeoutMs !== undefined) context.addIssue({ code: 'custom', message: 'Device model providers cannot define network timeouts' });
   }
   for (const model of config.models) {
     const provider = config.providers.find((provider) => provider.id === model.providerId);

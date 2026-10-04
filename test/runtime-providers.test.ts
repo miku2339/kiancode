@@ -164,6 +164,67 @@ test('streaming providers preserve partial usage instead of coercing missing fie
   }).then((response) => response.usage), { outputTokens: 3 });
 });
 
+test('streaming provider body timeouts use the stable provider timeout error', async () => {
+  const timedFetch = (chunk: string): typeof fetch => async (_url, init) => new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(chunk));
+      init?.signal?.addEventListener('abort', () => controller.error(init.signal?.reason), { once: true });
+    },
+  }));
+  const openai = new OpenAICompatibleProvider({
+    id: 'openai-timeout',
+    locality: 'local',
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    fetch: timedFetch('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'),
+    timeoutMs: 1_000,
+  });
+  const ollama = new OllamaProvider({
+    id: 'ollama-timeout',
+    baseUrl: 'http://127.0.0.1:11434',
+    fetch: timedFetch('{"message":{"content":"partial"},"done":false}\n'),
+    timeoutMs: 1_000,
+  });
+  const request = (provider: OpenAICompatibleProvider | OllamaProvider): ChatRequest => ({
+    model: { id: 'model', providerId: provider.id, locality: 'local', capabilities: [] },
+    messages: [{ role: 'user', content: 'Answer' }],
+    tools: [],
+    signal: new AbortController().signal,
+  });
+  const providerTimeout = (error: unknown) => error instanceof Error
+    && 'code' in error && error.code === 'provider_timeout';
+
+  await Promise.all([
+    assert.rejects(openai.chat(request(openai)), providerTimeout),
+    assert.rejects(ollama.chat(request(ollama)), providerTimeout),
+  ]);
+});
+
+test('streaming providers preserve the caller abort reason', async () => {
+  const controller = new AbortController();
+  const reason = new Error('caller stopped');
+  const provider = new OpenAICompatibleProvider({
+    id: 'openai-abort',
+    locality: 'local',
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    timeoutMs: 120_000,
+    fetch: async (_url, init) => new Response(new ReadableStream({
+      start(stream) {
+        stream.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+        init?.signal?.addEventListener('abort', () => stream.error(init.signal?.reason), { once: true });
+      },
+    })),
+  });
+  const pending = provider.chat({
+    model: { id: 'model', providerId: provider.id, locality: 'local', capabilities: [] },
+    messages: [{ role: 'user', content: 'Answer' }],
+    tools: [],
+    signal: controller.signal,
+  });
+  setTimeout(() => controller.abort(reason), 10);
+
+  await assert.rejects(pending, (error: unknown) => error === reason);
+});
+
 test('OpenAI-compatible provider rejects truncated, empty, and unterminated streams', async () => {
   const request = (provider: OpenAICompatibleProvider): ChatRequest => ({
     model: { id: 'model', providerId: provider.id, locality: 'local', capabilities: [] },

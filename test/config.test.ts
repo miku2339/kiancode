@@ -91,6 +91,33 @@ test('account API endpoint permits loopback HTTP and rejects unsafe origins', ()
   }), /must not include user information/);
 });
 
+test('provider timeouts are bounded and apply only to network providers', () => {
+  const config = configSchema.parse({
+    providers: [{
+      id: 'cloud',
+      type: 'openai-compatible',
+      locality: 'cloud',
+      baseUrl: 'https://models.example/v1',
+      timeoutMs: 120_000,
+    }],
+  });
+  assert.equal(config.providers[0]?.timeoutMs, 120_000);
+  for (const timeoutMs of [999, 120_001]) {
+    assert.throws(() => configSchema.parse({
+      providers: [{
+        id: 'cloud',
+        type: 'openai-compatible',
+        locality: 'cloud',
+        baseUrl: 'https://models.example/v1',
+        timeoutMs,
+      }],
+    }), ZodError);
+  }
+  assert.throws(() => configSchema.parse({
+    providers: [{ id: 'device', type: 'device', locality: 'local', timeoutMs: 60_000 }],
+  }), ZodError);
+});
+
 test('terminal credentials require explicit environment references', () => {
   const config = configSchema.parse({
     terminal: { environmentEnv: { GITHUB_TOKEN: 'KIANCODE_TOOL_GITHUB_TOKEN' } },

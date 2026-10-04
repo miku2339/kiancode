@@ -159,6 +159,7 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
         type: provider.type,
         locality: provider.locality,
         baseUrl: provider.baseUrl,
+        timeoutMs: provider.timeoutMs,
         enabled: true,
         ...(apiKey ? { apiKey } : {}),
       };
@@ -169,8 +170,8 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
         dispatcher: devices,
         ephemeralPayloads: visualContexts,
       });
-      if (provider.type === 'ollama') return new OllamaProvider({ id: provider.id, baseUrl: provider.baseUrl! });
-      return new OpenAICompatibleProvider({ id: provider.id, baseUrl: provider.baseUrl!, locality: provider.locality, apiKey: provider.apiKey });
+      if (provider.type === 'ollama') return new OllamaProvider({ id: provider.id, baseUrl: provider.baseUrl!, timeoutMs: provider.timeoutMs });
+      return new OpenAICompatibleProvider({ id: provider.id, baseUrl: provider.baseUrl!, locality: provider.locality, apiKey: provider.apiKey, timeoutMs: provider.timeoutMs });
     };
     const providers = providerSeeds.map(createProvider);
     const credentialKeyValue = process.env[config.providerManagement.credentialKeyEnv];

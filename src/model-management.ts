@@ -11,10 +11,11 @@ export const providerSettingsSchema = z.object({
   type: z.enum(['openai-compatible', 'ollama', 'device']),
   locality: z.enum(['cloud', 'local']),
   baseUrl: z.url().optional(),
+  timeoutMs: z.number().int().min(1_000).max(120_000).optional(),
   enabled: z.boolean().default(true),
 }).strict().superRefine((value, context) => {
   if (value.type === 'device') {
-    if (value.locality !== 'local' || value.baseUrl) context.addIssue({ code: 'custom', message: 'Device providers must be local and cannot define a network URL' });
+    if (value.locality !== 'local' || value.baseUrl || value.timeoutMs !== undefined) context.addIssue({ code: 'custom', message: 'Device providers must be local and cannot define a network URL or timeout' });
   } else if (!value.baseUrl) context.addIssue({ code: 'custom', message: 'A provider URL is required' });
   if (value.type === 'ollama' && value.locality !== 'local') context.addIssue({ code: 'custom', message: 'Ollama providers must be local' });
   if (value.baseUrl) {
@@ -71,7 +72,7 @@ export class ModelManagement {
       const override = overrides.find((row) => row.data.id === id);
       const seed = this.options.providers.find((row) => row.id === id);
       const data = override?.data ?? seed!;
-      return { id, revision: override?.revision ?? 0, name: data.name, type: data.type, locality: data.locality, baseUrl: data.baseUrl, enabled: data.enabled,
+      return { id, revision: override?.revision ?? 0, name: data.name, type: data.type, locality: data.locality, baseUrl: data.baseUrl, timeoutMs: data.timeoutMs, enabled: data.enabled,
         credentialConfigured: Boolean(override ? override.data.credential || (override.data.inheritCredential && seed?.apiKey) : seed?.apiKey),
         credentialEditable: Boolean(this.key), source: override ? 'account' : 'configuration' };
     });
@@ -102,7 +103,7 @@ export class ModelManagement {
   async disableProvider(actor: Principal, id: string, revision: number): Promise<void> {
     const provider = (await this.providers(actor.id)).find((row) => row.id === id);
     if (!provider) throw new DomainError('not_found', 'Provider not found', 404);
-    await this.saveProvider(actor, id, { name: provider.name, type: provider.type, locality: provider.locality, baseUrl: provider.baseUrl, enabled: false }, revision);
+    await this.saveProvider(actor, id, { name: provider.name, type: provider.type, locality: provider.locality, baseUrl: provider.baseUrl, timeoutMs: provider.timeoutMs, enabled: false }, revision);
   }
 
   async models(ownerId: string) {
@@ -226,7 +227,7 @@ export class ModelManagement {
     const seed = this.options.providers.find((provider) => provider.id === id);
     if (!row && !seed) throw new DomainError('provider_not_found', 'Provider not found', 404);
     const source = row?.data ?? seed!;
-    const settings: ProviderSettings = { name: source.name, type: source.type, locality: source.locality, baseUrl: source.baseUrl, enabled: source.enabled };
+    const settings: ProviderSettings = { name: source.name, type: source.type, locality: source.locality, baseUrl: source.baseUrl, timeoutMs: source.timeoutMs, enabled: source.enabled };
     const apiKey = row ? row.data.credential ? this.open(ownerId, id, row.data.credential) : row.data.inheritCredential ? seed?.apiKey : undefined : seed?.apiKey;
     const version = createHash('sha256').update(JSON.stringify({ id, settings, revision: row?.revision ?? 0, credential: apiKey ? createHash('sha256').update(apiKey).digest('hex') : null })).digest('hex');
     return { id, settings, apiKey, version, overridden: Boolean(row) };

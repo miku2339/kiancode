@@ -71,7 +71,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
   public async chat(request: ChatRequest): Promise<ChatResponse> {
     const names = new FunctionNames();
-    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(this.timeoutMs)]);
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    const signal = AbortSignal.any([request.signal, timeoutSignal]);
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
@@ -89,7 +90,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         redirect: 'error',
       });
     } catch (error) {
-      throw providerFetchError(error, request.signal, this.id);
+      throw providerFetchError(error, request.signal, timeoutSignal, this.id);
     }
     await assertOk(response, this.id);
     if (!response.body) {
@@ -100,7 +101,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     const calls = new Map<number, { id: string; name: string; arguments: string }>();
     let sawDone = false;
     let finishReason: string | undefined;
-    for await (const event of readSse(response.body, this.maxResponseBytes)) {
+    for await (const event of providerStream(readSse(response.body, this.maxResponseBytes), request.signal, timeoutSignal, this.id)) {
       if (event === '[DONE]') {
         sawDone = true;
         break;
@@ -182,7 +183,8 @@ export class OllamaProvider implements ModelProvider {
 
   public async chat(request: ChatRequest): Promise<ChatResponse> {
     const names = new FunctionNames();
-    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(this.timeoutMs)]);
+    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    const signal = AbortSignal.any([request.signal, timeoutSignal]);
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}/api/chat`, {
@@ -199,7 +201,7 @@ export class OllamaProvider implements ModelProvider {
         redirect: 'error',
       });
     } catch (error) {
-      throw providerFetchError(error, request.signal, this.id);
+      throw providerFetchError(error, request.signal, timeoutSignal, this.id);
     }
     await assertOk(response, this.id);
     if (!response.body) {
@@ -210,7 +212,7 @@ export class OllamaProvider implements ModelProvider {
     const toolCalls: ToolCall[] = [];
     let sawDone = false;
     let doneReason: string | undefined;
-    for await (const line of readLines(response.body, this.maxResponseBytes)) {
+    for await (const line of providerStream(readLines(response.body, this.maxResponseBytes), request.signal, timeoutSignal, this.id)) {
       if (!line.trim()) {
         continue;
       }
@@ -483,13 +485,29 @@ function boundedInteger(value: number | undefined, fallback: number, minimum: nu
   return selected;
 }
 
-function providerFetchError(error: unknown, callerSignal: AbortSignal, providerId: string): Error {
+async function* providerStream<T>(
+  stream: AsyncIterable<T>,
+  callerSignal: AbortSignal,
+  timeoutSignal: AbortSignal,
+  providerId: string,
+): AsyncGenerator<T> {
+  try {
+    yield* stream;
+  } catch (error) {
+    if (callerSignal.aborted || timeoutSignal.aborted) {
+      throw providerFetchError(error, callerSignal, timeoutSignal, providerId);
+    }
+    throw error;
+  }
+}
+
+function providerFetchError(error: unknown, callerSignal: AbortSignal, timeoutSignal: AbortSignal, providerId: string): Error {
   if (callerSignal.aborted) {
     return callerSignal.reason instanceof Error
       ? callerSignal.reason
       : new DOMException('The operation was aborted.', 'AbortError');
   }
-  if (error instanceof DOMException && error.name === 'TimeoutError') {
+  if (timeoutSignal.aborted || (error instanceof DOMException && error.name === 'TimeoutError')) {
     return new DomainError('provider_timeout', `${providerId} did not respond before the timeout.`, 504);
   }
   return new DomainError('provider_unavailable', `${providerId} is unavailable.`, 503);

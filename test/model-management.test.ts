@@ -71,6 +71,26 @@ test('only verified capabilities enable a model and changing destination invalid
   assert.deepEqual(await service.models(other.id), []);
 });
 
+test('managed provider timeouts reach runtime construction', async (t) => {
+  let observedTimeout: number | undefined;
+  const { store, service } = setup({
+    createProvider: (provider) => {
+      observedTimeout = provider.timeoutMs;
+      return { id: provider.id, locality: provider.locality, chat: verifiedResponse };
+    },
+  });
+  t.after(() => store.close());
+  await service.saveProvider(owner, 'custom', { ...settings, timeoutMs: 120_000 }, 0);
+  await service.saveModel(owner, 'model', modelSettings, 0);
+  await service.probe(owner, 'model');
+  await service.saveModel(owner, 'model', { ...modelSettings, enabled: true }, 2);
+  observedTimeout = undefined;
+
+  await service.runtime(owner.id);
+
+  assert.equal(observedTimeout, 120_000);
+});
+
 test('failed capability probe disables the candidate and records a safe failure code', async (t) => {
   const { store, service } = setup({ createProvider: (provider) => ({ ...provider, chat: async () => reply('not the probe') }) }); t.after(() => store.close());
   await service.saveProvider(owner, 'custom', settings, 0);
@@ -115,9 +135,22 @@ test('model HTTP management validates scopes and never exposes provider keys', a
   const { store, service } = setup(); const app = Fastify(); t.after(async () => { await app.close(); await store.close(); });
   app.setErrorHandler((error, _request, response) => response.code(error instanceof Error && error.name === 'ZodError' ? 400 : 500).send({ error: 'invalid' }));
   registerModelManagementRoutes(app, service, () => owner);
-  const created = await app.inject({ method: 'PUT', url: '/v1/providers/custom', payload: { revision: 0, settings, apiKey: 'private-key' } });
+  const timedSettings = { ...settings, timeoutMs: 120_000 };
+  const created = await app.inject({ method: 'PUT', url: '/v1/providers/custom', payload: { revision: 0, settings: timedSettings, apiKey: 'private-key' } });
   assert.equal(created.statusCode, 200); assert.ok(!created.body.includes('private-key'));
-  const list = await app.inject('/v1/providers'); assert.equal(list.json().data[0].credentialConfigured, true);
+  assert.equal(created.json().data.timeoutMs, 120_000);
+  const list = await app.inject('/v1/providers');
+  assert.equal(list.json().data[0].credentialConfigured, true);
+  assert.equal(list.json().data[0].timeoutMs, 120_000);
+  assert.equal((await app.inject({
+    method: 'PUT',
+    url: '/v1/providers/device',
+    payload: { revision: 0, settings: { name: 'Device', type: 'device', locality: 'local', enabled: true, timeoutMs: 60_000 } },
+  })).statusCode, 400);
+  assert.equal((await app.inject({ method: 'DELETE', url: '/v1/providers/custom?revision=1' })).statusCode, 204);
+  const disabled = await app.inject('/v1/providers');
+  assert.equal(disabled.json().data[0].enabled, false);
+  assert.equal(disabled.json().data[0].timeoutMs, 120_000);
   assert.equal((await app.inject({ method: 'PUT', url: '/v1/models/model', payload: { revision: 0, settings: { ...modelSettings, capabilities: ['vision'] } } })).statusCode, 400);
 });
 
