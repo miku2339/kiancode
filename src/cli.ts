@@ -5,14 +5,14 @@ import path from 'node:path';
 import { bootstrap } from './bootstrap.js';
 import { loadConfig, requireOwnerSubject } from './config.js';
 import { createBlobServer } from './http/blob-server.js';
-import { runConnector } from './connector-cli.js';
+import { parseParentPidArgument, runConnector } from './connector-cli.js';
 
 function flag(name: string, fallback: string): string { const index = process.argv.indexOf(name); return index >= 0 ? process.argv[index + 1] ?? fallback : fallback; }
 
 async function main() {
   const command = process.argv[2] ?? 'help';
   const configFile = flag('--config', '.runtime/config.json');
-  if (command === 'connector') { await runConnector(configFile); return; }
+  if (command === 'connector') { await runConnector(configFile, { parentPid: parseParentPidArgument(process.argv) }); return; }
   if (command === 'blobs') {
     const key = flag('--tls-key', ''); const cert = flag('--tls-cert', '');
     if (Boolean(key) !== Boolean(cert)) throw new Error('Provide both --tls-key and --tls-cert');

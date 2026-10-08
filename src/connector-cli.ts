@@ -40,8 +40,37 @@ interface ProcessLock {
   release(): Promise<void>;
 }
 
+export interface RunConnectorOptions {
+  parentPid?: number;
+}
+
 const lockReadyMarker = 'KIANCODE_LOCK_READY';
 const lockOwnerPattern = /^\d+(?: [0-9a-f-]{36})?\n?$/i;
+
+export function parseParentPidArgument(argv: readonly string[]): number | undefined {
+  const index = argv.indexOf('--parent-pid');
+  if (index < 0) return undefined;
+  const value = argv[index + 1];
+  if (!value || !/^[1-9]\d*$/.test(value)) throw new Error('Use --parent-pid with a positive process ID');
+  const parentPid = Number(value);
+  if (!Number.isSafeInteger(parentPid)) throw new Error('Use --parent-pid with a positive process ID');
+  return parentPid;
+}
+
+function assertCurrentParent(parentPid: number | undefined): void {
+  if (parentPid === undefined) return;
+  if (!Number.isSafeInteger(parentPid) || parentPid <= 0) throw new Error('Parent process ID must be a positive integer');
+  if (process.ppid !== parentPid) throw new Error(`Parent process ${parentPid} is no longer the connector parent`);
+}
+
+function watchParent(parentPid: number | undefined, onExit: () => void): () => void {
+  if (parentPid === undefined) return () => {};
+  const check = () => { if (process.ppid !== parentPid) onExit(); };
+  const timer = setInterval(check, 250);
+  timer.unref();
+  check();
+  return () => clearInterval(timer);
+}
 
 async function waitForLockHolder(holder: ChildProcessWithoutNullStreams): Promise<void> {
   await new Promise<void>((resolve, reject) => {
@@ -118,13 +147,19 @@ async function acquireProcessLock(lockPath: string): Promise<ProcessLock> {
   };
 }
 
-export async function runConnector(file: string) {
+export async function runConnector(file: string, options: RunConnectorOptions = {}) {
+  assertCurrentParent(options.parentPid);
   const config = connectorConfig.parse(JSON.parse(await readFile(file, 'utf8')));
   const token = config.tokenEnv ? process.env[config.tokenEnv]?.trim() : (await readFile(config.tokenFile!, 'utf8')).trim();
   if (!token) throw new Error(`Missing device token${config.tokenEnv ? ` in ${config.tokenEnv}` : ''}`);
   const processLock = await acquireProcessLock(config.lockPath ?? path.join(path.dirname(config.journalPath), 'connector.lock'));
   const resources: Array<{ close(): Promise<void> }> = [];
+  const controller = new AbortController();
+  let transport: WebSocketDeviceTransport | undefined;
+  const stop = () => { controller.abort(); transport?.close(); };
+  const stopWatchingParent = watchParent(options.parentPid, stop);
   try {
+    if (controller.signal.aborted) return;
     const terminalEnvironment = Object.fromEntries(Object.entries(config.terminal.environmentEnv).map(([name, source]) => {
       const value = process.env[source];
       if (value === undefined) throw new Error(`Missing terminal environment variable ${source}`);
@@ -144,16 +179,16 @@ export async function runConnector(file: string) {
       const { McpToolProvider } = await import('./tools/mcp.js');
       for (const server of config.mcp) { const provider = await McpToolProvider.connect(server); resources.push(provider); tools.push(...await provider.asToolDefinitions()); }
     }
+    if (controller.signal.aborted) return;
     let connector: DeviceConnector;
-    const transport = new WebSocketDeviceTransport({ baseUrl: config.url, token, deviceId: config.deviceId, onCancel: (id) => connector?.cancel(id) });
-    connector = new DeviceConnector({ deviceId: config.deviceId, ownerId: config.ownerId, transport, capabilities: config.capabilities, workspaces: new Map(config.workspaces.map((item) => [item.id, item as Workspace])), tools, journalPath: config.journalPath });
-    const controller = new AbortController();
-    const stop = () => { controller.abort(); transport.close(); };
+    const activeTransport = new WebSocketDeviceTransport({ baseUrl: config.url, token, deviceId: config.deviceId, onCancel: (id) => connector?.cancel(id) });
+    transport = activeTransport;
+    connector = new DeviceConnector({ deviceId: config.deviceId, ownerId: config.ownerId, transport: activeTransport, capabilities: config.capabilities, workspaces: new Map(config.workspaces.map((item) => [item.id, item as Workspace])), tools, journalPath: config.journalPath });
     void processLock.lost.then(stop);
     process.on('SIGINT', stop); process.on('SIGTERM', stop);
-    const heartbeat = setInterval(() => { void transport.heartbeat(config.deviceId, config.capabilities).catch(() => { /* The authenticated socket cancels active jobs on loss. */ }); }, 15000);
+    const heartbeat = setInterval(() => { void activeTransport.heartbeat(config.deviceId, config.capabilities).catch(() => { /* The authenticated socket cancels active jobs on loss. */ }); }, 15000);
     try {
-      process.stdout.write('Device connector started\n');
+      if (!controller.signal.aborted) process.stdout.write('Device connector started\n');
       let reconnectDelay = 500;
       while (!controller.signal.aborted) {
         try {
@@ -174,10 +209,11 @@ export async function runConnector(file: string) {
         }
       }
     } finally {
-      clearInterval(heartbeat); transport.close();
+      clearInterval(heartbeat); activeTransport.close();
       process.off('SIGINT', stop); process.off('SIGTERM', stop);
     }
   } finally {
+    stopWatchingParent();
     await Promise.allSettled(resources.map((resource) => resource.close()));
     await processLock.release();
   }

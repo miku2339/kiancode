@@ -33,9 +33,29 @@ test('connector requires exactly one token source and rejects unsafe terminal en
   }), /reserved/i);
 });
 
-function connectorChild(configPath: string): ChildProcessWithoutNullStreams {
-  return spawn(process.execPath, ['--import', 'tsx', 'src/connector-entry.ts', '--config', configPath], {
+function connectorChild(configPath: string, parentPid?: number): ChildProcessWithoutNullStreams {
+  const args = ['--import', 'tsx', 'src/connector-entry.ts', '--config', configPath];
+  if (parentPid !== undefined) args.push('--parent-pid', String(parentPid));
+  return spawn(process.execPath, args, {
     cwd: process.cwd(),
+    env: { ...process.env, KIANCODE_CONNECTOR_TOKEN: '0123456789abcdef0123456789abcdef' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+}
+
+function connectorSupervisor(configPath: string): ChildProcessWithoutNullStreams {
+  const source = `
+    const { spawn } = require('node:child_process');
+    const [cwd, configPath] = process.argv.slice(1);
+    const connector = spawn(process.execPath, [
+      '--import', 'tsx', 'src/connector-entry.ts', '--config', configPath,
+      '--parent-pid', String(process.pid),
+    ], { cwd, env: process.env, stdio: ['ignore', process.stdout, process.stderr] });
+    connector.once('error', (error) => { process.stderr.write(error.message + '\\n'); process.exit(1); });
+    process.stdout.write('Supervisor started connector ' + connector.pid + '\\n');
+    process.stdin.resume();
+  `;
+  return spawn(process.execPath, ['-e', source, process.cwd(), configPath], {
     env: { ...process.env, KIANCODE_CONNECTOR_TOKEN: '0123456789abcdef0123456789abcdef' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -67,6 +87,20 @@ async function lockIsAvailable(lockPath: string): Promise<boolean> {
     probe.once('error', () => resolve(false));
     probe.once('exit', (code) => resolve(code === 0));
   });
+}
+
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+async function waitForExit(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => child.once('exit', () => resolve()));
 }
 
 test('connector never clears a lock that may still be initializing', {
@@ -142,6 +176,86 @@ test('concurrent connector processes admit one owner and recover after its crash
     await Promise.all(children.map((child) => child.exitCode !== null || child.signalCode !== null
       ? Promise.resolve()
       : new Promise<void>((resolve) => child.once('exit', () => resolve()))));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('connector exits with its supervisor, releases its lock, and an independent connector takes over', {
+  timeout: 20_000,
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kiancode-connector-parent-'));
+  const configPath = path.join(directory, 'config.json');
+  const lockPath = path.join(directory, 'connector.lock');
+  await writeFile(configPath, JSON.stringify({
+    ...base,
+    url: 'http://127.0.0.1:9',
+    tokenEnv: 'KIANCODE_CONNECTOR_TOKEN',
+    journalPath: path.join(directory, 'journal.json'),
+    checkpointDirectory: path.join(directory, 'checkpoints'),
+    lockPath,
+  }));
+
+  const supervisor = connectorSupervisor(configPath);
+  const supervisorOutput = output(supervisor);
+  let connectorPid: number | undefined;
+  let replacement: ChildProcessWithoutNullStreams | undefined;
+  try {
+    await waitFor(() => supervisorOutput.stdout().includes('Device connector started'));
+    const match = /Supervisor started connector (\d+)/.exec(supervisorOutput.stdout());
+    assert.ok(match);
+    connectorPid = Number(match[1]);
+    assert.equal(processIsRunning(connectorPid), true);
+
+    supervisor.kill('SIGKILL');
+    await waitForExit(supervisor);
+    await waitFor(() => !processIsRunning(connectorPid!), 5_000);
+    await waitFor(() => lockIsAvailable(lockPath));
+
+    replacement = connectorChild(configPath);
+    const replacementOutput = output(replacement);
+    await waitFor(() => replacementOutput.stdout().includes('Device connector started'));
+    assert.match(await readFile(lockPath, 'utf8'), new RegExp(`^${replacement.pid}(?:\\s|$)`));
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    assert.equal(replacement.exitCode, null);
+    assert.equal(replacement.signalCode, null);
+  } finally {
+    if (supervisor.exitCode === null && supervisor.signalCode === null) supervisor.kill('SIGKILL');
+    await waitForExit(supervisor);
+    if (connectorPid !== undefined && processIsRunning(connectorPid)) process.kill(connectorPid, 'SIGKILL');
+    if (replacement && replacement.exitCode === null && replacement.signalCode === null) replacement.kill('SIGTERM');
+    if (replacement) await waitForExit(replacement);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('connector rejects a stale parent process ID before taking the lock', {
+  timeout: 10_000,
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'kiancode-connector-stale-parent-'));
+  const configPath = path.join(directory, 'config.json');
+  const lockPath = path.join(directory, 'connector.lock');
+  await writeFile(configPath, JSON.stringify({
+    ...base,
+    url: 'http://127.0.0.1:9',
+    tokenEnv: 'KIANCODE_CONNECTOR_TOKEN',
+    journalPath: path.join(directory, 'journal.json'),
+    checkpointDirectory: path.join(directory, 'checkpoints'),
+    lockPath,
+  }));
+
+  const child = connectorChild(configPath, process.pid + 1);
+  const stream = output(child);
+  try {
+    await waitForExit(child);
+    assert.equal(child.exitCode, 1);
+    assert.doesNotMatch(stream.stdout(), /Device connector started/);
+    assert.match(stream.stderr(), /no longer the connector parent/i);
+    assert.equal(await lockIsAvailable(lockPath), true);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    await waitForExit(child);
     await rm(directory, { recursive: true, force: true });
   }
 });
