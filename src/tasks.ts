@@ -125,6 +125,7 @@ type RuntimeEvent = { type: string; [key: string]: unknown };
 
 const tokenFlushDelayMs = 32;
 const tokenBufferLimitBytes = 64 * 1024;
+const failedEventRepairBatchSize = 16;
 
 class DurableRuntimeEventStream {
   private intake = Promise.resolve();
@@ -285,6 +286,7 @@ export class TaskService {
   private reconciler?: () => Promise<void>;
   private tickFailures = 0;
   private tickLastErrorAt?: string;
+  private failedEventRepairOffset = 0;
 
   public constructor(
     private readonly store: Store,
@@ -420,9 +422,11 @@ export class TaskService {
   }
 
   public async events(ownerId: string, taskId: string, after = 0): Promise<Array<Entity<TaskEvent>>> {
-    if (!await this.store.get('task', taskId, ownerId)) {
+    const task = await this.store.get<Task>('task', taskId, ownerId);
+    if (!task) {
       throw new DomainError('not_found', 'Task not found', 404);
     }
+    if (task.data.state === 'failed') await this.ensureFailedEvent(task);
     return (await this.store.scan<TaskEvent>('event', ownerId))
       .filter((row) => row.data.taskId === taskId && row.data.sequence > after)
       .sort((left, right) => left.data.sequence - right.data.sequence);
@@ -830,6 +834,29 @@ export class TaskService {
     }
   }
 
+  private async ensureFailedEvent(task: Entity<Task>): Promise<void> {
+    if (task.data.state !== 'failed') return;
+    await this.fixedEvent(task, `${task.id}:terminal:failed:${task.revision}`, {
+      type: 'failed',
+      taskRevision: task.revision,
+      error: task.data.error ?? 'Task execution failed',
+    }, task.updatedAt);
+  }
+
+  private async repairFailedEvents(tasks: Array<Entity<Task>>): Promise<void> {
+    const failed = tasks.filter((task) => task.data.state === 'failed');
+    if (failed.length === 0) {
+      this.failedEventRepairOffset = 0;
+      return;
+    }
+    const count = Math.min(failedEventRepairBatchSize, failed.length);
+    const offset = this.failedEventRepairOffset % failed.length;
+    for (let index = 0; index < count; index += 1) {
+      await this.ensureFailedEvent(failed[(offset + index) % failed.length]!);
+    }
+    this.failedEventRepairOffset = (offset + count) % failed.length;
+  }
+
   public start(intervalMs = 1_000): void {
     if (this.timer) {
       return;
@@ -928,6 +955,7 @@ export class TaskService {
 
   private async claimTasks(): Promise<void> {
     let tasks = await this.store.scan<Task>('task');
+    await this.repairFailedEvents(tasks);
     for (const task of tasks) {
       if (task.data.state === 'running'
         && !this.active.has(task.id)
@@ -975,6 +1003,7 @@ export class TaskService {
           error: 'A dependency did not complete successfully.',
         }));
         await this.event(failed, { type: 'dependency_failed' });
+        await this.ensureFailedEvent(failed);
         await this.notify(failed, taskNotification(failed, 'task_failed'), new Date(failed.updatedAt));
         continue;
       }
@@ -1298,6 +1327,7 @@ export class TaskService {
         await this.notify(updated, taskNotification(updated, type), new Date(updated.updatedAt))
           .catch((notificationError) => this.options.onError?.(notificationError));
       }
+      if (updated?.data.state === 'failed') await this.ensureFailedEvent(updated);
     } finally {
       runtimeEvents.dispose();
       clearInterval(leaseTimer);

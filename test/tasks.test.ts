@@ -76,6 +76,40 @@ test('a durable task runs once for a repeated client request and records its res
   } finally { await service.close(); await store.close(); }
 });
 
+test('separate failed task revisions retain one terminal event for each attempt', async () => {
+  const store = new SqliteStore();
+  let attempts = 0;
+  const service = new TaskService(store, async () => {
+    attempts += 1;
+    throw new Error(`failure ${attempts}`);
+  });
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'retryable failure');
+    await service.drain();
+    const firstFailed = (await store.get<Task>('task', task.id, principal.id))!;
+    assert.equal(firstFailed.data.state, 'failed');
+
+    await store.put<Task>('task', task.id, principal.id, {
+      ...firstFailed.data,
+      state: 'queued',
+      error: undefined,
+    }, firstFailed.revision);
+    await service.drain();
+    await service.drain();
+
+    const failedEvents = (await service.events(principal.id, task.id))
+      .filter((event) => event.data.type === 'failed');
+    assert.equal(attempts, 2);
+    assert.equal(failedEvents.length, 2);
+    assert.deepEqual(failedEvents.map((event) => (event.data.payload as { error?: string }).error), [
+      'failure 1',
+      'failure 2',
+    ]);
+    assert.equal(new Set(failedEvents.map((event) => (event.data.payload as { taskRevision?: number }).taskRevision)).size, 2);
+  } finally { await service.close(); await store.close(); }
+});
+
 test('tasks snapshot their conversation workspace without assigning legacy records', async () => {
   const store = new SqliteStore();
   const service = new TaskService(store, async () => ({ text: 'done' }));
