@@ -69,6 +69,8 @@ Remote MCP header values use `{ "envRef": "ENVIRONMENT_VARIABLE" }`. Keep origin
 
 ## Deployment
 
+Core provides the authenticated task API, durable execution, memory and device connectors. A product frontend such as Plus, its Account authority and its media service are separate deployment components; their release revisions do not identify the Core revision. Keep an independent source revision for each component in the release manifest, and keep installation-specific topology in the operator's private operations records.
+
 Production uses PostgreSQL and an authenticated HTTPS attachment service. Run the API under systemd using `deploy/kiancode.service` and `deploy/config.example.json` as templates. Runtime checkpoints default to `/var/lib/kiancode/checkpoints` in production and can be set with `stateDirectory` or `checkpointDirectory`; keep them on a path writable by the service account. Keep configuration, service credentials and private workspaces outside the source tree. Grant only the workspace roots and capabilities needed by the service account.
 
 `deploy/postgres/init-app.sh` creates a dedicated role and database when run by a PostgreSQL administrator. It requires `APP_USER`, `APP_DATABASE`, `POSTGRES_USER` and a mounted `/run/secrets/app_password`; the identifiers and password are deliberately restricted to the script's accepted character set. Put the resulting connection string in the environment variable named by `database.urlEnv` (`DATABASE_URL` by default), then validate the complete production configuration before starting the service:
