@@ -79,6 +79,8 @@ export interface AccountTaskGrant {
   audience: string;
   credentialVersion: number;
   consentVersion: number;
+  grantVersion?: number;
+  authenticatedAt?: number;
   scopes: string[];
   rootTaskId: string;
   delegationExpiresAt?: string;

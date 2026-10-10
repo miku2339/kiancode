@@ -41,16 +41,20 @@ export function accountAuth(
       response = await fetcher(new URL('/api/mobile-auth/session/', accountApiOrigin), { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000), redirect: 'error' });
     } catch { throw new DomainError('identity_unavailable', 'Account service is unavailable', 503); }
     if (!response.ok) throw new DomainError(response.status === 401 ? 'unauthorized' : 'identity_unavailable', response.status === 401 ? 'Session expired or revoked' : 'Account service is unavailable', response.status === 401 ? 401 : 503);
-    const envelope = await response.json() as { success?: boolean; data?: { session?: { subject?: string; level?: number; scopes?: unknown; expiresAt?: string | number; applicationId?: string; audience?: string; credentialVersion?: number; consentVersion?: number } } };
+    const envelope = await response.json() as { success?: boolean; data?: { session?: { subject?: string; level?: number; scopes?: unknown; expiresAt?: string | number; applicationId?: string; audience?: string; credentialVersion?: number; consentVersion?: number; grantVersion?: number; authenticatedAt?: number } } };
     const session = envelope.data?.session;
     const expiresAt = accountSessionExpiry(session?.expiresAt);
     if (!envelope.success || !session?.subject?.match(/^acct_[0-9a-f]{32}$/) || ![1, 2, 3, 4, 5].includes(session.level ?? 0)
       || !Array.isArray(session.scopes) || session.scopes.some((scope) => typeof scope !== 'string') || !expiresAt
-      || !Number.isInteger(session.consentVersion) || session.consentVersion! <= 0) {
+      || !Number.isInteger(session.consentVersion) || session.consentVersion! <= 0
+      || (session.grantVersion !== undefined && (!Number.isSafeInteger(session.grantVersion) || session.grantVersion <= 0))
+      || (session.grantVersion !== undefined && session.authenticatedAt === undefined)
+      || (session.authenticatedAt !== undefined && (!Number.isSafeInteger(session.authenticatedAt)
+        || session.authenticatedAt <= 0 || session.authenticatedAt > Math.floor(Date.now() / 1_000)))) {
       throw new DomainError('invalid_identity', 'Account returned an invalid session', 401);
     }
     if (expectedAudience && (session.audience !== expectedAudience || !session.applicationId || !Number.isInteger(session.credentialVersion))) throw new DomainError('invalid_audience', 'This session is not authorized for Kian', 403);
-    return { id: createHash('sha256').update(`${canonicalIssuer}\0${session.subject}`).digest('hex'), issuer: canonicalIssuer, subject: session.subject, level: session.level as Principal['level'], scopes: session.scopes as string[], applicationId: session.applicationId, audience: session.audience, credentialVersion: session.credentialVersion, consentVersion: session.consentVersion, expiresAt };
+    return { id: createHash('sha256').update(`${canonicalIssuer}\0${session.subject}`).digest('hex'), issuer: canonicalIssuer, subject: session.subject, level: session.level as Principal['level'], scopes: session.scopes as string[], applicationId: session.applicationId, audience: session.audience, credentialVersion: session.credentialVersion, consentVersion: session.consentVersion, ...(session.grantVersion === undefined ? {} : { grantVersion: session.grantVersion }), ...(session.authenticatedAt === undefined ? {} : { authenticatedAt: session.authenticatedAt }), expiresAt };
   };
 }
 

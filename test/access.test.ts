@@ -80,7 +80,7 @@ async function storeRecord(store: Store, subject: string, scopes: string[], enab
 function accountAccess(store: Store, levelCeilings: LevelCeilings = {}): AccessService {
   const authorizationCheck = (async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body)) as { credentialVersion: number; consentVersion: number };
-    return Response.json({ success: true, data: { active: true, credentialVersion: body.credentialVersion, consentVersion: body.consentVersion } });
+    return Response.json({ success: true, data: { active: true, credentialVersion: body.credentialVersion, consentVersion: body.consentVersion, grantVersion: 0 } });
   }) as typeof fetch;
   return new AccessService(store, ownerSubject, serviceToken, 'account', undefined, authorizationCheck, levelCeilings);
 }
@@ -266,7 +266,7 @@ test('account automation delegation validates its canonical identity tuple befor
   let requests = 0;
   const fetcher = (async () => {
     requests += 1;
-    return Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 1 } });
+    return Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 1, grantVersion: 0 } });
   }) as typeof fetch;
   const access = new AccessService(
     store,
@@ -293,6 +293,7 @@ test('account automation delegation validates its canonical identity tuple befor
       { ...valid, credentialVersion: 1.5 },
       { ...valid, consentVersion: 0 },
       { ...valid, consentVersion: 1.5 },
+      { ...valid, grantVersion: 1 },
     ]) {
       await assert.rejects(access.validateDelegation(changed), hasCode('invalid_automation_identity', 403));
     }
@@ -318,32 +319,102 @@ test('account authorization outages remain retryable while explicit inactive or 
       (async () => Response.json(null)) as typeof fetch,
       (async () => Response.json({ success: true, data: {} })) as typeof fetch,
       (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 0, consentVersion: 0 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 0, consentVersion: 1 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 0 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 1.5 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: '1' } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 0, consentVersion: 0, grantVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 0, consentVersion: 1, grantVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 0, grantVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 1.5, grantVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: '1', grantVersion: 0 } })) as typeof fetch,
       (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: false, credentialVersion: -1, consentVersion: 0 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0, consentVersion: -1 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0.5, consentVersion: 0 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0, consentVersion: '0' } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: false, credentialVersion: -1, consentVersion: 0, grantVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0, consentVersion: -1, grantVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0.5, consentVersion: 0, grantVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0, consentVersion: '0', grantVersion: 0 } })) as typeof fetch,
     ]) {
       await assert.rejects(accessFor(fetcher).validateDelegation(owner), hasCode('identity_unavailable', 503));
     }
     await assert.rejects(accessFor(fetch, undefined).validateDelegation(owner), hasCode('identity_unavailable', 503));
     assert.equal(await accessFor((async () => Response.json({
-      success: true, data: { active: false, credentialVersion: 0, consentVersion: 0 },
+      success: true, data: { active: false, credentialVersion: 0, consentVersion: 0, grantVersion: 0 },
     })) as typeof fetch).validateDelegation(owner), false);
     assert.equal(await accessFor((async () => Response.json({
-      success: true, data: { active: false, credentialVersion: 1, consentVersion: 1 },
+      success: true, data: { active: false, credentialVersion: 1, consentVersion: 1, grantVersion: 0 },
     })) as typeof fetch).validateDelegation(owner), false);
     assert.equal(await accessFor((async () => Response.json({
-      success: true, data: { active: true, credentialVersion: 2, consentVersion: 1 },
+      success: true, data: { active: true, credentialVersion: 2, consentVersion: 1, grantVersion: 0 },
     })) as typeof fetch).validateDelegation(owner), false);
     assert.equal(await accessFor((async () => Response.json({
-      success: true, data: { active: true, credentialVersion: 1, consentVersion: 2 },
+      success: true, data: { active: true, credentialVersion: 1, consentVersion: 2, grantVersion: 0 },
     })) as typeof fetch).validateDelegation(owner), false);
+  } finally {
+    await store.close();
+  }
+});
+
+test('Account grant role updates require a fresh snapshot while refresh preserves its scope and logout-all epoch', async () => {
+  const store = new SqliteStore();
+  const authenticatedAt = 1_700_000_000;
+  const issued = identity(memberSubject, 2, { scopes: ['chat:read'], grantVersion: 7, authenticatedAt });
+  const requests: Array<Record<string, unknown>> = [];
+  let response: { active: boolean; credentialVersion: number; consentVersion: number; grantVersion?: unknown } = {
+    active: true, credentialVersion: 1, consentVersion: 1, grantVersion: 7,
+  };
+  const access = new AccessService(
+    store,
+    ownerSubject,
+    serviceToken,
+    'account',
+    undefined,
+    (async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return Response.json({ success: true, data: response });
+    }) as typeof fetch,
+    {},
+    { expectedIssuer: issuer, expectedAudience: 'kiancode' },
+  );
+  try {
+    await storeRecord(store, memberSubject, ['chat:read']);
+    assert.equal(await access.validateDelegation(issued), true);
+    assert.deepEqual(requests.at(-1), {
+      subject: memberSubject,
+      applicationId: 'kiancode',
+      credentialVersion: 1,
+      consentVersion: 1,
+      grantVersion: 7,
+      authenticatedAt,
+    });
+
+    const refreshed = { ...issued, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    assert.equal(await access.validateDelegation(refreshed), true);
+    const checksBeforeExpansion = requests.length;
+    assert.equal(await access.validateDelegation({
+      ...refreshed,
+      scopes: ['chat:read', 'admin:grant'],
+    }), false);
+    assert.equal(requests.length, checksBeforeExpansion);
+
+    response = { active: false, credentialVersion: 1, consentVersion: 1, grantVersion: 8 };
+    assert.equal(await access.validateDelegation(issued), false);
+    response = { ...response, active: true };
+    assert.equal(await access.validateDelegation(issued), false);
+    const freshGrant = { ...refreshed, grantVersion: 8, authenticatedAt: authenticatedAt + 60 };
+    assert.equal(await access.validateDelegation(freshGrant), true);
+    response = { active: true, credentialVersion: 1, consentVersion: 1 };
+    assert.equal(await access.validateDelegation(freshGrant), false);
+    response = { active: true, credentialVersion: 1, consentVersion: 1, grantVersion: '8' };
+    await assert.rejects(access.validateDelegation(freshGrant), hasCode('identity_unavailable', 503));
+
+    response = { active: false, credentialVersion: 2, consentVersion: 1, grantVersion: 8 };
+    assert.equal(await access.validateDelegation(freshGrant), false);
+
+    response = { active: true, credentialVersion: 1, consentVersion: 1 };
+    const legacyConsent = identity(memberSubject, 2);
+    assert.equal(await access.validateDelegation(legacyConsent), true);
+    assert.deepEqual(requests.at(-1), {
+      subject: memberSubject,
+      applicationId: 'kiancode',
+      credentialVersion: 1,
+      consentVersion: 1,
+    });
   } finally {
     await store.close();
   }

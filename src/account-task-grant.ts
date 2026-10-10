@@ -28,6 +28,11 @@ export function isAccountIdentity(
     && principal.credentialVersion! >= 0
     && Number.isInteger(principal.consentVersion)
     && principal.consentVersion! > 0
+    && (principal.grantVersion === undefined
+      || (Number.isSafeInteger(principal.grantVersion) && principal.grantVersion > 0))
+    && (principal.grantVersion === undefined || principal.authenticatedAt !== undefined)
+    && (principal.authenticatedAt === undefined
+      || (Number.isSafeInteger(principal.authenticatedAt) && principal.authenticatedAt > 0))
     && (!binding || (issuer === binding.expectedIssuer && principal.audience === binding.expectedAudience)));
 }
 
@@ -47,6 +52,8 @@ export function bindAccountTaskGrant(
     audience: admission.audience,
     credentialVersion: admission.credentialVersion,
     consentVersion: admission.consentVersion,
+    ...(admission.grantVersion === undefined ? {} : { grantVersion: admission.grantVersion }),
+    ...(admission.authenticatedAt === undefined ? {} : { authenticatedAt: admission.authenticatedAt }),
     scopes,
     rootTaskId,
   };
@@ -115,7 +122,9 @@ function matchesIdentity(grant: AccountTaskGrant | AccountTaskGrantAdmission, pr
     && grant.applicationId === principal.applicationId
     && grant.audience === principal.audience
     && grant.credentialVersion === principal.credentialVersion
-    && grant.consentVersion === principal.consentVersion;
+    && grant.consentVersion === principal.consentVersion
+    && grant.grantVersion === principal.grantVersion
+    && grant.authenticatedAt === principal.authenticatedAt;
 }
 
 function normalizedScopes(scopes: readonly string[]): string[] {

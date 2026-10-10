@@ -1827,7 +1827,9 @@ function accountAutomationIdentityMatches(granted: Principal, current: Principal
     && granted.applicationId === current.applicationId
     && granted.audience === current.audience
     && granted.credentialVersion === current.credentialVersion
-    && granted.consentVersion === current.consentVersion;
+    && granted.consentVersion === current.consentVersion
+    && granted.grantVersion === current.grantVersion
+    && granted.authenticatedAt === current.authenticatedAt;
 }
 
 function isDurableAccountTask(task: Pick<Entity<Task>, 'id' | 'data'>): boolean {

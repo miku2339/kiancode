@@ -82,9 +82,15 @@ class StampFaultStore implements Store {
 test('dispatcher creates a durable marker only after current account authorization succeeds', async () => {
   const store = new SqliteStore();
   let active = false;
-  const access = new AccessService(store, ownerSubject, 'service-token', 'account', undefined, (async () => Response.json({
-    success: true, data: { active, credentialVersion: 3, consentVersion: 1 },
-  })) as typeof fetch, {}, { expectedIssuer: issuer, expectedAudience: 'kiancode' });
+  const authenticatedAt = 1_700_000_000;
+  const issued = { ...actor(), grantVersion: 5, authenticatedAt };
+  let authorizationBody: Record<string, unknown> | undefined;
+  const access = new AccessService(store, ownerSubject, 'service-token', 'account', undefined, (async (_input, init) => {
+    authorizationBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return Response.json({
+      success: true, data: { active, credentialVersion: 3, consentVersion: 1, grantVersion: 5 },
+    });
+  }) as typeof fetch, {}, { expectedIssuer: issuer, expectedAudience: 'kiancode' });
   const reauthorize = async (principal: Principal): Promise<Principal> => {
     if (!await access.validateDelegation(principal)) throw new DomainError('grant_revoked', 'revoked', 403);
     return access.authorize(principal);
@@ -103,7 +109,7 @@ test('dispatcher creates a durable marker only after current account authorizati
       sourceVersion: 4,
       occurrenceId: 'occurrence-1',
       prompt: 'Run',
-      actor: actor(),
+      actor: issued,
       settings,
       reauthorize,
       durable: true,
@@ -113,9 +119,19 @@ test('dispatcher creates a durable marker only after current account authorizati
 
     active = true;
     const task = await dispatcher.dispatch(input);
+    assert.deepEqual(authorizationBody, {
+      subject: ownerSubject,
+      applicationId: 'kiancode-plus',
+      credentialVersion: 3,
+      consentVersion: 1,
+      grantVersion: 5,
+      authenticatedAt,
+    });
     assert.equal(task.data.authorizationKind, 'account_automation');
     assert.deepEqual(task.data.automationSource, { type: 'schedule', id: 'schedule-1', version: 4 });
     assert.equal('expiresAt' in task.data.principal, false);
+    assert.equal(task.data.principal.grantVersion, 5);
+    assert.equal(task.data.principal.authenticatedAt, authenticatedAt);
     await assert.rejects(dispatcher.dispatch({ ...input, sourceVersion: 5 }), hasCode('idempotency_conflict'));
   } finally {
     await tasks.close();
@@ -510,7 +526,7 @@ test('Account 401 dispatch outage retries without stamping or disabling its sche
   let clock = now;
   let available = false;
   const access = new AccessService(store, ownerSubject, 'service-token', 'account', undefined, (async () => available
-    ? Response.json({ success: true, data: { active: true, credentialVersion: 3, consentVersion: 1 } })
+    ? Response.json({ success: true, data: { active: true, credentialVersion: 3, consentVersion: 1, grantVersion: 0 } })
     : new Response(null, { status: 401 })) as typeof fetch, {}, {
     expectedIssuer: issuer, expectedAudience: 'kiancode',
   });

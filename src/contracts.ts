@@ -8,6 +8,8 @@ export interface Principal {
   audience?: string;
   credentialVersion?: number;
   consentVersion?: number;
+  grantVersion?: number;
+  authenticatedAt?: number;
   expiresAt?: string;
 }
 

@@ -87,6 +87,46 @@ test('account authentication rejects missing or malformed consent versions', asy
   }
 });
 
+test('account authentication preserves the issued grant snapshot and validates its Unix-second fields', async () => {
+  const subject = `acct_${'f'.repeat(32)}`;
+  const authenticatedAt = Math.floor(Date.now() / 1_000) - 30;
+  const authenticate = async (snapshot: Record<string, unknown>) => accountAuth(
+    'https://identity.example.test',
+    (async () => Response.json({
+      success: true,
+      data: { session: {
+        subject,
+        level: 2,
+        scopes: ['chat:read'],
+        applicationId: 'kiancode',
+        audience: 'kiancode',
+        credentialVersion: 4,
+        consentVersion: 2,
+        expiresAt: Math.floor(Date.now() / 1_000) + 600,
+        ...snapshot,
+      } },
+    })) as typeof fetch,
+    'kiancode',
+  )('Bearer account-token');
+
+  const principal = await authenticate({ grantVersion: 7, authenticatedAt });
+  assert.equal(principal.grantVersion, 7);
+  assert.equal(principal.authenticatedAt, authenticatedAt);
+  assert.equal((await authenticate({ authenticatedAt })).grantVersion, undefined);
+
+  for (const snapshot of [
+    { grantVersion: 7 },
+    { grantVersion: 0, authenticatedAt },
+    { grantVersion: 1.5, authenticatedAt },
+    { grantVersion: '7', authenticatedAt },
+    { grantVersion: 7, authenticatedAt: 0 },
+    { grantVersion: 7, authenticatedAt: authenticatedAt + 0.5 },
+    { grantVersion: 7, authenticatedAt: Math.floor(Date.now() / 1_000) + 60 },
+  ]) {
+    await assert.rejects(authenticate(snapshot), /invalid session/);
+  }
+});
+
 test('account API endpoint is separate from the canonical identity issuer', async () => {
   const subject = `acct_${'c'.repeat(32)}`;
   const requests: Array<{ url: string; init?: RequestInit }> = [];
@@ -110,7 +150,7 @@ test('account API endpoint is separate from the canonical identity issuer', asyn
     }
     return new Response(JSON.stringify({
       success: true,
-      data: { active: true, credentialVersion: 4, consentVersion: 2 },
+      data: { active: true, credentialVersion: 4, consentVersion: 2, grantVersion: 0 },
     }), { status: 200 });
   }) as typeof fetch;
   const issuer = 'https://identity.example';

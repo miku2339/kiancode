@@ -42,7 +42,7 @@ test('PostgreSQL: durable automation survives session expiry and restart, retrie
     store = await PostgresStore.connect(databaseUrl, { schema });
     const access = new AccessService(store, subject, 'synthetic-service-token', 'account', undefined,
       (async () => unavailable ? new Response('', { status: 503 }) : Response.json({
-        success: true, data: { active, credentialVersion, consentVersion },
+        success: true, data: { active, credentialVersion, consentVersion, grantVersion: 0 },
       })) as typeof fetch, {}, { expectedIssuer: issuer, expectedAudience: 'kiancode' });
     const reauthorize = async (principal: Principal): Promise<Principal> => {
       if (!await access.validateDelegation(principal)) throw new DomainError('grant_revoked', 'Revoked', 403);
@@ -68,7 +68,7 @@ test('PostgreSQL: durable automation survives session expiry and restart, retrie
     });
     const scheduler = (): SchedulerService => {
       const access = new AccessService(currentStore, subject, 'synthetic-service-token', 'account', undefined,
-        (async () => Response.json({ success: true, data: { active, credentialVersion, consentVersion } })) as typeof fetch,
+        (async () => Response.json({ success: true, data: { active, credentialVersion, consentVersion, grantVersion: 0 } })) as typeof fetch,
         {}, { expectedIssuer: issuer, expectedAudience: 'kiancode' });
       return new SchedulerService(currentStore, new AutomationDispatcher(currentStore, tasks!, () => clock), {
         enabled: true, unattended: 'durable', now: () => clock,

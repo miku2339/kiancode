@@ -72,6 +72,8 @@ export class AccessService {
       audience: identity.audience!,
       credentialVersion: identity.credentialVersion!,
       consentVersion: identity.consentVersion!,
+      ...(identity.grantVersion === undefined ? {} : { grantVersion: identity.grantVersion }),
+      ...(identity.authenticatedAt === undefined ? {} : { authenticatedAt: identity.authenticatedAt }),
       scopes: [...identity.scopes],
     };
   }
@@ -121,7 +123,14 @@ export class AccessService {
     try {
       response = await this.fetcher(new URL('/api/internal/authorization/check/', this.accountApiOrigin ?? principal.issuer), {
         method: 'POST', headers: { authorization: `Bearer ${this.serviceToken}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ subject: principal.subject, applicationId: principal.applicationId, credentialVersion: principal.credentialVersion, consentVersion: principal.consentVersion }), redirect: 'error', signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({
+          subject: principal.subject,
+          applicationId: principal.applicationId,
+          credentialVersion: principal.credentialVersion,
+          consentVersion: principal.consentVersion,
+          ...(principal.grantVersion === undefined ? {} : { grantVersion: principal.grantVersion }),
+          ...(principal.authenticatedAt === undefined ? {} : { authenticatedAt: principal.authenticatedAt }),
+        }), redirect: 'error', signal: AbortSignal.timeout(5000),
       });
     } catch {
       throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
@@ -136,10 +145,12 @@ export class AccessService {
     if (!parsed || typeof parsed !== 'object') {
       throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
     }
-    const result = parsed as { success?: boolean; data?: { active?: boolean; credentialVersion?: number; consentVersion?: number } };
+    const result = parsed as { success?: boolean; data?: { active?: boolean; credentialVersion?: number; consentVersion?: number; grantVersion?: unknown } };
     if (result.success !== true || typeof result.data?.active !== 'boolean'
       || !Number.isSafeInteger(result.data.credentialVersion) || result.data.credentialVersion! < 0
-      || !Number.isSafeInteger(result.data.consentVersion) || result.data.consentVersion! < 0) {
+      || !Number.isSafeInteger(result.data.consentVersion) || result.data.consentVersion! < 0
+      || (result.data.grantVersion !== undefined
+        && (!Number.isSafeInteger(result.data.grantVersion) || (result.data.grantVersion as number) < 0))) {
       throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
     }
     if (!result.data.active) return false;
@@ -147,7 +158,8 @@ export class AccessService {
       throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
     }
     return result.data.credentialVersion === principal.credentialVersion
-      && result.data.consentVersion === principal.consentVersion;
+      && result.data.consentVersion === principal.consentVersion
+      && (principal.grantVersion === undefined || result.data.grantVersion === principal.grantVersion);
   }
 
   private validateAccountAutomationIdentity(principal: Principal): void {
