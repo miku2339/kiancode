@@ -8,11 +8,11 @@ import { SqliteStore } from '../src/storage/sqlite.js';
 
 test('account authentication rejects expired/revoked credentials and never merges by email', async () => {
   let status = 200; let subject = `acct_${'a'.repeat(32)}`;
-  const auth = accountAuth('https://identity.example', (async () => new Response(JSON.stringify({ success: true, data: { session: { subject, level: 1, scopes: ['chat:read'], email: 'same@example.com', expiresAt: new Date(Date.now() + 60000).toISOString() } } }), { status })) as typeof fetch);
+  const auth = accountAuth('https://identity.example', (async () => new Response(JSON.stringify({ success: true, data: { session: { subject, level: 1, scopes: ['chat:read'], email: 'same@example.com', consentVersion: 1, expiresAt: new Date(Date.now() + 60000).toISOString() } } }), { status })) as typeof fetch);
   const first = await auth('Bearer credential'); subject = `acct_${'b'.repeat(32)}`;
   const second = await auth('Bearer credential'); assert.notEqual(first.id, second.id);
   status = 401; await assert.rejects(auth('Bearer credential'), /revoked/);
-  const expired = accountAuth('https://identity.example', (async () => new Response(JSON.stringify({ success: true, data: { session: { subject, level: 1, scopes: ['*'], expiresAt: '2020-01-01T00:00:00Z' } } }))) as typeof fetch);
+  const expired = accountAuth('https://identity.example', (async () => new Response(JSON.stringify({ success: true, data: { session: { subject, level: 1, scopes: ['*'], consentVersion: 1, expiresAt: '2020-01-01T00:00:00Z' } } }))) as typeof fetch);
   await assert.rejects(expired('Bearer credential'), /invalid session/);
 });
 
@@ -29,6 +29,7 @@ test('account authentication accepts Account Unix seconds and ISO expiry while r
         applicationId: 'kiancode-plus',
         audience: 'kiancode',
         credentialVersion: 1,
+        consentVersion: 1,
         expiresAt,
       } },
     }))) as typeof fetch,
@@ -39,6 +40,7 @@ test('account authentication accepts Account Unix seconds and ISO expiry while r
   const unixSeconds = Math.floor(Date.now() / 1_000) + 60;
   const fromSeconds = await authenticate(unixSeconds);
   assert.equal(fromSeconds.expiresAt, new Date(unixSeconds * 1_000).toISOString());
+  assert.equal(fromSeconds.consentVersion, 1);
 
   const iso = new Date(Date.now() + 60_000).toISOString();
   assert.equal((await authenticate(iso)).expiresAt, iso);
@@ -60,6 +62,31 @@ test('account authentication accepts Account Unix seconds and ISO expiry while r
   }
 });
 
+test('account authentication rejects missing or malformed consent versions', async () => {
+  const subject = `acct_${'e'.repeat(32)}`;
+  const authenticate = async (consentVersion: unknown) => accountAuth(
+    'https://identity.example.test',
+    (async () => Response.json({
+      success: true,
+      data: { session: {
+        subject,
+        level: 1,
+        scopes: ['chat:read'],
+        applicationId: 'kiancode-plus',
+        audience: 'kiancode',
+        credentialVersion: 1,
+        consentVersion,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      } },
+    })) as typeof fetch,
+    'kiancode',
+  )('Bearer account-token');
+
+  for (const consentVersion of [undefined, null, 0, -1, 1.5, '1']) {
+    await assert.rejects(authenticate(consentVersion), /invalid session/);
+  }
+});
+
 test('account API endpoint is separate from the canonical identity issuer', async () => {
   const subject = `acct_${'c'.repeat(32)}`;
   const requests: Array<{ url: string; init?: RequestInit }> = [];
@@ -77,12 +104,13 @@ test('account API endpoint is separate from the canonical identity issuer', asyn
           applicationId: 'kiancode',
           audience: 'kiancode',
           credentialVersion: 4,
+          consentVersion: 2,
         } },
       }), { status: 200 });
     }
     return new Response(JSON.stringify({
       success: true,
-      data: { active: true, credentialVersion: 4 },
+      data: { active: true, credentialVersion: 4, consentVersion: 2 },
     }), { status: 200 });
   }) as typeof fetch;
   const issuer = 'https://identity.example';

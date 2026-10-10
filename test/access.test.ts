@@ -45,6 +45,7 @@ async function accountIdentity(
       applicationId: 'kiancode',
       audience: 'kiancode',
       credentialVersion: 1,
+      consentVersion: 1,
     } },
   })) as typeof fetch, 'kiancode');
   return authenticate('Bearer credential');
@@ -60,6 +61,7 @@ function identity(subject: string, level: Principal['level'] = 2, overrides: Par
     applicationId: 'kiancode',
     audience: 'kiancode',
     credentialVersion: 1,
+    consentVersion: 1,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
     ...overrides,
   };
@@ -77,8 +79,8 @@ async function storeRecord(store: Store, subject: string, scopes: string[], enab
 
 function accountAccess(store: Store, levelCeilings: LevelCeilings = {}): AccessService {
   const authorizationCheck = (async (_input: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as { credentialVersion: number };
-    return Response.json({ success: true, data: { active: true, credentialVersion: body.credentialVersion } });
+    const body = JSON.parse(String(init?.body)) as { credentialVersion: number; consentVersion: number };
+    return Response.json({ success: true, data: { active: true, credentialVersion: body.credentialVersion, consentVersion: body.consentVersion } });
   }) as typeof fetch;
   return new AccessService(store, ownerSubject, serviceToken, 'account', undefined, authorizationCheck, levelCeilings);
 }
@@ -95,6 +97,7 @@ function accountSessionAuth(sessions: Record<string, { subject: string; level: P
       applicationId: 'kiancode',
       audience: 'kiancode',
       credentialVersion: 1,
+      consentVersion: 1,
     } } });
   }) as typeof fetch, 'kiancode');
 }
@@ -263,7 +266,7 @@ test('account automation delegation validates its canonical identity tuple befor
   let requests = 0;
   const fetcher = (async () => {
     requests += 1;
-    return Response.json({ success: true, data: { active: true, credentialVersion: 1 } });
+    return Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 1 } });
   }) as typeof fetch;
   const access = new AccessService(
     store,
@@ -288,6 +291,8 @@ test('account automation delegation validates its canonical identity tuple befor
       { ...valid, applicationId: '' },
       { ...valid, credentialVersion: -1 },
       { ...valid, credentialVersion: 1.5 },
+      { ...valid, consentVersion: 0 },
+      { ...valid, consentVersion: 1.5 },
     ]) {
       await assert.rejects(access.validateDelegation(changed), hasCode('invalid_automation_identity', 403));
     }
@@ -312,15 +317,22 @@ test('account authorization outages remain retryable while explicit inactive or 
       (async () => new Response('{')) as typeof fetch,
       (async () => Response.json(null)) as typeof fetch,
       (async () => Response.json({ success: true, data: {} })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 1.5 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: '1' } })) as typeof fetch,
     ]) {
       await assert.rejects(accessFor(fetcher).validateDelegation(owner), hasCode('identity_unavailable', 503));
     }
     await assert.rejects(accessFor(fetch, undefined).validateDelegation(owner), hasCode('identity_unavailable', 503));
     assert.equal(await accessFor((async () => Response.json({
-      success: true, data: { active: false, credentialVersion: 1 },
+      success: true, data: { active: false, credentialVersion: 1, consentVersion: 1 },
     })) as typeof fetch).validateDelegation(owner), false);
     assert.equal(await accessFor((async () => Response.json({
-      success: true, data: { active: true, credentialVersion: 2 },
+      success: true, data: { active: true, credentialVersion: 2, consentVersion: 1 },
+    })) as typeof fetch).validateDelegation(owner), false);
+    assert.equal(await accessFor((async () => Response.json({
+      success: true, data: { active: true, credentialVersion: 1, consentVersion: 2 },
     })) as typeof fetch).validateDelegation(owner), false);
   } finally {
     await store.close();
@@ -545,6 +557,7 @@ test('bootstrap passes the configured owner and level ceilings into access decis
       applicationId: 'kiancode',
       audience: 'kiancode',
       credentialVersion: 1,
+      consentVersion: 1,
     } } });
   }) as typeof fetch);
   let server: Awaited<ReturnType<typeof bootstrap>> | undefined;
@@ -600,6 +613,7 @@ test('Account principal ids use the canonical issuer origin and isolate grants b
       applicationId: 'kiancode',
       audience: 'kiancode',
       credentialVersion: 1,
+      consentVersion: 1,
     } },
   })) as typeof fetch, 'kiancode')('Bearer credential');
 

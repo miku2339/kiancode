@@ -29,6 +29,7 @@ function ownerIdentity(expiresAt: string): Principal {
     applicationId: 'kiancode',
     audience: 'kiancode',
     credentialVersion: 7,
+    consentVersion: 3,
     expiresAt,
   };
 }
@@ -57,13 +58,15 @@ test('controlled Account fixture resumes an admitted act workspace task after se
       subject: string;
       applicationId: string;
       credentialVersion: number;
+      consentVersion: number;
     };
     assert.deepEqual(body, {
       subject: ownerSubject,
       applicationId: 'kiancode',
       credentialVersion: 7,
+      consentVersion: 3,
     });
-    return Response.json({ success: true, data: { active: true, credentialVersion: 7 } });
+    return Response.json({ success: true, data: { active: true, credentialVersion: 7, consentVersion: 3 } });
   }) as typeof fetch;
   const access = new AccessService(
     store,
@@ -122,6 +125,7 @@ test('controlled Account fixture resumes an admitted act workspace task after se
           applicationId: 'kiancode',
           audience: 'kiancode',
           credentialVersion: 7,
+          consentVersion: 3,
           scopes: ['*'],
           rootTaskId: 'fake',
         },
@@ -140,6 +144,8 @@ test('controlled Account fixture resumes an admitted act workspace task after se
     await server.tasks.drain();
     const waiting = await store.get<Task>('task', taskId, identity.id);
     assert.equal(waiting?.data.state, 'waiting_for_device', waiting?.data.error);
+    assert.equal(waiting?.data.principal.consentVersion, 3);
+    assert.equal(waiting?.data.accountTaskGrant?.consentVersion, 3);
     await server.tasks.close();
 
     audit.length = 0;
@@ -209,6 +215,7 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
   let accountActive = true;
   let accountApplicationActive = true;
   let accountCredentialVersion = 7;
+  let accountConsentVersion = 3;
   let authorizationChecks = 0;
   let executions = 0;
   const accountAuthorization = (async (_input: string | URL | Request, init?: RequestInit) => {
@@ -216,12 +223,14 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
     const body = JSON.parse(String(init?.body)) as {
       applicationId: string;
       credentialVersion: number;
+      consentVersion: number;
     };
     return Response.json({
       success: true,
       data: {
         active: accountActive && accountApplicationActive && body.applicationId === 'kiancode',
         credentialVersion: accountCredentialVersion,
+        consentVersion: accountConsentVersion,
       },
     });
   }) as typeof fetch;
@@ -258,6 +267,7 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
       applicationId: 'kiancode',
       audience: 'kiancode',
       credentialVersion: 7,
+      consentVersion: 3,
       expiresAt: new Date(Date.now() + 900_000).toISOString(),
     });
     const conversation = await store.create('conversation', id, {
@@ -322,6 +332,29 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
     const credentialRotatedChecks = authorizationChecks;
     await restoreWaiting();
     accountCredentialVersion = 7;
+    accountConsentVersion = 4;
+    authorizationChecks = 0;
+    const consentRegranted = await runExpired();
+    const consentRegrantedChecks = authorizationChecks;
+    const regrantControl = new TaskService(store, runner, {
+      now: () => resumedAt,
+      durableGrants: true,
+      reauthorize,
+    });
+    try {
+      await assert.rejects(
+        regrantControl.control(id, queued.id, 'resume', [], {
+          ...admitted,
+          consentVersion: 4,
+          expiresAt: new Date(resumedAt + 900_000).toISOString(),
+        }),
+        (error: unknown) => error instanceof DomainError && error.code === 'grant_revoked',
+      );
+    } finally {
+      await regrantControl.close();
+    }
+    await restoreWaiting();
+    accountConsentVersion = 3;
     authorizationChecks = 0;
     accountApplicationActive = false;
     const applicationRevoked = await runExpired();
@@ -343,30 +376,46 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
     authorizationChecks = 0;
     const descriptorTampered = await runExpired();
     const descriptorTamperedChecks = authorizationChecks;
+    await restoreWaiting((task) => {
+      const { consentVersion: _principalConsentVersion, ...principal } = task.principal;
+      const { consentVersion: _grantConsentVersion, ...accountTaskGrant } = task.accountTaskGrant!;
+      return { ...task, principal, accountTaskGrant } as Task;
+    });
+    authorizationChecks = 0;
+    const legacyWithoutConsent = await runExpired();
+    const legacyWithoutConsentChecks = authorizationChecks;
 
     assert.deepEqual({
       globallyRevoked: globallyRevoked.data.state,
       credentialRotated: credentialRotated.data.state,
+      consentRegranted: consentRegranted.data.state,
       applicationRevoked: applicationRevoked.data.state,
       scopeReduced: scopeReduced.data.state,
       descriptorTampered: descriptorTampered.data.state,
+      legacyWithoutConsent: legacyWithoutConsent.data.state,
       globallyRevokedChecks,
       credentialRotatedChecks,
+      consentRegrantedChecks,
       applicationRevokedChecks,
       scopeReducedChecks,
       descriptorTamperedChecks,
+      legacyWithoutConsentChecks,
       executions,
     }, {
       globallyRevoked: 'paused',
       credentialRotated: 'paused',
+      consentRegranted: 'paused',
       applicationRevoked: 'paused',
       scopeReduced: 'paused',
       descriptorTampered: 'paused',
+      legacyWithoutConsent: 'paused',
       globallyRevokedChecks: 1,
       credentialRotatedChecks: 1,
+      consentRegrantedChecks: 1,
       applicationRevokedChecks: 1,
       scopeReducedChecks: 0,
       descriptorTamperedChecks: 0,
+      legacyWithoutConsentChecks: 0,
       executions: 1,
     });
 
@@ -392,9 +441,11 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
     const plan = await coordinator.prepare(id, queued.id, childRequest);
     const [child] = await coordinator.runChildren(id, plan.id);
     assert.equal(child?.data.accountTaskGrant?.rootTaskId, queued.id);
+    assert.equal(child?.data.accountTaskGrant?.consentVersion, 3);
     assert.deepEqual(child?.data.accountTaskGrant?.scopes, ['workspace:read']);
     assert.equal(child?.data.accountTaskGrant?.delegationExpiresAt, childExpiry);
     assert.deepEqual(child?.data.principal.scopes, ['workspace:read']);
+    assert.equal(child?.data.principal.consentVersion, 3);
     assert.equal(child?.data.principal.expiresAt, undefined);
 
     let cappedNow = Date.parse(childExpiry) - 1;
@@ -429,6 +480,7 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
     });
     const [nestedChild] = await coordinator.runChildren(id, nestedPlan.id);
     assert.equal(nestedChild?.data.accountTaskGrant?.rootTaskId, queued.id);
+    assert.equal(nestedChild?.data.accountTaskGrant?.consentVersion, 3);
     assert.equal(nestedChild?.data.accountTaskGrant?.delegationExpiresAt, childExpiry);
     const expiredNestedService = new TaskService(store, async () => {
       cappedRuns += 1;
@@ -475,7 +527,7 @@ test('an expired bare Account principal remains invalid without a server-issued 
     issuer,
     (async () => {
       authorizationChecks += 1;
-      return Response.json({ success: true, data: { active: true, credentialVersion: 7 } });
+      return Response.json({ success: true, data: { active: true, credentialVersion: 7, consentVersion: 3 } });
     }) as typeof fetch,
     {},
     { expectedIssuer: issuer, expectedAudience: 'kiancode' },

@@ -26,6 +26,8 @@ export function isAccountIdentity(
     && principal.audience
     && Number.isInteger(principal.credentialVersion)
     && principal.credentialVersion! >= 0
+    && Number.isInteger(principal.consentVersion)
+    && principal.consentVersion! > 0
     && (!binding || (issuer === binding.expectedIssuer && principal.audience === binding.expectedAudience)));
 }
 
@@ -44,6 +46,7 @@ export function bindAccountTaskGrant(
     applicationId: admission.applicationId,
     audience: admission.audience,
     credentialVersion: admission.credentialVersion,
+    consentVersion: admission.consentVersion,
     scopes,
     rootTaskId,
   };
@@ -111,7 +114,8 @@ function matchesIdentity(grant: AccountTaskGrant | AccountTaskGrantAdmission, pr
     && grant.subject === principal.subject
     && grant.applicationId === principal.applicationId
     && grant.audience === principal.audience
-    && grant.credentialVersion === principal.credentialVersion;
+    && grant.credentialVersion === principal.credentialVersion
+    && grant.consentVersion === principal.consentVersion;
 }
 
 function normalizedScopes(scopes: readonly string[]): string[] {

@@ -7,6 +7,7 @@ export interface Principal {
   applicationId?: string;
   audience?: string;
   credentialVersion?: number;
+  consentVersion?: number;
   expiresAt?: string;
 }
 

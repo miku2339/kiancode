@@ -35,6 +35,7 @@ const actor = (expiresAt?: string): Principal => ({
   applicationId: 'kiancode-plus',
   audience: 'kiancode',
   credentialVersion: 3,
+  consentVersion: 1,
   ...(expiresAt ? { expiresAt } : {}),
 });
 
@@ -81,7 +82,7 @@ test('dispatcher creates a durable marker only after current account authorizati
   const store = new SqliteStore();
   let active = false;
   const access = new AccessService(store, ownerSubject, 'service-token', 'account', undefined, (async () => Response.json({
-    success: true, data: { active, credentialVersion: 3 },
+    success: true, data: { active, credentialVersion: 3, consentVersion: 1 },
   })) as typeof fetch, {}, { expectedIssuer: issuer, expectedAudience: 'kiancode' });
   const reauthorize = async (principal: Principal): Promise<Principal> => {
     if (!await access.validateDelegation(principal)) throw new DomainError('grant_revoked', 'revoked', 403);
@@ -483,7 +484,7 @@ test('Account 401 dispatch outage retries without stamping or disabling its sche
   let clock = now;
   let available = false;
   const access = new AccessService(store, ownerSubject, 'service-token', 'account', undefined, (async () => available
-    ? Response.json({ success: true, data: { active: true, credentialVersion: 3 } })
+    ? Response.json({ success: true, data: { active: true, credentialVersion: 3, consentVersion: 1 } })
     : new Response(null, { status: 401 })) as typeof fetch, {}, {
     expectedIssuer: issuer, expectedAudience: 'kiancode',
   });

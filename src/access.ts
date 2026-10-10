@@ -71,6 +71,7 @@ export class AccessService {
       applicationId: identity.applicationId!,
       audience: identity.audience!,
       credentialVersion: identity.credentialVersion!,
+      consentVersion: identity.consentVersion!,
       scopes: [...identity.scopes],
     };
   }
@@ -120,7 +121,7 @@ export class AccessService {
     try {
       response = await this.fetcher(new URL('/api/internal/authorization/check/', this.accountApiOrigin ?? principal.issuer), {
         method: 'POST', headers: { authorization: `Bearer ${this.serviceToken}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ subject: principal.subject, applicationId: principal.applicationId, credentialVersion: principal.credentialVersion }), redirect: 'error', signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({ subject: principal.subject, applicationId: principal.applicationId, credentialVersion: principal.credentialVersion, consentVersion: principal.consentVersion }), redirect: 'error', signal: AbortSignal.timeout(5000),
       });
     } catch {
       throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
@@ -135,12 +136,15 @@ export class AccessService {
     if (!parsed || typeof parsed !== 'object') {
       throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
     }
-    const result = parsed as { success?: boolean; data?: { active?: boolean; credentialVersion?: number } };
+    const result = parsed as { success?: boolean; data?: { active?: boolean; credentialVersion?: number; consentVersion?: number } };
     if (result.success !== true || typeof result.data?.active !== 'boolean'
-      || !Number.isInteger(result.data.credentialVersion)) {
+      || !Number.isInteger(result.data.credentialVersion) || result.data.credentialVersion! < 0
+      || !Number.isInteger(result.data.consentVersion) || result.data.consentVersion! <= 0) {
       throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
     }
-    return result.success === true && result.data?.active === true && result.data.credentialVersion === principal.credentialVersion;
+    return result.data.active === true
+      && result.data.credentialVersion === principal.credentialVersion
+      && result.data.consentVersion === principal.consentVersion;
   }
 
   private validateAccountAutomationIdentity(principal: Principal): void {

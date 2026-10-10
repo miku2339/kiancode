@@ -29,10 +29,11 @@ test('PostgreSQL: durable automation survives session expiry and restart, retrie
   let active = true;
   let revokeDuringRun = false;
   let credentialVersion = 3;
+  let consentVersion = 1;
   let runs = 0;
   const actor = (): Principal => ({
     id: ownerId, issuer, subject, level: 1, scopes: ['*'],
-    applicationId: 'standalone', audience: 'kiancode', credentialVersion,
+    applicationId: 'standalone', audience: 'kiancode', credentialVersion, consentVersion,
     expiresAt: new Date(clock + 2_000).toISOString(),
   });
   const open = async (): Promise<PostgresStore> => {
@@ -41,7 +42,7 @@ test('PostgreSQL: durable automation survives session expiry and restart, retrie
     store = await PostgresStore.connect(databaseUrl, { schema });
     const access = new AccessService(store, subject, 'synthetic-service-token', 'account', undefined,
       (async () => unavailable ? new Response('', { status: 503 }) : Response.json({
-        success: true, data: { active, credentialVersion },
+        success: true, data: { active, credentialVersion, consentVersion },
       })) as typeof fetch, {}, { expectedIssuer: issuer, expectedAudience: 'kiancode' });
     const reauthorize = async (principal: Principal): Promise<Principal> => {
       if (!await access.validateDelegation(principal)) throw new DomainError('grant_revoked', 'Revoked', 403);
@@ -67,7 +68,7 @@ test('PostgreSQL: durable automation survives session expiry and restart, retrie
     });
     const scheduler = (): SchedulerService => {
       const access = new AccessService(currentStore, subject, 'synthetic-service-token', 'account', undefined,
-        (async () => Response.json({ success: true, data: { active, credentialVersion } })) as typeof fetch,
+        (async () => Response.json({ success: true, data: { active, credentialVersion, consentVersion } })) as typeof fetch,
         {}, { expectedIssuer: issuer, expectedAudience: 'kiancode' });
       return new SchedulerService(currentStore, new AutomationDispatcher(currentStore, tasks!, () => clock), {
         enabled: true, unattended: 'durable', now: () => clock,
@@ -91,8 +92,10 @@ test('PostgreSQL: durable automation survives session expiry and restart, retrie
     assert.equal(queued.data.authorizationKind, 'account_automation');
     assert.deepEqual(queued.data.automationSource, { type: 'schedule', id: first.id, version: 1 });
     assert.equal(queued.data.principal.expiresAt, undefined);
+    assert.equal(queued.data.principal.consentVersion, 1);
 
     currentStore = await open();
+    assert.equal((await currentStore.get<Task>('task', queued.id, ownerId))?.data.principal.consentVersion, 1);
     clock += 3_600_001;
     unavailable = true;
     await tasks!.drain();
