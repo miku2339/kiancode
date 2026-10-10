@@ -143,9 +143,10 @@ export class AccessService {
       throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
     }
     if (!result.data.active) return false;
-    return result.data.credentialVersion! > 0
-      && result.data.consentVersion! > 0
-      && result.data.credentialVersion === principal.credentialVersion
+    if (result.data.credentialVersion! <= 0 || result.data.consentVersion! <= 0) {
+      throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
+    }
+    return result.data.credentialVersion === principal.credentialVersion
       && result.data.consentVersion === principal.consentVersion;
   }
 
