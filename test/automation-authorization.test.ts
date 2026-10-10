@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AccessService } from '../src/access.js';
+import { AgentCoordinator } from '../src/agents/coordinator.js';
 import { markAutomationAuthorizationFailed } from '../src/automation-authorization.js';
 import { DomainError, type Principal } from '../src/contracts.js';
 import type { Conversation, Notification, Task } from '../src/domain.js';
@@ -323,6 +324,31 @@ test('durable renewal requires a complete automation marker and transient identi
   }
 });
 
+test('automation execution rejects a reauthorized principal from a newer consent epoch', async () => {
+  const store = new SqliteStore();
+  let runs = 0;
+  const tasks = new TaskService(store, async () => { runs += 1; return { text: 'must not run' }; }, {
+    now: () => now,
+    durableGrants: true,
+    reauthorize: async (principal) => ({ ...principal, consentVersion: 2 }),
+  });
+  try {
+    const source = await store.create<Conversation>('conversation', ownerId, conversation);
+    const task = await tasks.enqueue(actor(), source.id, 'Old consent epoch', undefined, [], [], undefined, undefined, {
+      authorizationKind: 'account_automation',
+      automationSource: { type: 'schedule', id: 'schedule-old-consent', version: 1 },
+    });
+    await tasks.drain();
+    const paused = (await store.get<Task>('task', task.id, ownerId))!;
+    assert.equal(paused.data.state, 'paused');
+    assert.equal(paused.data.principal.consentVersion, 1);
+    assert.equal(runs, 0);
+  } finally {
+    await tasks.close();
+    await store.close();
+  }
+});
+
 test('a permanent task denial stamps its exact source before preserving an unknown outcome', async () => {
   const store = new SqliteStore();
   const failedAt = new Date(now).toISOString();
@@ -541,11 +567,98 @@ test('resuming a marked automation task preserves its durability and scope ceili
       automationSource: { type: 'event_trigger', id: 'trigger-1', version: 1 },
     });
     await tasks.control(ownerId, task.id, 'pause');
-    const resumed = await tasks.control(ownerId, task.id, 'resume', [], actor(new Date(now + 60_000).toISOString()));
+    const currentActor = actor(new Date(now + 60_000).toISOString());
+    for (const changed of [
+      { ...currentActor, credentialVersion: 4 },
+      { ...currentActor, consentVersion: 2 },
+      { ...currentActor, applicationId: 'different-client' },
+      { ...currentActor, audience: 'different-audience' },
+      { ...currentActor, issuer: 'https://different-identity.example.test' },
+      { ...currentActor, subject: `acct_${'b'.repeat(32)}` },
+    ]) {
+      await assert.rejects(tasks.control(ownerId, task.id, 'resume', [], changed), hasCode('grant_revoked'));
+      assert.equal((await store.get<Task>('task', task.id, ownerId))?.data.principal.consentVersion, 1);
+    }
+    const resumed = await tasks.control(ownerId, task.id, 'resume', [], currentActor);
     assert.equal('expiresAt' in resumed.data.principal, false);
     assert.deepEqual(resumed.data.principal.scopes, ['model:read']);
+    assert.equal(resumed.data.principal.credentialVersion, 3);
+    assert.equal(resumed.data.principal.consentVersion, 1);
     assert.equal(resumed.data.authorizationKind, 'account_automation');
     assert.deepEqual(resumed.data.automationSource, { type: 'event_trigger', id: 'trigger-1', version: 1 });
+
+    const coordinator = new AgentCoordinator(
+      store,
+      (id, childId, action, principal) => tasks.control(id, childId, action, [], principal),
+    );
+    const plan = await coordinator.prepare(ownerId, task.id, {
+      key: 'automation-child-version',
+      children: [{ key: 'child', prompt: 'Continue' }],
+      budget: { maxCalls: 3, maxTokens: 1_000 },
+    });
+    const [child] = await coordinator.runChildren(ownerId, plan.id);
+    const nestedPlan = await coordinator.prepare(ownerId, child!.id, {
+      key: 'automation-nested-version',
+      children: [{ key: 'nested', prompt: 'Continue nested' }],
+    });
+    const [nested] = await coordinator.runChildren(ownerId, nestedPlan.id);
+    await coordinator.propagateControl(ownerId, task.id, 'pause');
+    await assert.rejects(
+      coordinator.propagateControl(ownerId, task.id, 'resume', { ...currentActor, consentVersion: 2 }),
+      hasCode('grant_revoked'),
+    );
+    await assert.rejects(
+      tasks.control(ownerId, nested!.id, 'resume', [], { ...currentActor, consentVersion: 2 }),
+      hasCode('grant_revoked'),
+    );
+    assert.equal((await store.get<Task>('task', child!.id, ownerId))?.data.principal.consentVersion, 1);
+    assert.equal((await store.get<Task>('task', nested!.id, ownerId))?.data.principal.consentVersion, 1);
+  } finally {
+    await tasks.close();
+    await store.close();
+  }
+});
+
+test('marked automation reconciliation and legacy resume cannot replace the stored authorization epoch', async () => {
+  const store = new SqliteStore();
+  const durable = { ...actor(), scopes: ['approval:write'] };
+  const tasks = new TaskService(store, async () => ({ text: 'unused' }), {
+    now: () => now,
+    durableGrants: true,
+    reauthorize: async (principal) => principal,
+  });
+  try {
+    const source = await store.create<Conversation>('conversation', ownerId, conversation);
+    const authorization = {
+      authorizationKind: 'account_automation' as const,
+      automationSource: { type: 'schedule' as const, id: 'schedule-version', version: 1 },
+    };
+    const unknown = await tasks.enqueue(durable, source.id, 'Reconcile', undefined, [], [], undefined, undefined, authorization);
+    await store.put<Task>('task', unknown.id, ownerId, {
+      ...unknown.data,
+      state: 'unknown',
+      error: 'Outcome unknown',
+    }, unknown.revision);
+    await assert.rejects(
+      tasks.reconcileOutcome({ ...actor(), consentVersion: 2 }, unknown.id, { resolution: 'abandon' }),
+      hasCode('grant_revoked'),
+    );
+    const unchanged = (await store.get<Task>('task', unknown.id, ownerId))!;
+    assert.equal(unchanged.data.state, 'unknown');
+    assert.equal(unchanged.data.reconciliation, undefined);
+    assert.equal(unchanged.data.principal.consentVersion, 1);
+
+    const { consentVersion: _consentVersion, ...legacyPrincipal } = durable;
+    const legacy = await tasks.enqueue(legacyPrincipal, source.id, 'Legacy', undefined, [], [], undefined, undefined, {
+      ...authorization,
+      automationSource: { ...authorization.automationSource, id: 'legacy-version' },
+    });
+    await tasks.control(ownerId, legacy.id, 'pause');
+    await assert.rejects(
+      tasks.control(ownerId, legacy.id, 'resume', [], actor(new Date(now + 60_000).toISOString())),
+      hasCode('grant_revoked'),
+    );
+    assert.equal((await store.get<Task>('task', legacy.id, ownerId))?.data.principal.consentVersion, undefined);
   } finally {
     await tasks.close();
     await store.close();

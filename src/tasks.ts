@@ -3,6 +3,7 @@ import {
   accountTaskGrantIdentityMatches,
   accountTaskGrantMatches,
   bindAccountTaskGrant,
+  isAccountIdentity,
   repairableAccountTaskGrant,
   type AccountTaskGrantAdmission,
 } from './account-task-grant.js';
@@ -1794,6 +1795,9 @@ function resumedPrincipal(
     return durable;
   }
   if (durableGrants && isDurableAutomationTask(task)) {
+    if (!accountAutomationIdentityMatches(task.principal, actor)) {
+      throw new DomainError('grant_revoked', 'Account automation authorization has changed', 403);
+    }
     const { expiresAt: _expiresAt, ...durable } = revalidatedPrincipal(task.principal, actor, task.principal.id);
     return durable;
   }
@@ -1802,12 +1806,28 @@ function resumedPrincipal(
 }
 
 function revalidatedTaskPrincipal(task: Entity<Task>, current: Principal): Principal {
+  if (isDurableAutomationTask(task.data)
+    && !accountAutomationIdentityMatches(task.data.principal, current)) {
+    throw new DomainError('grant_revoked', 'Account automation authorization has changed', 403);
+  }
   const principal = revalidatedPrincipal(task.data.principal, current, task.ownerId);
   if (task.data.accountTaskGrant
     && !accountTaskGrantMatches(task.data.accountTaskGrant, principal, taskRootId(task.data, task.id))) {
     throw new DomainError('invalid_account_task_grant', 'Account task authorization context is invalid', 403);
   }
   return principal;
+}
+
+function accountAutomationIdentityMatches(granted: Principal, current: Principal): boolean {
+  return isAccountIdentity(granted)
+    && isAccountIdentity(current)
+    && granted.id === current.id
+    && granted.issuer === current.issuer
+    && granted.subject === current.subject
+    && granted.applicationId === current.applicationId
+    && granted.audience === current.audience
+    && granted.credentialVersion === current.credentialVersion
+    && granted.consentVersion === current.consentVersion;
 }
 
 function isDurableAccountTask(task: Pick<Entity<Task>, 'id' | 'data'>): boolean {
