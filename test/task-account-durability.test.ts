@@ -322,10 +322,15 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
 
     authorizationChecks = 0;
     accountActive = false;
-    const globallyRevoked = await runExpired();
-    const globallyRevokedChecks = authorizationChecks;
+    accountCredentialVersion = 0;
+    accountConsentVersion = 0;
+    const unknownOrDeleted = await runExpired();
+    const unknownOrDeletedAgain = await runExpired();
+    const unknownOrDeletedChecks = authorizationChecks;
     await restoreWaiting();
     accountActive = true;
+    accountCredentialVersion = 7;
+    accountConsentVersion = 3;
     authorizationChecks = 0;
     accountCredentialVersion = 8;
     const credentialRotated = await runExpired();
@@ -386,14 +391,15 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
     const legacyWithoutConsentChecks = authorizationChecks;
 
     assert.deepEqual({
-      globallyRevoked: globallyRevoked.data.state,
+      unknownOrDeleted: unknownOrDeleted.data.state,
+      unknownOrDeletedAgain: unknownOrDeletedAgain.data.state,
       credentialRotated: credentialRotated.data.state,
       consentRegranted: consentRegranted.data.state,
       applicationRevoked: applicationRevoked.data.state,
       scopeReduced: scopeReduced.data.state,
       descriptorTampered: descriptorTampered.data.state,
       legacyWithoutConsent: legacyWithoutConsent.data.state,
-      globallyRevokedChecks,
+      unknownOrDeletedChecks,
       credentialRotatedChecks,
       consentRegrantedChecks,
       applicationRevokedChecks,
@@ -402,14 +408,15 @@ test('controlled Account task grant stops before dispatch on Account, Core scope
       legacyWithoutConsentChecks,
       executions,
     }, {
-      globallyRevoked: 'paused',
+      unknownOrDeleted: 'paused',
+      unknownOrDeletedAgain: 'paused',
       credentialRotated: 'paused',
       consentRegranted: 'paused',
       applicationRevoked: 'paused',
       scopeReduced: 'paused',
       descriptorTampered: 'paused',
       legacyWithoutConsent: 'paused',
-      globallyRevokedChecks: 1,
+      unknownOrDeletedChecks: 1,
       credentialRotatedChecks: 1,
       consentRegrantedChecks: 1,
       applicationRevokedChecks: 1,

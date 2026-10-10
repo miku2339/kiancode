@@ -318,15 +318,25 @@ test('account authorization outages remain retryable while explicit inactive or 
       (async () => Response.json(null)) as typeof fetch,
       (async () => Response.json({ success: true, data: {} })) as typeof fetch,
       (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1 } })) as typeof fetch,
-      (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 0 } })) as typeof fetch,
       (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 1.5 } })) as typeof fetch,
       (async () => Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: '1' } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: false, credentialVersion: -1, consentVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0, consentVersion: -1 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0.5, consentVersion: 0 } })) as typeof fetch,
+      (async () => Response.json({ success: true, data: { active: false, credentialVersion: 0, consentVersion: '0' } })) as typeof fetch,
     ]) {
       await assert.rejects(accessFor(fetcher).validateDelegation(owner), hasCode('identity_unavailable', 503));
     }
     await assert.rejects(accessFor(fetch, undefined).validateDelegation(owner), hasCode('identity_unavailable', 503));
     assert.equal(await accessFor((async () => Response.json({
+      success: true, data: { active: false, credentialVersion: 0, consentVersion: 0 },
+    })) as typeof fetch).validateDelegation(owner), false);
+    assert.equal(await accessFor((async () => Response.json({
       success: true, data: { active: false, credentialVersion: 1, consentVersion: 1 },
+    })) as typeof fetch).validateDelegation(owner), false);
+    assert.equal(await accessFor((async () => Response.json({
+      success: true, data: { active: true, credentialVersion: 0, consentVersion: 0 },
     })) as typeof fetch).validateDelegation(owner), false);
     assert.equal(await accessFor((async () => Response.json({
       success: true, data: { active: true, credentialVersion: 2, consentVersion: 1 },

@@ -138,11 +138,13 @@ export class AccessService {
     }
     const result = parsed as { success?: boolean; data?: { active?: boolean; credentialVersion?: number; consentVersion?: number } };
     if (result.success !== true || typeof result.data?.active !== 'boolean'
-      || !Number.isInteger(result.data.credentialVersion) || result.data.credentialVersion! < 0
-      || !Number.isInteger(result.data.consentVersion) || result.data.consentVersion! <= 0) {
+      || !Number.isSafeInteger(result.data.credentialVersion) || result.data.credentialVersion! < 0
+      || !Number.isSafeInteger(result.data.consentVersion) || result.data.consentVersion! < 0) {
       throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
     }
-    return result.data.active === true
+    if (!result.data.active) return false;
+    return result.data.credentialVersion! > 0
+      && result.data.consentVersion! > 0
       && result.data.credentialVersion === principal.credentialVersion
       && result.data.consentVersion === principal.consentVersion;
   }
