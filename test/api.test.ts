@@ -1,13 +1,58 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createServer } from '../src/http/server.js';
-import { developmentAuth } from '../src/auth.js';
+import { accountAuth, developmentAuth } from '../src/auth.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
 import type { Principal, ToolDefinition } from '../src/contracts.js';
 import type { Task } from '../src/domain.js';
 
 const token = 'test-owner-token-with-at-least-thirty-two-characters';
 const headers = { authorization: `Bearer ${token}` };
+
+test('security setup requirement crosses the public API without dispatching work', async () => {
+  const store = new SqliteStore();
+  let runs = 0;
+  let toolCalls = 0;
+  const authenticate = accountAuth('https://identity.example', (async () => Response.json({
+    success: false,
+    error: 'security_setup_required',
+    message: 'upstream detail',
+  }, { status: 403 })) as typeof fetch);
+  const server = await createServer({
+    store,
+    authenticate,
+    runner: async () => { runs += 1; return { text: 'unused' }; },
+    tools: [{
+      name: 'test.tool',
+      description: 'Unused test tool.',
+      inputSchema: { type: 'object' },
+      requiredCapabilities: [],
+      sideEffect: 'read',
+      execute: async () => { toolCalls += 1; return { content: '{}' }; },
+    }],
+  });
+  try {
+    const response = await server.app.inject({ method: 'GET', url: '/v1/session', headers });
+    assert.equal(response.statusCode, 403, response.body);
+    assert.deepEqual(response.json(), {
+      error: {
+        code: 'security_setup_required',
+        message: 'Complete account security setup before signing in',
+      },
+    });
+    const dispatch = await server.app.inject({
+      method: 'POST',
+      url: '/v1/conversations/test-id/messages',
+      headers,
+      payload: { content: 'Do not dispatch' },
+    });
+    assert.equal(dispatch.statusCode, 403, dispatch.body);
+    assert.equal(dispatch.json().error.code, 'security_setup_required');
+    assert.equal((await store.scan<Task>('task')).length, 0);
+    assert.equal(runs, 0);
+    assert.equal(toolCalls, 0);
+  } finally { await server.close(); }
+});
 
 test('authenticated chat creates a durable task and returns stored history', async () => {
   const store = new SqliteStore();

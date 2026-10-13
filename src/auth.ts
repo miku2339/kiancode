@@ -40,7 +40,13 @@ export function accountAuth(
     try {
       response = await fetcher(new URL('/api/mobile-auth/session/', accountApiOrigin), { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5000), redirect: 'error' });
     } catch { throw new DomainError('identity_unavailable', 'Account service is unavailable', 503); }
-    if (!response.ok) throw new DomainError(response.status === 401 ? 'unauthorized' : 'identity_unavailable', response.status === 401 ? 'Session expired or revoked' : 'Account service is unavailable', response.status === 401 ? 401 : 503);
+    if (!response.ok) {
+      if (response.status === 401) throw new DomainError('unauthorized', 'Session expired or revoked', 401);
+      if (await accountSecuritySetupRequired(response)) {
+        throw new DomainError('security_setup_required', 'Complete account security setup before signing in', 403);
+      }
+      throw new DomainError('identity_unavailable', 'Account service is unavailable', 503);
+    }
     const envelope = await response.json() as { success?: boolean; data?: { session?: { subject?: string; level?: number; scopes?: unknown; expiresAt?: string | number; applicationId?: string; audience?: string; credentialVersion?: number; consentVersion?: number; grantVersion?: number; authenticatedAt?: number } } };
     const session = envelope.data?.session;
     const expiresAt = accountSessionExpiry(session?.expiresAt);
@@ -56,6 +62,42 @@ export function accountAuth(
     if (expectedAudience && (session.audience !== expectedAudience || !session.applicationId || !Number.isInteger(session.credentialVersion))) throw new DomainError('invalid_audience', 'This session is not authorized for Kian', 403);
     return { id: createHash('sha256').update(`${canonicalIssuer}\0${session.subject}`).digest('hex'), issuer: canonicalIssuer, subject: session.subject, level: session.level as Principal['level'], scopes: session.scopes as string[], applicationId: session.applicationId, audience: session.audience, credentialVersion: session.credentialVersion, consentVersion: session.consentVersion, ...(session.grantVersion === undefined ? {} : { grantVersion: session.grantVersion }), ...(session.authenticatedAt === undefined ? {} : { authenticatedAt: session.authenticatedAt }), expiresAt };
   };
+}
+
+async function accountSecuritySetupRequired(response: Response): Promise<boolean> {
+  if (response.status !== 403 || !response.body) return false;
+  const limit = 16 * 1024;
+  const length = Number(response.headers.get('content-length'));
+  if (Number.isFinite(length) && length > limit) return false;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        return false;
+      }
+      chunks.push(value);
+    }
+    const body = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const parsed = JSON.parse(new TextDecoder().decode(body)) as unknown;
+    return typeof parsed === 'object' && parsed !== null
+      && (parsed as { success?: unknown }).success === false
+      && (parsed as { error?: unknown }).error === 'security_setup_required';
+  } catch {
+    return false;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 export function canonicalAccountIssuer(raw: string): string {

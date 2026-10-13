@@ -16,6 +16,36 @@ test('account authentication rejects expired/revoked credentials and never merge
   await assert.rejects(expired('Bearer credential'), /invalid session/);
 });
 
+test('account authentication preserves only the exact security setup response', async () => {
+  const authenticate = async (status: number, body: string) => accountAuth(
+    'https://identity.example',
+    (async () => new Response(body, { status })) as typeof fetch,
+  )('Bearer credential');
+
+  await assert.rejects(
+    authenticate(403, JSON.stringify({ success: false, error: 'security_setup_required', detail: 'upstream detail' })),
+    (error: unknown) => error instanceof DomainError
+      && error.code === 'security_setup_required'
+      && error.statusCode === 403
+      && !error.message.includes('upstream detail'),
+  );
+  for (const [status, body] of [
+    [403, JSON.stringify({ success: false, error: 'account_forbidden' })],
+    [400, JSON.stringify({ success: false, error: 'security_setup_required' })],
+    [500, JSON.stringify({ success: false, error: 'security_setup_required' })],
+    [403, JSON.stringify({ success: true, error: 'security_setup_required' })],
+    [403, '{invalid'],
+    [403, JSON.stringify({ success: false, error: 'security_setup_required', padding: 'x'.repeat(20_000) })],
+  ] as const) {
+    await assert.rejects(
+      authenticate(status, body),
+      (error: unknown) => error instanceof DomainError
+        && error.code === 'identity_unavailable'
+        && error.statusCode === 503,
+    );
+  }
+});
+
 test('account authentication accepts Account Unix seconds and ISO expiry while rejecting invalid or expired boundaries', async () => {
   const subject = `acct_${'d'.repeat(32)}`;
   const authenticate = async (expiresAt: unknown) => accountAuth(
