@@ -284,6 +284,229 @@ test('act mode rebuilds a failed check from checkpoint and completes after repai
   assert.equal(provider.calls.length, 4);
 });
 
+test('act mode clears a failed terminal action after the same operation passes with a different shell', async () => {
+  const taskId = 'terminal-shell-retry-task';
+  const command = 'sleep 12; cat result.txt';
+  const firstArguments = { command, shell: '/bin/zsh', cwd: 'workspace', timeoutMs: 15_000 };
+  const retryArguments = { ...firstArguments, shell: '/bin/bash' };
+  const provider = new ScriptedProvider([
+    {
+      message: {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'terminal-zsh', name: 'terminal.run', arguments: firstArguments }],
+      },
+      usage: { inputTokens: 2, outputTokens: 1 },
+    },
+    {
+      message: {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'terminal-bash', name: 'terminal.run', arguments: retryArguments }],
+      },
+      usage: { inputTokens: 2, outputTokens: 1 },
+    },
+    {
+      message: {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'read-1', name: 'workspace.read', arguments: { path: 'result.txt' } }],
+      },
+      usage: { inputTokens: 2, outputTokens: 1 },
+    },
+    {
+      message: { role: 'assistant', content: 'Operation verified.' },
+      usage: { inputTokens: 2, outputTokens: 1 },
+    },
+  ]);
+  const shells: unknown[] = [];
+  let reads = 0;
+  const runtime = new AgentRuntime({
+    providers: [provider],
+    models: [{ id: 'local-model', providerId: provider.id, locality: 'local', capabilities: ['tools'] }],
+    tools: [
+      {
+        name: 'terminal.run', description: 'Run a check', inputSchema: {}, requiredCapabilities: [], sideEffect: 'external',
+        async execute(input) {
+          shells.push(input.shell);
+          return input.shell === '/bin/zsh'
+            ? { content: JSON.stringify({
+                exitCode: 127,
+                signal: null,
+                stdout: '',
+                stderr: 'Shell executable is unavailable: /bin/zsh',
+                truncated: false,
+                timedOut: false,
+                aborted: false,
+                failureCode: 'shell_executable_missing',
+                commandStarted: false,
+                shell: '/bin/zsh',
+              }), isError: true }
+            : { content: JSON.stringify({ exitCode: 0, stderr: '' }) };
+        },
+      },
+      {
+        name: 'workspace.read', description: 'Read a file', inputSchema: {}, requiredCapabilities: [], sideEffect: 'read',
+        async execute() { reads += 1; return { content: 'result' }; },
+      },
+    ],
+  });
+
+  const failed = await runtime.run({
+    principal,
+    taskId,
+    prompt: 'Run and verify the operation',
+    mode: 'act',
+    strategy: 'single',
+    approvedActionHashes: new Set(),
+  });
+  const firstHash = failed.pendingActions?.[0]?.actionHash ?? '';
+  const retry = await runtime.run({
+    principal,
+    taskId,
+    messages: failed.messages,
+    mode: 'act',
+    strategy: 'single',
+    priorUsage: failed.usage,
+    approvedActionHashes: new Set([firstHash]),
+  });
+  const retryHash = retry.pendingActions?.[0]?.actionHash ?? '';
+  assert.equal(retry.status, 'waiting_for_approval');
+  assert.notEqual(retryHash, firstHash);
+
+  const completed = await runtime.run({
+    principal,
+    taskId,
+    messages: retry.messages,
+    mode: 'act',
+    strategy: 'single',
+    priorUsage: retry.usage,
+    approvedActionHashes: new Set([retryHash]),
+  });
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.content, 'Operation verified.');
+  assert.deepEqual(shells, ['/bin/zsh', '/bin/bash']);
+  assert.equal(reads, 1);
+});
+
+test('act mode keeps terminal failures unresolved for semantic failures or retries that change the operation', async () => {
+  const scenarios = [
+    {
+      label: 'semantic shell failure',
+      first: { command: 'cat *.txt', shell: '/bin/zsh', cwd: 'workspace' },
+      retry: { command: 'cat *.txt', shell: '/bin/bash', cwd: 'workspace' },
+      failedContent: {
+        exitCode: 1,
+        stdout: '',
+        stderr: 'zsh: no matches found: *.txt',
+        timedOut: false,
+        aborted: false,
+      },
+    },
+    {
+      label: 'command',
+      first: { command: 'cat result.txt', shell: '/bin/zsh', cwd: 'workspace' },
+      retry: { command: 'cat other.txt', shell: '/bin/bash', cwd: 'workspace' },
+      failedContent: {
+        exitCode: 127,
+        signal: null,
+        stdout: '',
+        stderr: 'Shell executable is unavailable: /bin/zsh',
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        failureCode: 'shell_executable_missing',
+        commandStarted: false,
+        shell: '/bin/zsh',
+      },
+    },
+    {
+      label: 'cwd',
+      first: { command: 'cat result.txt', shell: '/bin/zsh', cwd: 'workspace' },
+      retry: { command: 'cat result.txt', shell: '/bin/bash', cwd: 'other-workspace' },
+      failedContent: {
+        exitCode: 127,
+        signal: null,
+        stdout: '',
+        stderr: 'Shell executable is unavailable: /bin/zsh',
+        truncated: false,
+        timedOut: false,
+        aborted: false,
+        failureCode: 'shell_executable_missing',
+        commandStarted: false,
+        shell: '/bin/zsh',
+      },
+    },
+  ];
+  for (const scenario of scenarios) {
+    const taskId = `terminal-${scenario.label}-retry-task`;
+    const provider = new ScriptedProvider([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'terminal-first', name: 'terminal.run', arguments: scenario.first }],
+        },
+        usage: { inputTokens: 2, outputTokens: 1 },
+      },
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'terminal-retry', name: 'terminal.run', arguments: scenario.retry }],
+        },
+        usage: { inputTokens: 2, outputTokens: 1 },
+      },
+      {
+        message: { role: 'assistant', content: 'Operation verified.' },
+        usage: { inputTokens: 2, outputTokens: 1 },
+      },
+    ]);
+    let executions = 0;
+    const runtime = new AgentRuntime({
+      providers: [provider],
+      models: [{ id: 'local-model', providerId: provider.id, locality: 'local', capabilities: ['tools'] }],
+      tools: [{
+        name: 'terminal.run', description: 'Run a check', inputSchema: {}, requiredCapabilities: [], sideEffect: 'external',
+        async execute() {
+          executions += 1;
+          return executions === 1
+            ? { content: JSON.stringify(scenario.failedContent), isError: true }
+            : { content: JSON.stringify({ exitCode: 0, stderr: '' }) };
+        },
+      }],
+    });
+
+    const failed = await runtime.run({
+      principal,
+      taskId,
+      prompt: 'Run and verify the operation',
+      mode: 'act',
+      strategy: 'single',
+      approvedActionHashes: new Set(),
+    });
+    const retry = await runtime.run({
+      principal,
+      taskId,
+      messages: failed.messages,
+      mode: 'act',
+      strategy: 'single',
+      priorUsage: failed.usage,
+      approvedActionHashes: new Set([failed.pendingActions?.[0]?.actionHash ?? '']),
+    });
+    await assert.rejects(runtime.run({
+      principal,
+      taskId,
+      messages: retry.messages,
+      mode: 'act',
+      strategy: 'single',
+      priorUsage: retry.usage,
+      approvedActionHashes: new Set([retry.pendingActions?.[0]?.actionHash ?? '']),
+    }), (error: unknown) => error instanceof DomainError && error.code === 'verification_failed', scenario.label);
+    assert.equal(executions, 2, scenario.label);
+  }
+});
+
 test('private auto policy never falls back to a cloud model', async () => {
   const cloud = new ScriptedProvider([{
     message: { role: 'assistant', content: 'cloud answer' },

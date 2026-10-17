@@ -220,6 +220,17 @@ function startProcess(executable: string, arguments_: string[], cwd: string, env
   }
 }
 
+async function executableIsMissing(executable: string): Promise<boolean> {
+  if (!path.isAbsolute(executable)) return false;
+  try {
+    await realpath(executable);
+    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR';
+  }
+}
+
 function stopProcess(pid: number | undefined): void {
   if (!pid) return;
   try {
@@ -273,6 +284,24 @@ export function createTerminalTool(options: TerminalToolOptions = {}): ToolDefin
         throw notDispatched('invalid_input', `timeoutMs must be from 1 to ${maxTimeoutMs}`);
       }
       const { root, cwd } = await resolveCwd(context, input.cwd);
+      const shellMissing = await executableIsMissing(shell);
+      if (shellMissing && !context.signal.aborted) {
+        return {
+          content: JSON.stringify({
+            exitCode: 127,
+            signal: null,
+            stdout: '',
+            stderr: `Shell executable is unavailable: ${shell}`,
+            truncated: false,
+            timedOut: false,
+            aborted: false,
+            failureCode: 'shell_executable_missing',
+            commandStarted: false,
+            shell,
+          }),
+          isError: true,
+        };
+      }
       const stdout: CapturedOutput = { text: '', bytes: 0, truncated: false };
       const stderr: CapturedOutput = { text: '', bytes: 0, truncated: false };
       const startedAt = Date.now();

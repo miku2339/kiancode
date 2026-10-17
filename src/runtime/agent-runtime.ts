@@ -479,11 +479,13 @@ export class AgentRuntime {
         toolOutcome: outcome,
       });
       if (input.mode === 'act' && tool && tool.sideEffect !== 'read') {
-        const key = actionFailureKey(toolCall);
         if (outcome === 'failed') {
+          const key = actionFailureKey(toolCall, content);
           unresolvedFailures.set(key, { tool: tool.name });
         } else if (outcome === 'confirmed') {
-          unresolvedFailures.delete(key);
+          unresolvedFailures.delete(actionFailureKey(toolCall));
+          const shellFailureKey = terminalShellFailureKey(toolCall);
+          if (shellFailureKey) unresolvedFailures.delete(shellFailureKey);
         }
       }
       await input.onEvent?.({
@@ -850,8 +852,43 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function actionFailureKey(toolCall: ToolCall): string {
+function terminalShellFailureKey(toolCall: ToolCall): string | undefined {
+  if (toolCall.name !== 'terminal.run' || typeof toolCall.arguments.shell !== 'string') return undefined;
+  const argumentsWithoutShell = Object.fromEntries(
+    Object.entries(toolCall.arguments).filter(([field]) => field !== 'shell'),
+  );
+  return `${toolCall.name}\0shell-executable-missing\0${stableJson(argumentsWithoutShell)}`;
+}
+
+function isMissingShellFailure(toolCall: ToolCall, content: string): boolean {
+  if (toolCall.name !== 'terminal.run' || typeof toolCall.arguments.shell !== 'string') return false;
+  let result: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    result = parsed as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  return result.failureCode === 'shell_executable_missing'
+    && result.commandStarted === false
+    && result.shell === toolCall.arguments.shell
+    && typeof result.exitCode === 'number'
+    && result.exitCode !== 0
+    && result.signal === null
+    && result.stdout === ''
+    && result.stderr === `Shell executable is unavailable: ${toolCall.arguments.shell}`
+    && result.truncated === false
+    && result.timedOut === false
+    && result.aborted === false;
+}
+
+function actionFailureKey(toolCall: ToolCall, content?: string): string {
   if (toolCall.name === 'terminal.run') {
+    const shellFailureKey = content && isMissingShellFailure(toolCall, content)
+      ? terminalShellFailureKey(toolCall)
+      : undefined;
+    if (shellFailureKey) return shellFailureKey;
     return `${toolCall.name}\0${stableJson(toolCall.arguments)}`;
   }
   for (const field of ['path', 'target', 'url', 'resourceId', 'id']) {
@@ -881,11 +918,13 @@ function unresolvedActionFailures(
     };
     const tool = tools.get(call.name);
     if (!tool || tool.sideEffect === 'read') continue;
-    const key = actionFailureKey(call);
     if (message.toolOutcome === 'failed') {
+      const key = actionFailureKey(call, message.content);
       failures.set(key, { tool: tool.name });
     } else if (message.toolOutcome === 'confirmed') {
-      failures.delete(key);
+      failures.delete(actionFailureKey(call));
+      const shellFailureKey = terminalShellFailureKey(call);
+      if (shellFailureKey) failures.delete(shellFailureKey);
     }
   }
   return failures;

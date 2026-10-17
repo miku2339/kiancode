@@ -233,11 +233,24 @@ test('terminal marks refusals before a process exists but returns failures after
       });
     }
     const missingShell = path.join(root, 'no-such-shell');
-    await assert.rejects(
-      createTerminalTool({ allowedShells: [missingShell], runtimeDirectory: path.join(root, '.runtime') })
-        .execute({ command: 'true', shell: missingShell }, context(root, signal)),
-      (error: unknown) => isNotDispatched(error) && error.code === 'terminal_spawn_failed',
-    );
+    const missing = await createTerminalTool({
+      allowedShells: [missingShell],
+      runtimeDirectory: path.join(root, '.runtime'),
+    }).execute({ command: `touch ${marker}`, shell: missingShell }, context(root, signal));
+    assert.equal(missing.isError, true);
+    assert.deepEqual(JSON.parse(missing.content), {
+      exitCode: 127,
+      signal: null,
+      stdout: '',
+      stderr: `Shell executable is unavailable: ${missingShell}`,
+      truncated: false,
+      timedOut: false,
+      aborted: false,
+      failureCode: 'shell_executable_missing',
+      commandStarted: false,
+      shell: missingShell,
+    });
+    await assert.rejects(access(marker));
     const failed = await tool.execute({ command: 'exit 3', shell: '/bin/sh' }, context(root, signal));
     assert.equal(failed.isError, true);
     assert.equal((JSON.parse(failed.content) as { exitCode: number }).exitCode, 3);
