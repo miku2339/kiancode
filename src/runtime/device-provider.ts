@@ -10,6 +10,8 @@ import type {
 } from './types.js';
 import type { EphemeralAttachmentPayload, EphemeralPayloadStore } from './visual-context.js';
 
+const LOCAL_INFERENCE_TIMEOUT_MS = 120_000;
+
 export interface DeviceModelDispatcher {
   executeModel(
     deviceId: string,
@@ -151,12 +153,14 @@ export function createLocalModelTool(options: LocalModelToolOptions): ToolDefini
       ? new OllamaProvider({
           id: `local-tool:${model.id}`,
           baseUrl: model.baseUrl,
+          timeoutMs: LOCAL_INFERENCE_TIMEOUT_MS,
           ...(options.fetch ? { fetch: options.fetch } : {}),
         })
       : new OpenAICompatibleProvider({
           id: `local-tool:${model.id}`,
           locality: 'local',
           baseUrl: model.baseUrl,
+          timeoutMs: LOCAL_INFERENCE_TIMEOUT_MS,
           ...(model.apiKey ? { apiKey: model.apiKey } : {}),
           ...(options.fetch ? { fetch: options.fetch } : {}),
         });

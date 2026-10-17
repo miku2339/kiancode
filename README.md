@@ -127,6 +127,8 @@ The store contract always covers SQLite. Set `KIANCODE_TEST_DATABASE_URL` to a d
 
 `npm run acceptance` is not part of `npm run check`. It requires the isolated PostgreSQL configuration in `KIANCODE_ACCEPTANCE_CONFIG`, an absolute Bubblewrap workspace in `KIANCODE_ACCEPTANCE_WORKSPACE`, and a configured real model. Set `KIANCODE_ACCEPTANCE_REPORT`, or pass `--report`, to an evidence path outside the workspace. The report is replaced atomically: it starts as `incomplete`, becomes `passed` only after every gate succeeds, and becomes `failed` with sanitized error text plus evidence verified before the failure. An `incomplete` report after exit means the process stopped before finalization.
 
+`npm run acceptance:local-device -- --report /absolute/path/report.json` exercises an isolated SQLite runtime, real device WebSocket transport, private read/write/read workflow, device waiting and controlled model limits. Use `--mode live --base-url http://127.0.0.1:8000/v1 --model YOUR_MODEL` for a real loopback model; limit checks remain controlled fixtures, and this does not replace deployed cross-client acceptance.
+
 ## License
 
 Apache-2.0. Dependencies retain their own licenses.

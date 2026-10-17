@@ -145,6 +145,48 @@ test('local model tool only uses allowlisted models and loopback providers', asy
   }), /loopback/);
 });
 
+test('local model tool gives both provider types a bounded timeout and preserves caller cancellation', async (context) => {
+  const timeouts: number[] = [];
+  context.mock.method(AbortSignal, 'timeout', (milliseconds: number) => {
+    timeouts.push(milliseconds);
+    return new AbortController().signal;
+  });
+
+  for (const type of ['openai', 'ollama'] as const) {
+    const controller = new AbortController();
+    const reason = new Error(`${type} caller stopped`);
+    let providerSignal: AbortSignal | null | undefined;
+    const fetchImpl: typeof fetch = async (_url, init) => new Promise<Response>((_resolve, reject) => {
+      providerSignal = init?.signal;
+      assert.ok(providerSignal);
+      providerSignal.addEventListener('abort', () => reject(providerSignal?.reason), { once: true });
+    });
+    const tool = createLocalModelTool({
+      fetch: fetchImpl,
+      models: [{
+        id: `${type}-model`,
+        type,
+        baseUrl: type === 'openai' ? 'http://127.0.0.1:8080/v1' : 'http://127.0.0.1:11434',
+        model: 'local-name',
+        capabilities: [],
+      }],
+    });
+    const pending = tool.execute({
+      operation: 'chat',
+      modelId: `${type}-model`,
+      messages: [{ role: 'user', content: 'hello' }],
+      tools: [],
+      requiredCapabilities: [],
+    }, { principal, taskId: `${type}-timeout`, signal: controller.signal });
+
+    controller.abort(reason);
+
+    await assert.rejects(pending, (error: unknown) => error === reason);
+    assert.equal(providerSignal?.aborted, true);
+  }
+  assert.deepEqual(timeouts, [120_000, 120_000]);
+});
+
 test('device model jobs persist only an opaque reference and hydrate visual data from bounded memory', async () => {
   const store = new SqliteStore();
   const visuals = new VisualContextStore();
