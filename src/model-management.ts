@@ -130,15 +130,20 @@ export class ModelManagement {
   async saveModel(actor: Principal, id: string, input: ModelSettings, revision: number) {
     this.manage(actor); identifier.parse(id);
     const data = modelSettingsSchema.parse(input);
+    const existing = await this.options.store.get<ModelRecord>('model_setting', storageId(actor.id, id), actor.id);
+    if ((existing?.revision ?? 0) !== revision) throw new DomainError('conflict', 'Model settings have changed', 409);
     const provider = await this.provider(actor.id, data.providerId);
     if ((provider.settings.type === 'device') !== Boolean(data.deviceId)) throw new DomainError('invalid_device_model', 'Device models require a device ID; network models cannot specify one');
-    if (data.deviceId) {
+    const sameDestination = Boolean(existing
+      && existing.data.providerId === data.providerId
+      && existing.data.model === data.model
+      && existing.data.deviceId === data.deviceId);
+    const disablingSameDestination = !data.enabled && sameDestination;
+    if (data.deviceId && !disablingSameDestination) {
       const device = await this.options.store.get<{ revokedAt?: string; capabilities: string[] }>('device', data.deviceId, actor.id);
       if (!device || device.data.revokedAt || !device.data.capabilities.includes('model:generate')) throw new DomainError('device_not_found', 'An authorized model device is required', 404);
     }
-    const existing = await this.options.store.get<ModelRecord>('model_setting', storageId(actor.id, id), actor.id);
-    if ((existing?.revision ?? 0) !== revision) throw new DomainError('conflict', 'Model settings have changed', 409);
-    const verified = existing?.data.verifiedProviderVersion === provider.version && existing.data.providerId === data.providerId && existing.data.model === data.model && existing.data.deviceId === data.deviceId;
+    const verified = sameDestination && existing?.data.verifiedProviderVersion === provider.version;
     if (data.enabled && !verified) throw new DomainError('model_probe_required', 'Verify model capabilities before enabling it', 409);
     const record: ModelRecord = { ...data, id, capabilities: verified ? existing!.data.capabilities : [],
       ...(verified ? { verifiedAt: existing!.data.verifiedAt, verifiedProviderVersion: provider.version } : {}) };

@@ -173,6 +173,94 @@ test('device model probes have bounded execution records and flow through author
   assert.equal((await store.scan('task')).length, 0);
 });
 
+test('revoked device models can be disabled without weakening device or ownership checks', async (t) => {
+  const { store, options } = setup();
+  const devices = new DeviceService(store);
+  const service = new ModelManagement({
+    ...options,
+    createProvider: ({ id }) => new DeviceModelProvider({ id, dispatcher: devices }),
+  });
+  const app = Fastify();
+  let actor = owner;
+  t.after(async () => { await app.close(); await store.close(); });
+  app.setErrorHandler((error, _request, response) => {
+    if (error instanceof DomainError) {
+      return response.code(error.statusCode).send({ error: { code: error.code } });
+    }
+    return response.code(500).send({ error: { code: 'internal_error' } });
+  });
+  registerModelManagementRoutes(app, service, () => actor);
+  const pairing = await devices.createPairing(owner, ['model:generate'], []);
+  const paired = await devices.pair({ code: pairing.code, name: 'Test Mac', capabilities: ['model:generate'] });
+  const device = await devices.authenticate(`Bearer ${paired.token}`, paired.deviceId);
+  const deviceModel = {
+    ...modelSettings,
+    providerId: 'device',
+    deviceId: paired.deviceId,
+  };
+  await service.saveProvider(owner, 'device', {
+    name: 'Mac', type: 'device', locality: 'local', enabled: true,
+  }, 0);
+  await service.saveModel(owner, 'local', deviceModel, 0);
+  const pending = service.probe(owner, 'local');
+  let jobs = (await devices.poll(device)).jobs;
+  for (let attempt = 0; jobs.length === 0 && attempt < 50; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    jobs = (await devices.poll(device)).jobs;
+  }
+  assert.equal(jobs.length, 1);
+  await devices.submit(device, jobs[0]!.id, {
+    status: 'confirmed', result: { content: JSON.stringify(reply('MODEL_READY')) },
+  });
+  await pending;
+  await service.saveModel(owner, 'local', { ...deviceModel, enabled: true }, 2);
+  await devices.control(owner.id, paired.deviceId, 'revoke');
+
+  actor = other;
+  const wrongOwner = await app.inject({ method: 'DELETE', url: '/v1/models/local?revision=3' });
+  assert.equal(wrongOwner.statusCode, 404);
+  assert.equal(wrongOwner.json().error.code, 'not_found');
+
+  actor = owner;
+  const disabled = await app.inject({ method: 'DELETE', url: '/v1/models/local?revision=3' });
+  assert.equal(disabled.statusCode, 204, disabled.body);
+  assert.equal((await service.models(owner.id))[0]?.enabled, false);
+
+  const stale = await app.inject({ method: 'DELETE', url: '/v1/models/local?revision=3' });
+  assert.equal(stale.statusCode, 409);
+  assert.equal(stale.json().error.code, 'conflict');
+  const reenabled = await app.inject({
+    method: 'PUT', url: '/v1/models/local',
+    payload: { revision: 4, settings: { ...deviceModel, enabled: true } },
+  });
+  assert.equal(reenabled.statusCode, 404);
+  assert.equal(reenabled.json().error.code, 'device_not_found');
+  const retargeted = await app.inject({
+    method: 'PUT', url: '/v1/models/local',
+    payload: { revision: 4, settings: { ...deviceModel, model: 'other-model' } },
+  });
+  assert.equal(retargeted.statusCode, 404);
+  assert.equal(retargeted.json().error.code, 'device_not_found');
+  const created = await app.inject({
+    method: 'PUT', url: '/v1/models/new-local',
+    payload: { revision: 0, settings: deviceModel },
+  });
+  assert.equal(created.statusCode, 404);
+  assert.equal(created.json().error.code, 'device_not_found');
+
+  actor = { ...owner, scopes: ['model:read'] };
+  const forbidden = await app.inject({ method: 'DELETE', url: '/v1/models/local?revision=4' });
+  assert.equal(forbidden.statusCode, 403);
+  assert.equal(forbidden.json().error.code, 'forbidden');
+
+  const revokedDevice = await store.get('device', paired.deviceId, owner.id);
+  assert.ok(revokedDevice);
+  await store.remove('device', paired.deviceId, owner.id, revokedDevice.revision);
+  actor = owner;
+  const removedDevice = await app.inject({ method: 'DELETE', url: '/v1/models/local?revision=4' });
+  assert.equal(removedDevice.statusCode, 204, removedDevice.body);
+});
+
 
 test('unreported or invalid provider usage retains a conservative reservation', async (t) => {
   let probe = true;
