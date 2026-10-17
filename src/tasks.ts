@@ -105,6 +105,7 @@ interface ActiveRun {
 
 interface EventSequence {
   next: number;
+  fixed?: Record<string, number>;
 }
 
 interface MessageSequence {
@@ -472,7 +473,7 @@ export class TaskService {
           'event_sequence',
           taskId,
           ownerId,
-          { next: sequence + 1 },
+          { ...cursor.data, next: sequence + 1 },
           cursor.revision,
         );
         return sequence;
@@ -485,6 +486,38 @@ export class TaskService {
     throw new DomainError('busy', 'Task event stream is busy; retry', 409);
   }
 
+  private async nextFixedEventSequence(ownerId: string, taskId: string, eventId: string): Promise<number> {
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      const cursor = await this.store.get<EventSequence>('event_sequence', taskId, ownerId);
+      const reserved = cursor?.data.fixed?.[eventId];
+      if (reserved !== undefined) return reserved;
+      const existing = (await this.store.scan<TaskEvent>('event', ownerId))
+        .filter((row) => row.data.taskId === taskId);
+      const sequence = Math.max(
+        cursor?.data.next ?? 1,
+        Math.max(0, ...existing.map((row) => row.data.sequence)) + 1,
+      );
+      try {
+        if (!cursor) {
+          await this.store.create<EventSequence>('event_sequence', ownerId, {
+            next: sequence + 1,
+            fixed: { [eventId]: sequence },
+          }, taskId);
+        } else {
+          await this.store.put<EventSequence>('event_sequence', taskId, ownerId, {
+            ...cursor.data,
+            next: sequence + 1,
+            fixed: { ...cursor.data.fixed, [eventId]: sequence },
+          }, cursor.revision);
+        }
+        return sequence;
+      } catch (error) {
+        if (!(error instanceof DomainError && error.code === 'conflict')) throw error;
+      }
+    }
+    throw new DomainError('busy', 'Task event stream is busy; retry', 409);
+  }
+
   private async change(ownerId: string, id: string, change: (task: Task) => Task): Promise<Entity<Task>> {
     for (let attempt = 0; attempt < 16; attempt += 1) {
       const row = await this.store.get<Task>('task', id, ownerId);
@@ -492,7 +525,9 @@ export class TaskService {
         throw new DomainError('not_found', 'Task not found', 404);
       }
       try {
-        return await this.store.put('task', id, ownerId, change(row.data), row.revision);
+        const updated = change(row.data);
+        if (updated === row.data) return row;
+        return await this.store.put('task', id, ownerId, updated, row.revision);
       } catch (error) {
         if (!(error instanceof DomainError && error.code === 'conflict')) {
           throw error;
@@ -820,7 +855,7 @@ export class TaskService {
     }
     const data: TaskEvent = {
       taskId: task.id,
-      sequence: await this.nextEventSequence(task.ownerId, task.id),
+      sequence: await this.nextFixedEventSequence(task.ownerId, task.id, id),
       type: payload.type,
       payload,
       at,

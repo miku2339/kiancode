@@ -54,6 +54,67 @@ class SlowEventStore implements Store {
   }
 }
 
+class TerminalEventRaceStore implements Store {
+  public terminalNoopPuts = 0;
+  public readonly failedEventStarted: Promise<void>;
+  public readonly terminalRead: Promise<void>;
+  private releaseFailedEventWrite?: () => void;
+  private markFailedEventStarted?: () => void;
+  private markTerminalRead?: () => void;
+  private blockFailedEvent = true;
+  private failedEventBlocked = false;
+
+  public constructor(private readonly delegate: Store) {
+    this.failedEventStarted = new Promise<void>((resolve) => { this.markFailedEventStarted = resolve; });
+    this.terminalRead = new Promise<void>((resolve) => { this.markTerminalRead = resolve; });
+  }
+
+  public releaseFailedEvent(): void {
+    this.blockFailedEvent = false;
+    this.releaseFailedEventWrite?.();
+  }
+
+  public async create<T>(kind: string, ownerId: string, data: T, id?: string): Promise<Entity<T>> {
+    if (kind === 'event' && (data as TaskEvent).type === 'failed'
+      && this.blockFailedEvent && !this.failedEventBlocked) {
+      this.failedEventBlocked = true;
+      this.markFailedEventStarted?.();
+      await new Promise<void>((resolve) => { this.releaseFailedEventWrite = resolve; });
+    }
+    return this.delegate.create(kind, ownerId, data, id);
+  }
+
+  public async get<T>(kind: string, id: string, ownerId: string): Promise<Entity<T> | undefined> {
+    const row = await this.delegate.get<T>(kind, id, ownerId);
+    if (kind === 'task' && (row?.data as Task | undefined)?.state === 'failed' && this.blockFailedEvent) {
+      this.markTerminalRead?.();
+    }
+    return row;
+  }
+
+  public scan<T>(kind: string, ownerId?: string): Promise<Array<Entity<T>>> {
+    return this.delegate.scan(kind, ownerId);
+  }
+
+  public async put<T>(kind: string, id: string, ownerId: string, data: T, revision: number): Promise<Entity<T>> {
+    if (kind === 'task') {
+      const current = await this.delegate.get<Task>(kind, id, ownerId);
+      if (current?.data.state === 'failed' && JSON.stringify(data) === JSON.stringify(current.data)) {
+        this.terminalNoopPuts += 1;
+      }
+    }
+    return this.delegate.put(kind, id, ownerId, data, revision);
+  }
+
+  public remove(kind: string, id: string, ownerId: string, revision: number): Promise<boolean> {
+    return this.delegate.remove(kind, id, ownerId, revision);
+  }
+
+  public close(): Promise<void> {
+    return this.delegate.close();
+  }
+}
+
 test('a durable task runs once for a repeated client request and records its result', async () => {
   const store = new SqliteStore();
   let calls = 0;
@@ -108,6 +169,76 @@ test('separate failed task revisions retain one terminal event for each attempt'
     ]);
     assert.equal(new Set(failedEvents.map((event) => (event.data.payload as { taskRevision?: number }).taskRevision)).size, 2);
   } finally { await service.close(); await store.close(); }
+});
+
+test('terminal heartbeat and event read keep one contiguous failed event without revision drift', async () => {
+  const store = new TerminalEventRaceStore(new SqliteStore());
+  const service = new TaskService(store, async () => {
+    throw new DomainError('provider_unavailable', 'Provider unavailable', 503);
+  }, { heartbeatMs: 1, leaseMs: 60_000 });
+  const reader = new TaskService(store, async () => ({ text: '' }));
+  let draining: Promise<void> | undefined;
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'fail while heartbeat runs');
+    draining = service.drain();
+    await store.failedEventStarted;
+    await store.terminalRead;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const failed = (await store.get<Task>('task', task.id, principal.id))!;
+    assert.equal(failed.data.state, 'failed');
+    assert.equal(store.terminalNoopPuts, 0);
+
+    const reading = reader.events(principal.id, task.id);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    store.releaseFailedEvent();
+    const [events] = await Promise.all([reading, draining]);
+
+    const final = (await store.get<Task>('task', task.id, principal.id))!;
+    assert.equal(final.revision, failed.revision);
+    assert.equal(store.terminalNoopPuts, 0);
+    assert.deepEqual(events.map((event) => event.data.sequence), [1, 2]);
+    assert.deepEqual(events.map((event) => event.data.type), ['queued', 'failed']);
+  } finally {
+    store.releaseFailedEvent();
+    await draining?.catch(() => undefined);
+    await reader.close();
+    await service.close();
+    await store.close();
+  }
+});
+
+test('concurrent task services reuse the reserved sequence for one fixed failed event', async () => {
+  const store = new TerminalEventRaceStore(new SqliteStore());
+  const first = new TaskService(store, async () => ({ text: '' }));
+  const second = new TaskService(store, async () => ({ text: '' }));
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const queued = await first.enqueue(principal, thread.id, 'fail before the event is persisted');
+    await store.put<Task>('task', queued.id, principal.id, {
+      ...queued.data,
+      state: 'failed',
+      error: 'Provider unavailable',
+    }, queued.revision);
+
+    const firstRead = first.events(principal.id, queued.id);
+    await store.failedEventStarted;
+    const secondRead = second.events(principal.id, queued.id);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    store.releaseFailedEvent();
+
+    const [firstEvents, secondEvents] = await Promise.all([firstRead, secondRead]);
+    for (const events of [firstEvents, secondEvents]) {
+      assert.deepEqual(events.map((event) => event.data.sequence), [1, 2]);
+      assert.deepEqual(events.map((event) => event.data.type), ['queued', 'failed']);
+    }
+  } finally {
+    store.releaseFailedEvent();
+    await second.close();
+    await first.close();
+    await store.close();
+  }
 });
 
 test('tasks snapshot their conversation workspace without assigning legacy records', async () => {

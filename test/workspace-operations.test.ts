@@ -238,6 +238,7 @@ test('a failed workspace operation durably backfills one resumable terminal even
     const events = (await store.scan<TaskEvent>('event', 'local-owner'))
       .filter((event) => event.data.taskId === taskId)
       .sort((left, right) => left.data.sequence - right.data.sequence);
+    assert.deepEqual(events.map((event) => event.data.sequence), [1, 2]);
     assert.deepEqual(events.map((event) => event.data.type), ['queued', 'failed']);
     assert.equal((events[1]?.data.payload as EventPayload).type, 'failed');
     assert.equal((events[1]?.data.payload as { error?: string }).error, 'Query read timeout');
