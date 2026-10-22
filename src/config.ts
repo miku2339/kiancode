@@ -10,6 +10,14 @@ const budgetSchema = (maxCalls: number, maxTokens: number) => z.object({
   maxTokens: z.number().int().min(1).max(20_000_000).default(maxTokens),
 }).strict().prefault({});
 const levelCeilingSchema = z.array(z.string().regex(/^[\x21-\x7e]{1,100}$/)).max(100);
+const applicationServiceTokenEnvsSchema = z.record(
+  z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
+  z.string().regex(/^[A-Z][A-Z0-9_]{0,127}$/),
+).superRefine((mapping, context) => {
+  if (Object.keys(mapping).length > 64) {
+    context.addIssue({ code: 'custom', message: 'Application service tokens may map at most 64 applications' });
+  }
+});
 const pluginCommandProfileSchema = z.object({
   id: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/),
   command: z.string().startsWith('/'),
@@ -41,6 +49,7 @@ export const configSchema = z.object({
     introspectionClientSecretEnv: z.string().regex(/^[A-Z][A-Z0-9_]*$/).default('KIANCODE_OIDC_CLIENT_SECRET'),
     ownerSubjectEnv: z.string().default('KIANCODE_OWNER_SUBJECT'),
     serviceTokenEnv: z.string().default('KIANCODE_ACCOUNT_SERVICE_TOKEN'),
+    applicationServiceTokenEnvs: applicationServiceTokenEnvsSchema.default({}),
     developmentTokenEnv: z.string().default('KIANCODE_DEV_TOKEN'),
     levelCeilings: z.object({
       2: levelCeilingSchema.optional(),
@@ -54,6 +63,7 @@ export const configSchema = z.object({
     introspectionClientSecretEnv: 'KIANCODE_OIDC_CLIENT_SECRET',
     ownerSubjectEnv: 'KIANCODE_OWNER_SUBJECT',
     serviceTokenEnv: 'KIANCODE_ACCOUNT_SERVICE_TOKEN',
+    applicationServiceTokenEnvs: {},
     developmentTokenEnv: 'KIANCODE_DEV_TOKEN',
     levelCeilings: {},
   }),

@@ -16,6 +16,7 @@ const token = 'controlled-account-session-fixture';
 const headers = { authorization: `Bearer ${token}` };
 const issuedGrantVersion = 9;
 const issuedAuthenticatedAt = 1_700_000_000;
+const issuedAuthorizationId = 'authorization_web_1234567890';
 
 function principalId(subject: string): string {
   return createHash('sha256').update(`${issuer}\0${subject}`).digest('hex');
@@ -30,6 +31,7 @@ function ownerIdentity(expiresAt: string): Principal {
     scopes: ['*'],
     applicationId: 'kiancode',
     audience: 'kiancode',
+    authorizationId: issuedAuthorizationId,
     credentialVersion: 7,
     consentVersion: 3,
     grantVersion: issuedGrantVersion,
@@ -61,6 +63,7 @@ test('controlled Account fixture resumes an admitted act workspace task after se
     const body = JSON.parse(String(init?.body)) as {
       subject: string;
       applicationId: string;
+      authorizationId: string;
       credentialVersion: number;
       consentVersion: number;
       grantVersion: number;
@@ -69,6 +72,7 @@ test('controlled Account fixture resumes an admitted act workspace task after se
     assert.deepEqual(body, {
       subject: ownerSubject,
       applicationId: 'kiancode',
+      authorizationId: issuedAuthorizationId,
       credentialVersion: 7,
       consentVersion: 3,
       grantVersion: issuedGrantVersion,
@@ -154,6 +158,8 @@ test('controlled Account fixture resumes an admitted act workspace task after se
     assert.equal(waiting?.data.state, 'waiting_for_device', waiting?.data.error);
     assert.equal(waiting?.data.principal.consentVersion, 3);
     assert.equal(waiting?.data.accountTaskGrant?.consentVersion, 3);
+    assert.equal(waiting?.data.principal.authorizationId, issuedAuthorizationId);
+    assert.equal(waiting?.data.accountTaskGrant?.authorizationId, issuedAuthorizationId);
     assert.equal(waiting?.data.principal.grantVersion, issuedGrantVersion);
     assert.equal(waiting?.data.principal.authenticatedAt, issuedAuthenticatedAt);
     assert.equal(waiting?.data.accountTaskGrant?.grantVersion, issuedGrantVersion);
@@ -173,6 +179,8 @@ test('controlled Account fixture resumes an admitted act workspace task after se
     const completed = await store.get<Task>('task', taskId, identity.id);
     assert.equal(completed?.data.state, 'completed', completed?.data.error);
     assert.equal(completed?.data.result, 'continued after reconnect');
+    assert.equal(completed?.data.principal.authorizationId, issuedAuthorizationId);
+    assert.equal(completed?.data.accountTaskGrant?.authorizationId, issuedAuthorizationId);
     assert.equal(executions, 2);
     assert.equal(authorizationChecks, 1);
     assert.deepEqual(audit, ['account-authorization-check', 'runner-dispatch']);
@@ -219,6 +227,13 @@ test('controlled Account fixture resumes an admitted act workspace task after se
       }),
       (error: unknown) => error instanceof DomainError && error.code === 'grant_revoked',
     );
+    await assert.rejects(
+      resumed.control(identity.id, rollbackId, 'resume', [], {
+        ...authenticatedIdentity,
+        authorizationId: 'authorization_other_1234567890',
+      }),
+      (error: unknown) => error instanceof DomainError && error.code === 'grant_revoked',
+    );
     const repaired = await resumed.control(identity.id, rollbackId, 'resume', [], authenticatedIdentity);
     assert.equal(repaired.data.state, 'queued');
     assert.equal(repaired.data.principal.expiresAt, undefined);
@@ -234,8 +249,10 @@ test('controlled Account fixture resumes an admitted act workspace task after se
     const [child] = await coordinator.runChildren(identity.id, plan.id);
     assert.equal(child?.data.principal.grantVersion, issuedGrantVersion);
     assert.equal(child?.data.principal.authenticatedAt, issuedAuthenticatedAt);
+    assert.equal(child?.data.principal.authorizationId, issuedAuthorizationId);
     assert.equal(child?.data.accountTaskGrant?.grantVersion, issuedGrantVersion);
     assert.equal(child?.data.accountTaskGrant?.authenticatedAt, issuedAuthenticatedAt);
+    assert.equal(child?.data.accountTaskGrant?.authorizationId, issuedAuthorizationId);
   } finally {
     await resumed?.close();
     await server.close();

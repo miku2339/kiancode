@@ -66,6 +66,13 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
     } else {
       identityAuth = developmentAuth(process.env[config.auth.developmentTokenEnv] ?? '');
     }
+    const applicationServiceTokens = authMode === 'account' ? Object.fromEntries(
+      Object.entries(config.auth.applicationServiceTokenEnvs).map(([applicationId, envName]) => {
+        const token = process.env[envName];
+        if (!token?.trim()) throw new Error(`Missing application service token environment variable ${envName}`);
+        return [applicationId, token];
+      }),
+    ) : {};
     const access = new AccessService(
       store,
       ownerSubject,
@@ -78,6 +85,7 @@ export async function bootstrap(config: Configuration, options: BootstrapOptions
         expectedIssuer: config.auth.issuer!,
         expectedAudience: config.auth.audience,
       },
+      applicationServiceTokens,
     );
     const authenticate = async (authorization: string | undefined) => access.authorize(await identityAuth(authorization));
     const notifications = new NotificationService(store, {

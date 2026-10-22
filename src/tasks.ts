@@ -1861,6 +1861,7 @@ function accountAutomationIdentityMatches(granted: Principal, current: Principal
     && granted.subject === current.subject
     && granted.applicationId === current.applicationId
     && granted.audience === current.audience
+    && granted.authorizationId === current.authorizationId
     && granted.credentialVersion === current.credentialVersion
     && granted.consentVersion === current.consentVersion
     && granted.grantVersion === current.grantVersion

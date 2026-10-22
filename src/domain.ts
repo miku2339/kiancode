@@ -77,6 +77,7 @@ export interface AccountTaskGrant {
   subject: string;
   applicationId: string;
   audience: string;
+  authorizationId?: string;
   credentialVersion: number;
   consentVersion: number;
   grantVersion?: number;

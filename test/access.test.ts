@@ -350,6 +350,115 @@ test('account authorization outages remain retryable while explicit inactive or 
   }
 });
 
+test('account authorization selects dedicated application tokens without weakening native fallback', async () => {
+  const store = new SqliteStore();
+  const requests: Array<{ authorization: string | null; applicationId: string }> = [];
+  const fetcher = (async (_input, init) => {
+    const authorization = new Headers(init?.headers).get('authorization');
+    const body = JSON.parse(String(init?.body)) as { applicationId: string };
+    requests.push({ authorization, applicationId: body.applicationId });
+    const active = (body.applicationId === 'kian-chat-web' && authorization === 'Bearer web-service-token')
+      || (body.applicationId === 'kiancode-plus' && authorization === `Bearer ${serviceToken}`);
+    return Response.json({
+      success: true,
+      data: { active, credentialVersion: 1, consentVersion: 1, grantVersion: 0 },
+    });
+  }) as typeof fetch;
+  const access = new AccessService(
+    store,
+    ownerSubject,
+    serviceToken,
+    'account',
+    undefined,
+    fetcher,
+    {},
+    { expectedIssuer: issuer, expectedAudience: 'kiancode' },
+    { 'kian-chat-web': 'web-service-token' },
+  );
+  try {
+    assert.equal(await access.validateDelegation(identity(ownerSubject, 1, {
+      applicationId: 'kian-chat-web',
+    })), true);
+    assert.equal(await access.validateDelegation(identity(ownerSubject, 1, {
+      applicationId: 'kiancode-plus',
+    })), true);
+    assert.deepEqual(requests, [
+      { authorization: 'Bearer web-service-token', applicationId: 'kian-chat-web' },
+      { authorization: `Bearer ${serviceToken}`, applicationId: 'kiancode-plus' },
+    ]);
+  } finally {
+    await store.close();
+  }
+});
+
+test('configured application tokens fail closed when missing, blank, mismatched, or revoked', async () => {
+  const principal = identity(ownerSubject, 1, { applicationId: 'kian-chat-web' });
+  for (const applicationServiceTokens of [
+    { 'kian-chat-web': undefined },
+    { 'kian-chat-web': '' },
+    { 'kian-chat-web': '   ' },
+  ]) {
+    const store = new SqliteStore();
+    let requests = 0;
+    const access = new AccessService(
+      store,
+      ownerSubject,
+      serviceToken,
+      'account',
+      undefined,
+      (async () => {
+        requests += 1;
+        return Response.json({ success: true, data: { active: true, credentialVersion: 1, consentVersion: 1 } });
+      }) as typeof fetch,
+      {},
+      { expectedIssuer: issuer, expectedAudience: 'kiancode' },
+      applicationServiceTokens,
+    );
+    try {
+      await assert.rejects(access.validateDelegation(principal), hasCode('identity_unavailable', 503));
+      assert.equal(requests, 0);
+    } finally {
+      await store.close();
+    }
+  }
+
+  for (const { applicationServiceToken, accountActive } of [
+    { applicationServiceToken: 'wrong-application-token', accountActive: true },
+    { applicationServiceToken: 'web-service-token', accountActive: false },
+  ]) {
+    const store = new SqliteStore();
+    const access = new AccessService(
+      store,
+      ownerSubject,
+      serviceToken,
+      'account',
+      undefined,
+      (async (_input, init) => {
+        const authorization = new Headers(init?.headers).get('authorization');
+        const body = JSON.parse(String(init?.body)) as { applicationId: string };
+        return Response.json({
+          success: true,
+          data: {
+            active: accountActive && authorization === 'Bearer web-service-token'
+              && body.applicationId === 'kian-chat-web',
+            credentialVersion: 1,
+            consentVersion: 1,
+            grantVersion: 0,
+          },
+        });
+      }) as typeof fetch,
+      {},
+      { expectedIssuer: issuer, expectedAudience: 'kiancode' },
+      { 'kian-chat-web': applicationServiceToken },
+    );
+    try {
+      assert.equal(await access.validateDelegation(principal), false);
+    } finally {
+      await store.close();
+    }
+  }
+});
+
 test('Account grant role updates require a fresh snapshot while refresh preserves its scope and logout-all epoch', async () => {
   const store = new SqliteStore();
   const authenticatedAt = 1_700_000_000;

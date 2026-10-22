@@ -219,6 +219,63 @@ test('auth.levelCeilings rejects unknown levels and malformed scope lists', () =
   }
 });
 
+test('auth.applicationServiceTokenEnvs accepts bounded application-to-environment mappings', () => {
+  assert.deepEqual(configSchema.parse({}).auth.applicationServiceTokenEnvs, {});
+  const mapping = {
+    'kian-chat-web': 'KIANCODE_ACCOUNT_KIAN_CHAT_WEB_SERVICE_TOKEN',
+    'kiancode-plus': 'KIANCODE_ACCOUNT_NATIVE_SERVICE_TOKEN',
+  };
+  assert.deepEqual(configSchema.parse({
+    auth: { applicationServiceTokenEnvs: mapping },
+  }).auth.applicationServiceTokenEnvs, mapping);
+
+  for (const applicationServiceTokenEnvs of [
+    { '': 'VALID_ENV' },
+    { 'Kian-chat-web': 'VALID_ENV' },
+    { 'kian_chat_web': 'VALID_ENV' },
+    { 'kian-chat-web': '' },
+    { 'kian-chat-web': 'lowercase_env' },
+    { 'kian-chat-web': '1INVALID_ENV' },
+    Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`app-${index}`, `TOKEN_${index}`])),
+  ]) {
+    assert.throws(
+      () => configSchema.parse({ auth: { applicationServiceTokenEnvs } }),
+      (error: unknown) => error instanceof ZodError,
+    );
+  }
+});
+
+test('bootstrap rejects missing or blank configured application service tokens', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'kiancode-application-token-'));
+  const envName = 'KIANCODE_CONFIG_TEST_WEB_SERVICE_TOKEN';
+  const previous = process.env[envName];
+  const config = configSchema.parse({
+    stateDirectory: path.join(directory, 'state'),
+    checkpointDirectory: path.join(directory, 'checkpoints'),
+    database: { sqlitePath: path.join(directory, 'core.sqlite') },
+    auth: {
+      mode: 'account',
+      issuer: 'https://account.example.com',
+      applicationServiceTokenEnvs: { 'kian-chat-web': envName },
+    },
+    attachments: { localDirectory: path.join(directory, 'attachments') },
+  });
+  try {
+    for (const token of [undefined, '', '   ']) {
+      if (token === undefined) delete process.env[envName];
+      else process.env[envName] = token;
+      await assert.rejects(
+        bootstrap(config),
+        { message: `Missing application service token environment variable ${envName}` },
+      );
+    }
+  } finally {
+    if (previous === undefined) delete process.env[envName];
+    else process.env[envName] = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 function productionConfig(
   mode: 'account' | 'oidc',
   ownerSubjectEnv = 'CUSTOM_OWNER_SUBJECT',

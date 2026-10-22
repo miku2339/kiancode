@@ -6,6 +6,7 @@ export interface Principal {
   scopes: string[];
   applicationId?: string;
   audience?: string;
+  authorizationId?: string;
   credentialVersion?: number;
   consentVersion?: number;
   grantVersion?: number;

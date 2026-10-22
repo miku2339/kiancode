@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { canonicalAccountIssuer } from './auth.js';
+import { canonicalAccountIssuer, isValidAccountAuthorizationId } from './auth.js';
 import { DomainError, type Principal } from './contracts.js';
 import type { AccountTaskGrant } from './domain.js';
 
@@ -24,6 +24,7 @@ export function isAccountIdentity(
     && principal.id === createHash('sha256').update(`${issuer}\0${subject}`).digest('hex')
     && principal.applicationId
     && principal.audience
+    && isValidAccountAuthorizationId(principal.authorizationId)
     && Number.isInteger(principal.credentialVersion)
     && principal.credentialVersion! >= 0
     && Number.isInteger(principal.consentVersion)
@@ -50,6 +51,7 @@ export function bindAccountTaskGrant(
     subject: admission.subject,
     applicationId: admission.applicationId,
     audience: admission.audience,
+    ...(admission.authorizationId === undefined ? {} : { authorizationId: admission.authorizationId }),
     credentialVersion: admission.credentialVersion,
     consentVersion: admission.consentVersion,
     ...(admission.grantVersion === undefined ? {} : { grantVersion: admission.grantVersion }),
@@ -121,6 +123,7 @@ function matchesIdentity(grant: AccountTaskGrant | AccountTaskGrantAdmission, pr
     && grant.subject === principal.subject
     && grant.applicationId === principal.applicationId
     && grant.audience === principal.audience
+    && grant.authorizationId === principal.authorizationId
     && grant.credentialVersion === principal.credentialVersion
     && grant.consentVersion === principal.consentVersion
     && grant.grantVersion === principal.grantVersion

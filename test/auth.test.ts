@@ -117,6 +117,43 @@ test('account authentication rejects missing or malformed consent versions', asy
   }
 });
 
+test('account authentication preserves valid source authorization ids and rejects malformed values', async () => {
+  const subject = `acct_${'e'.repeat(32)}`;
+  const authenticate = async (authorizationId: unknown) => accountAuth(
+    'https://identity.example.test',
+    (async () => Response.json({
+      success: true,
+      data: { session: {
+        subject,
+        level: 1,
+        scopes: ['chat:read'],
+        applicationId: 'kian-chat-web',
+        audience: 'kiancode',
+        authorizationId,
+        credentialVersion: 1,
+        consentVersion: 1,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      } },
+    })) as typeof fetch,
+    'kiancode',
+  )('Bearer account-token');
+
+  const valid = 'authorization_web_1234567890';
+  assert.equal((await authenticate(valid)).authorizationId, valid);
+  assert.equal((await authenticate(undefined)).authorizationId, undefined);
+  for (const authorizationId of [
+    '',
+    'short',
+    'authorization id with spaces',
+    'authorization.id.with.dots',
+    'a'.repeat(201),
+    42,
+    null,
+  ]) {
+    await assert.rejects(authenticate(authorizationId), /invalid session/);
+  }
+});
+
 test('account authentication preserves the issued grant snapshot and validates its Unix-second fields', async () => {
   const subject = `acct_${'f'.repeat(32)}`;
   const authenticatedAt = Math.floor(Date.now() / 1_000) - 30;

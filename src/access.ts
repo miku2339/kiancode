@@ -45,6 +45,7 @@ export class AccessService {
     private fetcher: typeof fetch = fetch,
     private levelCeilings: LevelCeilings = {},
     identityBinding?: { expectedIssuer: string; expectedAudience: string },
+    private applicationServiceTokens: Readonly<Record<string, string | undefined>> = {},
   ) {
     if (ownerSubject && (ownerSubject.length > 255 || ownerSubject.includes('\0'))) throw new Error('The Kian owner subject is invalid');
     this.accountApiOrigin = accountApiUrl ? secureAccountApiOrigin(accountApiUrl) : undefined;
@@ -70,6 +71,7 @@ export class AccessService {
       subject: identity.subject!,
       applicationId: identity.applicationId!,
       audience: identity.audience!,
+      ...(identity.authorizationId === undefined ? {} : { authorizationId: identity.authorizationId }),
       credentialVersion: identity.credentialVersion!,
       consentVersion: identity.consentVersion!,
       ...(identity.grantVersion === undefined ? {} : { grantVersion: identity.grantVersion }),
@@ -118,14 +120,22 @@ export class AccessService {
     if (!principal.scopes.every((scope) => scopeAllows(fresh.scopes, scope))) return false;
     if (!principal.issuer || this.identityMode === 'development') return true;
     if (this.identityMode === 'oidc') return true;
-    if (!this.serviceToken) throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
+    const hasApplicationToken = Object.prototype.hasOwnProperty.call(
+      this.applicationServiceTokens,
+      principal.applicationId!,
+    );
+    const serviceToken = hasApplicationToken
+      ? this.applicationServiceTokens[principal.applicationId!]
+      : this.serviceToken;
+    if (!serviceToken?.trim()) throw new DomainError('identity_unavailable', 'Account authorization is unavailable', 503);
     let response: Response;
     try {
       response = await this.fetcher(new URL('/api/internal/authorization/check/', this.accountApiOrigin ?? principal.issuer), {
-        method: 'POST', headers: { authorization: `Bearer ${this.serviceToken}`, 'content-type': 'application/json' },
+        method: 'POST', headers: { authorization: `Bearer ${serviceToken}`, 'content-type': 'application/json' },
         body: JSON.stringify({
           subject: principal.subject,
           applicationId: principal.applicationId,
+          ...(principal.authorizationId === undefined ? {} : { authorizationId: principal.authorizationId }),
           credentialVersion: principal.credentialVersion,
           consentVersion: principal.consentVersion,
           ...(principal.grantVersion === undefined ? {} : { grantVersion: principal.grantVersion }),

@@ -16,6 +16,10 @@ export function bearer(authorization: string | undefined): string {
 
 export function tokenHash(token: string): string { return createHash('sha256').update(token).digest('hex'); }
 
+export function isValidAccountAuthorizationId(value: unknown): value is string | undefined {
+  return value === undefined || (typeof value === 'string' && /^[A-Za-z0-9_-]{16,200}$/.test(value));
+}
+
 export function developmentAuth(token: string): Authenticator {
   if (token.length < 32) throw new Error('Development token must contain at least 32 characters');
   const expected = createHash('sha256').update(token).digest();
@@ -47,11 +51,12 @@ export function accountAuth(
       }
       throw new DomainError('identity_unavailable', 'Account service is unavailable', 503);
     }
-    const envelope = await response.json() as { success?: boolean; data?: { session?: { subject?: string; level?: number; scopes?: unknown; expiresAt?: string | number; applicationId?: string; audience?: string; credentialVersion?: number; consentVersion?: number; grantVersion?: number; authenticatedAt?: number } } };
+    const envelope = await response.json() as { success?: boolean; data?: { session?: { subject?: string; level?: number; scopes?: unknown; expiresAt?: string | number; applicationId?: string; audience?: string; authorizationId?: unknown; credentialVersion?: number; consentVersion?: number; grantVersion?: number; authenticatedAt?: number } } };
     const session = envelope.data?.session;
     const expiresAt = accountSessionExpiry(session?.expiresAt);
     if (!envelope.success || !session?.subject?.match(/^acct_[0-9a-f]{32}$/) || ![1, 2, 3, 4, 5].includes(session.level ?? 0)
       || !Array.isArray(session.scopes) || session.scopes.some((scope) => typeof scope !== 'string') || !expiresAt
+      || !isValidAccountAuthorizationId(session.authorizationId)
       || !Number.isInteger(session.consentVersion) || session.consentVersion! <= 0
       || (session.grantVersion !== undefined && (!Number.isSafeInteger(session.grantVersion) || session.grantVersion <= 0))
       || (session.grantVersion !== undefined && session.authenticatedAt === undefined)
@@ -60,7 +65,7 @@ export function accountAuth(
       throw new DomainError('invalid_identity', 'Account returned an invalid session', 401);
     }
     if (expectedAudience && (session.audience !== expectedAudience || !session.applicationId || !Number.isInteger(session.credentialVersion))) throw new DomainError('invalid_audience', 'This session is not authorized for Kian', 403);
-    return { id: createHash('sha256').update(`${canonicalIssuer}\0${session.subject}`).digest('hex'), issuer: canonicalIssuer, subject: session.subject, level: session.level as Principal['level'], scopes: session.scopes as string[], applicationId: session.applicationId, audience: session.audience, credentialVersion: session.credentialVersion, consentVersion: session.consentVersion, ...(session.grantVersion === undefined ? {} : { grantVersion: session.grantVersion }), ...(session.authenticatedAt === undefined ? {} : { authenticatedAt: session.authenticatedAt }), expiresAt };
+    return { id: createHash('sha256').update(`${canonicalIssuer}\0${session.subject}`).digest('hex'), issuer: canonicalIssuer, subject: session.subject, level: session.level as Principal['level'], scopes: session.scopes as string[], applicationId: session.applicationId, audience: session.audience, ...(session.authorizationId === undefined ? {} : { authorizationId: session.authorizationId }), credentialVersion: session.credentialVersion, consentVersion: session.consentVersion, ...(session.grantVersion === undefined ? {} : { grantVersion: session.grantVersion }), ...(session.authenticatedAt === undefined ? {} : { authenticatedAt: session.authenticatedAt }), expiresAt };
   };
 }
 
