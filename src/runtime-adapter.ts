@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { DomainError, isNotDispatched, type Principal, type RunMode, type ToolDefinition } from './contracts.js';
-import type { Memory, Task, TaskEvent } from './domain.js';
+import type { Memory, Task } from './domain.js';
 import { AgentRuntime, type AgentProfile, type ChatMessage, type RunUsage, type VisualContextStore } from './runtime/index.js';
-import type { Entity, Store } from './storage/store.js';
+import { taskEvents, type Entity, type Store } from './storage/store.js';
 import type { TaskRunner } from './tasks.js';
 import type { ArtifactService } from './artifacts.js';
 import {
@@ -165,10 +165,8 @@ async function recoveredRunUsage(
   stored: RunUsage | undefined,
   onEvent?: (event: { type: string; [key: string]: unknown }) => Promise<void>,
 ): Promise<RunUsage | undefined> {
-  const events = (await store.scan<TaskEvent>('event', ownerId))
-    .filter((event) => event.data.taskId === taskId
-      && ['model_call', 'model_call_released', 'usage'].includes(event.data.type))
-    .sort((left, right) => left.data.sequence - right.data.sequence);
+  const events = (await taskEvents(store, ownerId, taskId))
+    .filter((event) => ['model_call', 'model_call_released', 'usage'].includes(event.data.type));
   if (!events.length) return stored;
   const last = events.at(-1);
   if (stored && onEvent && last?.data.type === 'model_call') {

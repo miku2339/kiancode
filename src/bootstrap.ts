@@ -7,6 +7,7 @@ import { ArtifactService } from './artifacts.js';
 import { requireOwnerSubject, type Configuration } from './config.js';
 import { DomainError, notDispatched, type ToolDefinition } from './contracts.js';
 import { DeviceService } from './devices.js';
+import type { TaskEvent } from './domain.js';
 import { createServer } from './http/server.js';
 import { AgentRuntime, DeviceModelProvider, OllamaProvider, OpenAICompatibleProvider, VisualContextStore } from './runtime/index.js';
 import { PluginService } from './plugins.js';
@@ -333,6 +334,10 @@ class RecoveringPostgresStore implements Store {
 
   public queryMemory(query: MemoryQuery): Promise<MemoryQueryPage> {
     return this.use((store) => store.queryMemory(query));
+  }
+
+  public taskEvents(ownerId: string, taskId: string, after?: number): Promise<Array<Entity<TaskEvent>>> {
+    return this.use((store) => store.taskEvents(ownerId, taskId, after));
   }
 
   public put<T>(kind: string, id: string, ownerId: string, data: T, revision: number): Promise<Entity<T>> {

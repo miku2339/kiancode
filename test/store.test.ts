@@ -102,6 +102,7 @@ test('PostgreSQL: connect bootstraps an isolated table and index and keeps rows 
     let store = await harness.open();
     assert.equal(await harness.has('kiancode_entities'), true);
     assert.equal(await harness.has('kiancode_entities_owner_kind'), true);
+    assert.equal(await harness.has('kiancode_entities_event_task'), true);
     const created = await store.create('note', 'alice', { value: 1 }, 'kept');
     store = await harness.open();
     assert.deepEqual(await store.get('note', 'kept', 'alice'), created);
@@ -120,6 +121,42 @@ test('PostgreSQL: connect re-creates a missing owner index without touching rows
     store = await harness.open();
     assert.equal(await harness.has('kiancode_entities_owner_kind'), true);
     assert.deepEqual(await store.get('note', 'kept', 'alice'), created);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test('PostgreSQL: connect adds a missing task event index to an existing table without touching rows', { skip: postgresSkip }, async () => {
+  const harness = await postgresHarness(postgresUrl);
+  try {
+    let store = await harness.open();
+    const created = await store.create('event', 'alice', { taskId: 'task', sequence: 1, type: 'created', payload: {}, at: '2026-09-27T12:00:00.000Z' }, 'task:000000000001');
+    await harness.admin.query(`DROP INDEX ${harness.schema}.kiancode_entities_event_task`);
+    store = await harness.open();
+    assert.equal(await harness.has('kiancode_entities_event_task'), true);
+    assert.equal(await harness.has('kiancode_entities_owner_kind'), true);
+    assert.deepEqual(await store.taskEvents('alice', 'task'), [created]);
+  } finally {
+    await harness.dispose();
+  }
+});
+
+test('PostgreSQL: task event reads can use the task event index instead of scanning the owner', { skip: postgresSkip }, async () => {
+  const harness = await postgresHarness(postgresUrl);
+  try {
+    await harness.open();
+    const client = await harness.admin.connect();
+    try {
+      await client.query(`SET search_path = ${harness.schema}`);
+      await client.query('SET enable_seqscan = off');
+      await client.query('SET enable_bitmapscan = off');
+      const plan = await client.query<{ 'QUERY PLAN': string }>(`EXPLAIN SELECT * FROM kiancode_entities
+        WHERE kind='event' AND owner_id=$1 AND data->>'taskId'=$2 AND data->'sequence' > to_jsonb($3::numeric)
+        ORDER BY data->'sequence',created_at,id`, ['alice', 'task', 0]);
+      assert.match(plan.rows.map((row) => row['QUERY PLAN']).join('\n'), /kiancode_entities_event_task/);
+    } finally {
+      client.release();
+    }
   } finally {
     await harness.dispose();
   }

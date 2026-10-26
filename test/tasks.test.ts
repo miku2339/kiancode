@@ -241,6 +241,40 @@ test('concurrent task services reuse the reserved sequence for one fixed failed 
   }
 });
 
+test('event sequences continue past events the cursor missed, with or without a task event query', async () => {
+  const run = async (store: Store, dropCursor: boolean): Promise<Array<{ sequence: number; type: string }>> => {
+    const service = new TaskService(store, async ({ onEvent }) => {
+      await onEvent({ type: 'model_call' });
+      return { text: 'done' };
+    });
+    try {
+      const thread = await store.create('conversation', principal.id, conversation);
+      const task = await service.enqueue(principal, thread.id, 'continue the sequence');
+      await store.create<TaskEvent>('event', principal.id, {
+        taskId: task.id,
+        sequence: 5,
+        type: 'recovered',
+        payload: { type: 'recovered' },
+        at: new Date().toISOString(),
+      }, `${task.id}:reconciled:receipt`);
+      if (dropCursor) {
+        const cursor = (await store.get('event_sequence', task.id, principal.id))!;
+        await store.remove('event_sequence', task.id, principal.id, cursor.revision);
+      }
+      await service.drain();
+      assert.deepEqual((await service.events(principal.id, task.id, 5)).map((event) => event.data.type), ['model_call', 'completed']);
+      return (await service.events(principal.id, task.id))
+        .map((event) => ({ sequence: event.data.sequence, type: event.data.type }));
+    } finally { await service.close(); await store.close(); }
+  };
+  for (const dropCursor of [false, true]) {
+    const indexed = await run(new SqliteStore(), dropCursor);
+    const scanned = await run(new SlowEventStore(new SqliteStore()), dropCursor);
+    assert.deepEqual(indexed, scanned);
+    assert.deepEqual(indexed.map((event) => event.sequence), [1, 5, 6, 7]);
+  }
+});
+
 test('tasks snapshot their conversation workspace without assigning legacy records', async () => {
   const store = new SqliteStore();
   const service = new TaskService(store, async () => ({ text: 'done' }));

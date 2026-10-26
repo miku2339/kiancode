@@ -23,7 +23,7 @@ import type {
   TaskState,
 } from './domain.js';
 import type { NotificationInput, NotificationService } from './notifications.js';
-import type { Entity, Store } from './storage/store.js';
+import { taskEvents, type Entity, type Store } from './storage/store.js';
 import { snapshotEnabledPluginVersions } from './plugins.js';
 import { reconcileToolCall, type ChatMessage } from './runtime/index.js';
 import { WorkspaceWriteLeaseService } from './workspace-write-lease.js';
@@ -429,9 +429,7 @@ export class TaskService {
       throw new DomainError('not_found', 'Task not found', 404);
     }
     if (task.data.state === 'failed') await this.ensureFailedEvent(task);
-    return (await this.store.scan<TaskEvent>('event', ownerId))
-      .filter((row) => row.data.taskId === taskId && row.data.sequence > after)
-      .sort((left, right) => left.data.sequence - right.data.sequence);
+    return taskEvents(this.store, ownerId, taskId, after);
   }
 
   private async event(
@@ -456,9 +454,7 @@ export class TaskService {
       await guard?.();
       if (!cursor) {
         try {
-          const existing = (await this.store.scan<TaskEvent>('event', ownerId))
-            .filter((row) => row.data.taskId === taskId);
-          const sequence = Math.max(0, ...existing.map((row) => row.data.sequence)) + 1;
+          const sequence = await this.firstFreeEventSequence(ownerId, taskId, 1);
           await this.store.create<EventSequence>('event_sequence', ownerId, { next: sequence + 1 }, taskId);
           return sequence;
         } catch (error) {
@@ -469,12 +465,7 @@ export class TaskService {
         }
       }
       try {
-        const existing = (await this.store.scan<TaskEvent>('event', ownerId))
-          .filter((row) => row.data.taskId === taskId);
-        const sequence = Math.max(
-          cursor.data.next,
-          Math.max(0, ...existing.map((row) => row.data.sequence)) + 1,
-        );
+        const sequence = await this.firstFreeEventSequence(ownerId, taskId, cursor.data.next);
         await this.store.put<EventSequence>(
           'event_sequence',
           taskId,
@@ -492,17 +483,18 @@ export class TaskService {
     throw new DomainError('busy', 'Task event stream is busy; retry', 409);
   }
 
+  // Only events at or past the cursor can raise the next sequence, so earlier ones are not read.
+  private async firstFreeEventSequence(ownerId: string, taskId: string, next: number): Promise<number> {
+    const last = (await taskEvents(this.store, ownerId, taskId, next - 1)).at(-1)?.data.sequence ?? 0;
+    return Math.max(next, last + 1);
+  }
+
   private async nextFixedEventSequence(ownerId: string, taskId: string, eventId: string): Promise<number> {
     for (let attempt = 0; attempt < 16; attempt += 1) {
       const cursor = await this.store.get<EventSequence>('event_sequence', taskId, ownerId);
       const reserved = cursor?.data.fixed?.[eventId];
       if (reserved !== undefined) return reserved;
-      const existing = (await this.store.scan<TaskEvent>('event', ownerId))
-        .filter((row) => row.data.taskId === taskId);
-      const sequence = Math.max(
-        cursor?.data.next ?? 1,
-        Math.max(0, ...existing.map((row) => row.data.sequence)) + 1,
-      );
+      const sequence = await this.firstFreeEventSequence(ownerId, taskId, cursor?.data.next ?? 1);
       try {
         if (!cursor) {
           await this.store.create<EventSequence>('event_sequence', ownerId, {

@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { DomainError } from '../src/contracts.js';
-import type { Memory } from '../src/domain.js';
-import type { Store } from '../src/storage/store.js';
+import type { Memory, TaskEvent } from '../src/domain.js';
+import { taskEvents, type Entity, type Store } from '../src/storage/store.js';
 
-export type ContractStore = Store & { queryMemory: NonNullable<Store['queryMemory']> };
+export type ContractStore = Store & {
+  queryMemory: NonNullable<Store['queryMemory']>;
+  taskEvents: NonNullable<Store['taskEvents']>;
+};
 
 export interface StoreHarness {
   open(): Promise<ContractStore>;
@@ -24,6 +27,17 @@ const memory = (text: string, changes: Partial<Memory> = {}): Memory => ({
   ...changes,
 });
 const ids = (rows: Array<{ id: string }>): string[] => rows.map((row) => row.id);
+
+const event = (taskId: string, sequence: number, type = 'note'): TaskEvent => ({
+  taskId,
+  sequence,
+  type,
+  payload: { type },
+  at: current,
+});
+// The scan-and-filter behaviour that stores without taskEvents keep.
+const scannedTaskEvents = async (store: Store, ownerId: string, taskId: string, after = 0): Promise<Array<Entity<TaskEvent>>> =>
+  taskEvents({ scan: (kind: string, owner?: string) => store.scan(kind, owner) } as Store, ownerId, taskId, after);
 
 const domainError = (code: string, statusCode: number) => (error: unknown): boolean =>
   error instanceof DomainError && error.code === code && error.statusCode === statusCode;
@@ -149,6 +163,35 @@ export function storeContract(label: string, createHarness: () => Promise<StoreH
     assert.deepEqual((await store.scan('note')).map((row) => row.ownerId), ['alice', 'alice', 'alice', 'bob']);
     assert.deepEqual(await store.scan('unknown-kind'), []);
     assert.deepEqual(await store.scan('unknown-kind', 'alice'), []);
+  });
+
+  contract('task events are one owner and task, after a sequence, in sequence order', async (harness) => {
+    let store = await harness.open();
+    const task = `task'; DROP TABLE entities; -- 100%_`;
+    // Fixed events use ids outside the task prefix and may be written after later sequences.
+    await store.create('event', 'alice', event(task, 10, 'running'), `${task}:000000000010`);
+    await store.create('event', 'alice', event(task, 2, 'created'), `${task}:000000000002`);
+    await store.create('event', 'alice', event(task, 12, 'failed'), `${task}:terminal:failed:rev`);
+    await store.create('event', 'alice', event(task, 9, 'tool_result'), 'receipt-9f2c');
+    await store.create('event', 'alice', event(`${task}x`, 3), `${task}x:000000000003`);
+    await store.create('event', 'alice', event('task%', 4), 'task%:000000000004');
+    await store.create('event', 'bob', event(task, 5), 'bob-event');
+    await store.create('note', 'alice', event(task, 6), 'note-with-task-field');
+    store = await harness.open();
+    const sequences = (rows: Array<Entity<TaskEvent>>): number[] => rows.map((row) => row.data.sequence);
+    assert.deepEqual(sequences(await store.taskEvents('alice', task)), [2, 9, 10, 12]);
+    assert.deepEqual(ids(await store.taskEvents('alice', task)), [
+      `${task}:000000000002`, 'receipt-9f2c', `${task}:000000000010`, `${task}:terminal:failed:rev`,
+    ]);
+    assert.deepEqual(sequences(await store.taskEvents('alice', task, 9)), [10, 12]);
+    assert.deepEqual(sequences(await store.taskEvents('alice', task, 12)), []);
+    assert.deepEqual(sequences(await store.taskEvents('bob', task)), [5]);
+    assert.deepEqual(await store.taskEvents('alice', 'task%'), await scannedTaskEvents(store, 'alice', 'task%'));
+    assert.deepEqual(await store.taskEvents('alice', 'task_'), []);
+    assert.deepEqual(await store.taskEvents('carol', task), []);
+    for (const after of [0, 1, 2, 9, 11, 12]) {
+      assert.deepEqual(await store.taskEvents('alice', task, after), await scannedTaskEvents(store, 'alice', task, after));
+    }
   });
 
   contract('JSON data round-trips exactly', async (harness) => {
