@@ -71,8 +71,8 @@ test('OpenAI-compatible provider parses streamed text, tools, and usage', async 
   assert.deepEqual(response.usage, { inputTokens: 9, outputTokens: 4 });
   assert.deepEqual(tokens, ['Hello ', 'world']);
   const sent = bodies[0] as { tools?: Array<{ function?: { name?: string } }> };
-  assert.match(sent.tools?.[0]?.function?.name ?? '', /^kc_workspace_read_[a-f0-9]{40}$/);
-  assert.ok((sent.tools?.[0]?.function?.name?.length ?? Infinity) <= 64);
+  assert.match(sent.tools?.[0]?.function?.name ?? '', /^kc_workspace_read_[a-f0-9]{16}$/);
+  assert.ok((sent.tools?.[0]?.function?.name?.length ?? Infinity) <= 40);
   assert.doesNotMatch(sent.tools?.[0]?.function?.name ?? '', /\./);
   const sentMessages = (bodies[0] as { messages: Array<{ content: unknown }> }).messages;
   assert.deepEqual(sentMessages[0]?.content, [
@@ -156,10 +156,12 @@ test('provider tool aliases stay readable, distinct, exact, and consistent acros
     baseUrl: 'http://127.0.0.1:11434/v1',
     fetch: async (_url, init) => {
       sentBody = JSON.parse(String(init?.body)) as typeof sentBody;
-      const selected = sentBody?.tools[1]?.function.name;
-      assert.ok(selected);
+      const normalizedCollision = sentBody?.tools[1]?.function.name;
+      const emptyName = sentBody?.tools[3]?.function.name;
+      assert.ok(normalizedCollision);
+      assert.ok(emptyName);
       return new Response([
-        `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"${selected}","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n`,
+        `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"${normalizedCollision}","arguments":"{}"}},{"index":1,"id":"call-2","function":{"name":"${emptyName}","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n`,
         'data: [DONE]\n\n',
       ].join(''));
     },
@@ -192,20 +194,20 @@ test('provider tool aliases stay readable, distinct, exact, and consistent acros
 
   const aliases = sentBody?.tools.map((tool) => tool.function.name) ?? [];
   assert.equal(aliases.length, 5);
-  assert.match(aliases[0] ?? '', /^kc_workspace_read_[a-f0-9]{40}$/);
-  assert.match(aliases[1] ?? '', /^kc_workspace_read_[a-f0-9]{40}$/);
-  assert.match(aliases[2] ?? '', /^kc_{7}[a-f0-9]{40}$/);
-  assert.match(aliases[3] ?? '', /^kc_tool_[a-f0-9]{40}$/);
-  assert.match(aliases[4] ?? '', /^kc_abcdefghijklmnopqrst_[a-f0-9]{40}$/);
-  assert.equal(aliases[4]?.length, 64);
-  assert.ok(aliases.every((name) => name.length <= 64 && /^[A-Za-z0-9_-]+$/.test(name)));
+  assert.match(aliases[0] ?? '', /^kc_workspace_read_[a-f0-9]{16}$/);
+  assert.match(aliases[1] ?? '', /^kc_workspace_read_[a-f0-9]{16}$/);
+  assert.match(aliases[2] ?? '', /^kc_{7}[a-f0-9]{16}$/);
+  assert.match(aliases[3] ?? '', /^kc_tool_[a-f0-9]{16}$/);
+  assert.match(aliases[4] ?? '', /^kc_abcdefghijklmnopqrst_[a-f0-9]{16}$/);
+  assert.equal(aliases[4]?.length, 40);
+  assert.ok(aliases.every((name) => name.length <= 40 && /^[A-Za-z0-9_-]+$/.test(name)));
   assert.equal(new Set(aliases).size, aliases.length);
   assert.equal(sentBody?.messages[0]?.tool_calls?.[0]?.function.name, aliases[1]);
-  assert.equal(response.message.toolCalls?.[0]?.name, 'workspace/read');
+  assert.deepEqual(response.message.toolCalls?.map((call) => call.name), ['workspace/read', '']);
 });
 
-test('provider rejects guessed tool aliases even when their prefix or hash suffix looks valid', async () => {
-  for (const alteration of ['suffix', 'prefix'] as const) {
+test('provider rejects guessed, legacy-length, and overlong tool aliases', async () => {
+  for (const alteration of ['suffix', 'prefix', 'legacy-40', 'overlong-42'] as const) {
     const provider = new OpenAICompatibleProvider({
       id: `exact-alias-${alteration}`,
       locality: 'local',
@@ -216,7 +218,9 @@ test('provider rejects guessed tool aliases even when their prefix or hash suffi
         assert.ok(exposed);
         const guessed = alteration === 'suffix'
           ? `${exposed.slice(0, -1)}${exposed.endsWith('0') ? '1' : '0'}`
-          : exposed.replace(/^kc_[A-Za-z0-9_-]{1,20}_/, 'kc_workspace_write_');
+          : alteration === 'prefix'
+            ? exposed.replace(/^kc_[A-Za-z0-9_-]{1,20}_/, 'kc_workspace_write_')
+            : `${exposed}${'0'.repeat(alteration === 'legacy-40' ? 24 : 26)}`;
         assert.notEqual(guessed, exposed);
         return new Response([
           `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"${guessed}","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n`,

@@ -447,10 +447,10 @@ class FunctionNames {
       return previous;
     }
     const readable = name.replace(/[^A-Za-z0-9_-]/gu, '_').slice(0, 20) || 'tool';
-    const hash = createHash('sha256').update(name).digest('hex').slice(0, 40);
+    const hash = createHash('sha256').update(name).digest('hex').slice(0, 16);
     const safe = `kc_${readable}_${hash}`;
     const collision = this.decoded.get(safe);
-    if (collision && collision !== name) {
+    if (collision !== undefined && collision !== name) {
       throw new DomainError('tool_name_collision', 'Two tool names produced the same provider-safe identifier.', 500);
     }
     this.encoded.set(name, safe);
@@ -460,7 +460,7 @@ class FunctionNames {
 
   public decode(name: string): string {
     const decoded = this.decoded.get(name);
-    if (!decoded) {
+    if (decoded === undefined) {
       throw new DomainError('provider_protocol_error', 'Model requested a tool that was not exposed.', 502);
     }
     return decoded;
