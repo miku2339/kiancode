@@ -446,7 +446,9 @@ class FunctionNames {
     if (previous) {
       return previous;
     }
-    const safe = `kc_${createHash('sha256').update(name).digest('hex').slice(0, 40)}`;
+    const readable = name.replace(/[^A-Za-z0-9_-]/gu, '_').slice(0, 20) || 'tool';
+    const hash = createHash('sha256').update(name).digest('hex').slice(0, 40);
+    const safe = `kc_${readable}_${hash}`;
     const collision = this.decoded.get(safe);
     if (collision && collision !== name) {
       throw new DomainError('tool_name_collision', 'Two tool names produced the same provider-safe identifier.', 500);

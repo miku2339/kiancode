@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -25,8 +24,10 @@ test('bootstrap exposes browser and Mac tools to the model and dispatches them t
         tools?: Array<{ function: { name: string } }>;
       };
       const names = new Set(body.tools?.map((tool) => tool.function.name));
-      assert.ok(names.has(wireName('browser.snapshot')));
-      assert.ok(names.has(wireName('mac.app.health')));
+      const browserName = [...names].find((name) => name.startsWith('kc_browser_snapshot_'));
+      const macName = [...names].find((name) => name.startsWith('kc_mac_app_health_'));
+      assert.ok(browserName);
+      assert.ok(macName);
       const hasResult = body.messages.some((message) => message.role === 'tool');
       const wantsBrowser = body.messages.some((message) => String(message.content).includes('browser'));
       const payload = hasResult
@@ -34,7 +35,7 @@ test('bootstrap exposes browser and Mac tools to the model and dispatches them t
         : {
             message: {
               role: 'assistant', content: '',
-              tool_calls: [{ function: { name: wireName(wantsBrowser ? 'browser.snapshot' : 'mac.app.health'), arguments: {} } }],
+              tool_calls: [{ function: { name: wantsBrowser ? browserName : macName, arguments: {} } }],
             },
             done: true, done_reason: 'tool_calls',
           };
@@ -132,10 +133,6 @@ async function queueTask(store: Awaited<ReturnType<typeof bootstrap>>['store'], 
     approvedActionHashes: [],
     runtimeMessages: [{ role: 'user', content: prompt }],
   });
-}
-
-function wireName(name: string): string {
-  return `kc_${createHash('sha256').update(name).digest('hex').slice(0, 40)}`;
 }
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 5_000): Promise<void> {

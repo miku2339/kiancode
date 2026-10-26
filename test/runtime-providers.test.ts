@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import test from 'node:test';
 import type { ToolDefinition } from '../src/contracts.js';
 import { OllamaProvider, OpenAICompatibleProvider, type ChatRequest } from '../src/runtime/index.js';
@@ -9,7 +8,8 @@ test('OpenAI-compatible provider parses streamed text, tools, and usage', async 
   const fetchImpl: typeof fetch = async (_url, init) => {
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     bodies.push(body);
-    const safeName = `kc_${createHash('sha256').update('workspace.read').digest('hex').slice(0, 40)}`;
+    const safeName = ((body.tools as Array<{ function: { name: string } }>)[0]?.function.name);
+    assert.ok(safeName);
     const chunks = [
       'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\n',
       `data: {"choices":[{"delta":{"content":"world","tool_calls":[{"index":0,"id":"call-1","function":{"name":"${safeName}","arguments":"{\\"q\\":"}}]}}]}\n\n`,
@@ -71,7 +71,8 @@ test('OpenAI-compatible provider parses streamed text, tools, and usage', async 
   assert.deepEqual(response.usage, { inputTokens: 9, outputTokens: 4 });
   assert.deepEqual(tokens, ['Hello ', 'world']);
   const sent = bodies[0] as { tools?: Array<{ function?: { name?: string } }> };
-  assert.match(sent.tools?.[0]?.function?.name ?? '', /^kc_[a-f0-9]{40}$/);
+  assert.match(sent.tools?.[0]?.function?.name ?? '', /^kc_workspace_read_[a-f0-9]{40}$/);
+  assert.ok((sent.tools?.[0]?.function?.name?.length ?? Infinity) <= 64);
   assert.doesNotMatch(sent.tools?.[0]?.function?.name ?? '', /\./);
   const sentMessages = (bodies[0] as { messages: Array<{ content: unknown }> }).messages;
   assert.deepEqual(sentMessages[0]?.content, [
@@ -103,12 +104,16 @@ test('providers reject insecure remote endpoints and do not expose error bodies'
 });
 
 test('Ollama provider parses NDJSON streaming responses', async () => {
-  const safeName = `kc_${createHash('sha256').update('workspace.read').digest('hex').slice(0, 40)}`;
-  const fetchImpl: typeof fetch = async () => new Response([
-    '{"message":{"role":"assistant","content":"本地"},"done":false}\n',
-    `{"message":{"role":"assistant","content":"答案","tool_calls":[{"function":{"name":"${safeName}","arguments":{"path":"a"}}}]},"done":false}\n`,
-    '{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":5,"eval_count":3}\n',
-  ].join(''), { status: 200 });
+  const fetchImpl: typeof fetch = async (_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { tools: Array<{ function: { name: string } }> };
+    const safeName = body.tools[0]?.function.name;
+    assert.ok(safeName);
+    return new Response([
+      '{"message":{"role":"assistant","content":"本地"},"done":false}\n',
+      `{"message":{"role":"assistant","content":"答案","tool_calls":[{"function":{"name":"${safeName}","arguments":{"path":"a"}}}]},"done":false}\n`,
+      '{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":5,"eval_count":3}\n',
+    ].join(''), { status: 200 });
+  };
   const provider = new OllamaProvider({ id: 'ollama', baseUrl: 'http://127.0.0.1:11434', fetch: fetchImpl });
   const tool: ToolDefinition = {
     name: 'workspace.read',
@@ -138,6 +143,103 @@ test('Ollama provider parses NDJSON streaming responses', async () => {
     arguments: { path: 'a' },
   }]);
   assert.deepEqual(response.usage, { inputTokens: 5, outputTokens: 3 });
+});
+
+test('provider tool aliases stay readable, distinct, exact, and consistent across history and schema', async () => {
+  let sentBody: {
+    messages: Array<{ tool_calls?: Array<{ function: { name: string } }> }>;
+    tools: Array<{ function: { name: string } }>;
+  } | undefined;
+  const provider = new OpenAICompatibleProvider({
+    id: 'readable-aliases',
+    locality: 'local',
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    fetch: async (_url, init) => {
+      sentBody = JSON.parse(String(init?.body)) as typeof sentBody;
+      const selected = sentBody?.tools[1]?.function.name;
+      assert.ok(selected);
+      return new Response([
+        `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"${selected}","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n`,
+        'data: [DONE]\n\n',
+      ].join(''));
+    },
+  });
+  const tools = [
+    'workspace.read',
+    'workspace/read',
+    '工作/工具',
+    '',
+    'abcdefghijklmnopqrstuvwx',
+  ].map((name): ToolDefinition => ({
+    name,
+    description: name,
+    inputSchema: { type: 'object' },
+    requiredCapabilities: [],
+    sideEffect: 'read',
+    async execute() { return { content: '' }; },
+  }));
+
+  const response = await provider.chat({
+    model: { id: 'model', providerId: provider.id, locality: 'local', capabilities: ['tools'] },
+    messages: [{
+      role: 'assistant',
+      content: '',
+      toolCalls: [{ id: 'previous-call', name: 'workspace/read', arguments: {} }],
+    }],
+    tools,
+    signal: new AbortController().signal,
+  });
+
+  const aliases = sentBody?.tools.map((tool) => tool.function.name) ?? [];
+  assert.equal(aliases.length, 5);
+  assert.match(aliases[0] ?? '', /^kc_workspace_read_[a-f0-9]{40}$/);
+  assert.match(aliases[1] ?? '', /^kc_workspace_read_[a-f0-9]{40}$/);
+  assert.match(aliases[2] ?? '', /^kc_{7}[a-f0-9]{40}$/);
+  assert.match(aliases[3] ?? '', /^kc_tool_[a-f0-9]{40}$/);
+  assert.match(aliases[4] ?? '', /^kc_abcdefghijklmnopqrst_[a-f0-9]{40}$/);
+  assert.equal(aliases[4]?.length, 64);
+  assert.ok(aliases.every((name) => name.length <= 64 && /^[A-Za-z0-9_-]+$/.test(name)));
+  assert.equal(new Set(aliases).size, aliases.length);
+  assert.equal(sentBody?.messages[0]?.tool_calls?.[0]?.function.name, aliases[1]);
+  assert.equal(response.message.toolCalls?.[0]?.name, 'workspace/read');
+});
+
+test('provider rejects guessed tool aliases even when their prefix or hash suffix looks valid', async () => {
+  for (const alteration of ['suffix', 'prefix'] as const) {
+    const provider = new OpenAICompatibleProvider({
+      id: `exact-alias-${alteration}`,
+      locality: 'local',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body)) as { tools: Array<{ function: { name: string } }> };
+        const exposed = body.tools[0]?.function.name;
+        assert.ok(exposed);
+        const guessed = alteration === 'suffix'
+          ? `${exposed.slice(0, -1)}${exposed.endsWith('0') ? '1' : '0'}`
+          : exposed.replace(/^kc_[A-Za-z0-9_-]{1,20}_/, 'kc_workspace_write_');
+        assert.notEqual(guessed, exposed);
+        return new Response([
+          `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"${guessed}","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n`,
+          'data: [DONE]\n\n',
+        ].join(''));
+      },
+    });
+
+    await assert.rejects(provider.chat({
+      model: { id: 'model', providerId: provider.id, locality: 'local', capabilities: ['tools'] },
+      messages: [{ role: 'user', content: 'Use the tool' }],
+      tools: [{
+        name: 'workspace.read',
+        description: 'Read workspace data',
+        inputSchema: { type: 'object' },
+        requiredCapabilities: [],
+        sideEffect: 'read',
+        async execute() { return { content: '' }; },
+      }],
+      signal: new AbortController().signal,
+    }), (error: unknown) => error instanceof Error
+      && 'code' in error && error.code === 'provider_protocol_error');
+  }
 });
 
 test('streaming providers preserve partial usage instead of coercing missing fields to zero', async () => {
