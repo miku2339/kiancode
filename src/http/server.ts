@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { z, ZodError } from 'zod';
 import { bearer, type Authenticator, requireOwner, requireScope, tokenHash } from '../auth.js';
 import { DomainError, type Principal, type ToolDefinition, type Workspace } from '../contracts.js';
-import type { Conversation, Message, Memory, Task } from '../domain.js';
+import type { Conversation, Message, Memory, Task, TaskState } from '../domain.js';
 import type { Entity, Store } from '../storage/store.js';
 import { orderMessages, TaskService, type TaskRunner } from '../tasks.js';
 import { DeviceService, registerDeviceRoutes } from '../devices.js';
@@ -56,6 +56,18 @@ const agentSchema = z.object({
 
 const tickDegradedAfter = 3;
 const tickLogEvery = 60;
+// States that end a task stream, with the event types that announce each one. States reached
+// without an event (device waits, failure-path pauses or unknown outcomes) end after the grace period.
+const streamStopEvents: Partial<Record<TaskState, readonly string[]>> = {
+  completed: ['completed', 'reconcile'],
+  failed: ['failed'],
+  cancelled: ['cancel', 'reconcile'],
+  unknown: ['cancel', 'pause', 'reconcile'],
+  waiting_for_approval: ['waiting_for_approval'],
+  waiting_for_device: [],
+  paused: ['pause'],
+};
+const streamStopGraceMs = 2_000;
 
 export interface ServerLoggerOptions {
   level: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace';
@@ -556,14 +568,26 @@ export async function createServer(options: ServerOptions) {
     let closed = false;
     reply.raw.on('close', () => { closed = true; });
     const started = Date.now();
+    let stoppedAt: number | undefined;
     try {
       while (!closed && Date.now() - started < 55000) {
-        for (const row of await tasks.events(owner.id, taskId, sequence)) {
+        // Task state is persisted before its transition event, so read the state first and keep
+        // streaming until that event has been delivered.
+        const current = await store.get<Task>('task', taskId, owner.id);
+        const events = await tasks.events(owner.id, taskId);
+        for (const row of events) {
+          if (row.data.sequence <= sequence) continue;
           sequence = row.data.sequence;
           reply.raw.write(`id: ${sequence}\nevent: ${row.data.type}\ndata: ${JSON.stringify(row.data)}\n\n`);
         }
-        const current = await store.get<Task>('task', taskId, owner.id);
-        if (!current || ['completed', 'failed', 'cancelled', 'unknown', 'waiting_for_approval', 'waiting_for_device', 'paused'].includes(current.data.state)) break;
+        if (!current) break;
+        const expected = streamStopEvents[current.data.state];
+        if (expected) {
+          stoppedAt ??= Date.now();
+          if (expected.includes(events.at(-1)?.data.type ?? '') || Date.now() - stoppedAt >= streamStopGraceMs) break;
+        } else {
+          stoppedAt = undefined;
+        }
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
     } catch { if (!closed) reply.raw.write('event: unavailable\ndata: {}\n\n'); }
