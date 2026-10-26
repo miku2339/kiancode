@@ -350,13 +350,13 @@ test('account authorization outages remain retryable while explicit inactive or 
   }
 });
 
-test('account authorization selects dedicated application tokens without weakening native fallback', async () => {
+test('account authorization requires and checks source authorization ids for dedicated applications', async () => {
   const store = new SqliteStore();
-  const requests: Array<{ authorization: string | null; applicationId: string }> = [];
-  const fetcher = (async (_input, init) => {
+  const requests: Array<{ url: string; authorization: string | null; applicationId: string; authorizationId?: string }> = [];
+  const fetcher = (async (input, init) => {
     const authorization = new Headers(init?.headers).get('authorization');
-    const body = JSON.parse(String(init?.body)) as { applicationId: string };
-    requests.push({ authorization, applicationId: body.applicationId });
+    const body = JSON.parse(String(init?.body)) as { applicationId: string; authorizationId?: string };
+    requests.push({ url: String(input), authorization, applicationId: body.applicationId, authorizationId: body.authorizationId });
     const active = (body.applicationId === 'kian-chat-web' && authorization === 'Bearer web-service-token')
       || (body.applicationId === 'kiancode-plus' && authorization === `Bearer ${serviceToken}`);
     return Response.json({
@@ -376,23 +376,46 @@ test('account authorization selects dedicated application tokens without weakeni
     { 'kian-chat-web': 'web-service-token' },
   );
   try {
-    assert.equal(await access.validateDelegation(identity(ownerSubject, 1, {
+    const webIdentity = identity(ownerSubject, 1, {
       applicationId: 'kian-chat-web',
-    })), true);
+      authorizationId: 'authorization_web_1234567890',
+    });
+    assert.equal((await access.authorize(webIdentity)).authorizationId, 'authorization_web_1234567890');
+    assert.equal(access.accountTaskGrant(webIdentity)?.authorizationId, 'authorization_web_1234567890');
+    assert.equal(await access.validateDelegation(webIdentity), true);
     assert.equal(await access.validateDelegation(identity(ownerSubject, 1, {
       applicationId: 'kiancode-plus',
     })), true);
     assert.deepEqual(requests, [
-      { authorization: 'Bearer web-service-token', applicationId: 'kian-chat-web' },
-      { authorization: `Bearer ${serviceToken}`, applicationId: 'kiancode-plus' },
+      {
+        url: `${issuer}/api/internal/authorization/check/`,
+        authorization: 'Bearer web-service-token',
+        applicationId: 'kian-chat-web',
+        authorizationId: 'authorization_web_1234567890',
+      },
+      {
+        url: `${issuer}/api/internal/authorization/check/`,
+        authorization: `Bearer ${serviceToken}`,
+        applicationId: 'kiancode-plus',
+        authorizationId: undefined,
+      },
     ]);
+    const missingAuthorization = identity(ownerSubject, 1, { applicationId: 'kian-chat-web' });
+    await assert.rejects(access.authorize(missingAuthorization), hasCode('invalid_identity', 401));
+    assert.throws(() => access.accountTaskGrant(missingAuthorization), hasCode('invalid_identity', 401));
+    assert.equal(await access.validateDelegation(missingAuthorization), false);
+    await assert.rejects(reauthorizeWith(access)(missingAuthorization), hasCode('grant_revoked', 403));
+    assert.equal(requests.length, 2);
   } finally {
     await store.close();
   }
 });
 
 test('configured application tokens fail closed when missing, blank, mismatched, or revoked', async () => {
-  const principal = identity(ownerSubject, 1, { applicationId: 'kian-chat-web' });
+  const principal = identity(ownerSubject, 1, {
+    applicationId: 'kian-chat-web',
+    authorizationId: 'authorization_web_1234567890',
+  });
   for (const applicationServiceTokens of [
     { 'kian-chat-web': undefined },
     { 'kian-chat-web': '' },

@@ -81,6 +81,7 @@ export class AccessService {
   }
   async authorize(identity: Principal): Promise<Principal> {
     if (this.identityMode === 'development') return identity;
+    this.validateConfiguredApplicationIdentity(identity);
     if (!identity.issuer || !identity.subject) throw accessRequired();
     if (identity.subject === this.ownerSubject) return { ...identity, level: 1, scopes: ['*'] };
     const grant = await this.store.get<AccessGrant>('access', identity.id, identity.id);
@@ -115,6 +116,7 @@ export class AccessService {
     const expiresAt = principal.expiresAt ? Date.parse(principal.expiresAt) : undefined;
     if ((this.identityMode === 'oidc' && expiresAt === undefined)
       || (expiresAt !== undefined && (!Number.isFinite(expiresAt) || expiresAt <= Date.now()))) return false;
+    if (this.missingConfiguredApplicationAuthorization(principal)) return false;
     if (this.identityMode === 'account') this.validateAccountAutomationIdentity(principal);
     const fresh = await this.authorize(principal);
     if (!principal.scopes.every((scope) => scopeAllows(fresh.scopes, scope))) return false;
@@ -176,5 +178,19 @@ export class AccessService {
     if (!isAccountIdentity(principal, this.identityBinding)) {
       throw new DomainError('invalid_automation_identity', 'Automation identity is invalid', 403);
     }
+    this.validateConfiguredApplicationIdentity(principal);
+  }
+
+  private validateConfiguredApplicationIdentity(principal: Principal): void {
+    if (this.missingConfiguredApplicationAuthorization(principal)) {
+      throw new DomainError('invalid_identity', 'Account session is missing its source authorization', 401);
+    }
+  }
+
+  private missingConfiguredApplicationAuthorization(principal: Principal): boolean {
+    return this.identityMode === 'account'
+      && principal.authorizationId === undefined
+      && principal.applicationId !== undefined
+      && Object.prototype.hasOwnProperty.call(this.applicationServiceTokens, principal.applicationId);
   }
 }
