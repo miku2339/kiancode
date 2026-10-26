@@ -205,3 +205,22 @@ export function requireOwnerSubject(
   if (!valid) throw new Error(`Production requires the owner subject in ${config.auth.ownerSubjectEnv}`);
   return value;
 }
+
+export function requireProductionEnvironment(
+  config: Configuration,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (config.mode !== 'production') return;
+  const authMode = config.auth.mode ?? (config.auth.issuer ? 'account' : 'development');
+  const required: Array<readonly [string, string]> = [
+    [config.database.urlEnv, 'database.urlEnv'],
+    ...(authMode === 'account' ? [
+      [config.auth.serviceTokenEnv, 'auth.serviceTokenEnv'] as const,
+      ...Object.entries(config.auth.applicationServiceTokenEnvs)
+        .map(([applicationId, envName]) => [envName, `auth.applicationServiceTokenEnvs.${applicationId}`] as const),
+    ] : []),
+  ];
+  for (const [envName, field] of required) {
+    if (!env[envName]?.trim()) throw new Error(`Production requires ${field} in ${envName}`);
+  }
+}

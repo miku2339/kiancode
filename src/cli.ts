@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { bootstrap } from './bootstrap.js';
-import { loadConfig, requireOwnerSubject } from './config.js';
+import { loadConfig, requireOwnerSubject, requireProductionEnvironment } from './config.js';
 import { createBlobServer } from './http/blob-server.js';
 import { parseParentPidArgument, runConnector } from './connector-cli.js';
 
@@ -35,6 +35,8 @@ async function main() {
     if (config.mode === 'development') {
       try { process.loadEnvFile(envFile); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     }
+    requireOwnerSubject(config);
+    requireProductionEnvironment(config);
     const server = await bootstrap(config);
     const address = await server.app.listen({ host: config.host, port: config.port });
     process.stdout.write(`kiancode listening at ${address}\n`);
@@ -93,7 +95,12 @@ async function main() {
     }
     return;
   }
-  if (command === 'config-check') { requireOwnerSubject(await loadConfig(configFile)); process.stdout.write('Configuration valid\n'); return; }
+  if (command === 'config-check') {
+    const config = await loadConfig(configFile);
+    requireOwnerSubject(config);
+    requireProductionEnvironment(config);
+    process.stdout.write('Configuration valid\n'); return;
+  }
   if (command === 'version') { const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }; process.stdout.write(`${pkg.version}\n`); return; }
   process.stdout.write('kiancode init | serve [--config path] | chat --message text [--conversation id] [--model-policy cloud|local|auto] | config-check | version\n');
 }

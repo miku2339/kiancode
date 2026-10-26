@@ -355,24 +355,47 @@ test('bootstrap validates the production owner before touching PostgreSQL', asyn
   }
 });
 
-test('config-check enforces the same production owner validation', async () => {
+test('config-check validates every production identity and storage environment reference', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'kiancode-config-check-'));
   const ownerEnv = 'KIANCODE_CONFIG_CHECK_OWNER_SUBJECT';
+  const databaseEnv = 'KIANCODE_CONFIG_CHECK_DATABASE_URL';
+  const serviceTokenEnv = 'KIANCODE_CONFIG_CHECK_SERVICE_TOKEN';
+  const webTokenEnv = 'KIANCODE_CONFIG_CHECK_WEB_TOKEN';
+  const nativeTokenEnv = 'KIANCODE_CONFIG_CHECK_NATIVE_TOKEN';
   const file = path.join(directory, 'production.json');
   const repositoryRoot = fileURLToPath(new URL('..', import.meta.url));
   const run = promisify(execFile);
   const env = { ...process.env };
-  delete env[ownerEnv];
+  const configuredEnv: NodeJS.ProcessEnv = {
+    ...env,
+    [ownerEnv]: `acct_${'0'.repeat(32)}`,
+    [databaseEnv]: 'postgres://configured',
+    [serviceTokenEnv]: 'account-service-token',
+    [webTokenEnv]: 'web-service-token',
+    [nativeTokenEnv]: 'native-service-token',
+  };
   try {
     await writeFile(file, JSON.stringify({
       mode: 'production',
-      auth: { mode: 'account', issuer: 'https://account.example.com', ownerSubjectEnv: ownerEnv },
+      database: { urlEnv: databaseEnv },
+      auth: {
+        mode: 'account',
+        issuer: 'https://account.example.com',
+        ownerSubjectEnv: ownerEnv,
+        serviceTokenEnv,
+        applicationServiceTokenEnvs: {
+          'kian-chat-web': webTokenEnv,
+          'kiancode-plus': nativeTokenEnv,
+        },
+      },
       attachments: { url: 'https://storage.example.com' },
     }));
+    const missingOwnerEnv = { ...configuredEnv };
+    delete missingOwnerEnv[ownerEnv];
     await assert.rejects(
       run(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'config-check', '--config', file], {
         cwd: repositoryRoot,
-        env,
+        env: missingOwnerEnv,
       }),
       (error: unknown) => {
         const failure = error as { code?: unknown; stdout?: string; stderr?: string };
@@ -380,11 +403,71 @@ test('config-check enforces the same production owner validation', async () => {
           && (failure.stderr ?? '').trim() === `Production requires the owner subject in ${ownerEnv}`;
       },
     );
+    for (const [envName, field] of [
+      [databaseEnv, 'database.urlEnv'],
+      [serviceTokenEnv, 'auth.serviceTokenEnv'],
+      [webTokenEnv, 'auth.applicationServiceTokenEnvs.kian-chat-web'],
+      [nativeTokenEnv, 'auth.applicationServiceTokenEnvs.kiancode-plus'],
+    ] as const) {
+      for (const value of [undefined, '   ']) {
+        const invalidEnv = { ...configuredEnv };
+        if (value === undefined) delete invalidEnv[envName];
+        else invalidEnv[envName] = value;
+        for (const command of ['config-check', 'serve']) {
+          await assert.rejects(
+            run(process.execPath, ['--import', 'tsx', 'src/cli.ts', command, '--config', file], {
+              cwd: repositoryRoot,
+              env: invalidEnv,
+            }),
+            (error: unknown) => {
+              const failure = error as { code?: unknown; stdout?: string; stderr?: string };
+              return failure.code === 1 && failure.stdout === ''
+                && (failure.stderr ?? '').trim() === `Production requires ${field} in ${envName}`;
+            },
+          );
+        }
+      }
+    }
     const passed = await run(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'config-check', '--config', file], {
       cwd: repositoryRoot,
-      env: { ...env, [ownerEnv]: `acct_${'0'.repeat(32)}` },
+      env: configuredEnv,
     });
     assert.equal(passed.stdout, 'Configuration valid\n');
+
+    await writeFile(file, JSON.stringify({
+      mode: 'production',
+      database: { urlEnv: databaseEnv },
+      auth: {
+        mode: 'oidc',
+        issuer: 'https://identity.example.com',
+        jwksUri: 'https://identity.example.com/jwks',
+        ownerSubjectEnv: ownerEnv,
+        serviceTokenEnv,
+        applicationServiceTokenEnvs: { 'irrelevant-account-client': webTokenEnv },
+      },
+      attachments: { url: 'https://storage.example.com' },
+    }));
+    const oidcEnv: NodeJS.ProcessEnv = { ...configuredEnv, [ownerEnv]: 'opaque-oidc-owner' };
+    delete oidcEnv[serviceTokenEnv];
+    delete oidcEnv[webTokenEnv];
+    delete oidcEnv[nativeTokenEnv];
+    const oidcPassed = await run(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'config-check', '--config', file], {
+      cwd: repositoryRoot,
+      env: oidcEnv,
+    });
+    assert.equal(oidcPassed.stdout, 'Configuration valid\n');
+    delete oidcEnv[databaseEnv];
+    await assert.rejects(
+      run(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'config-check', '--config', file], {
+        cwd: repositoryRoot,
+        env: oidcEnv,
+      }),
+      (error: unknown) => {
+        const failure = error as { code?: unknown; stdout?: string; stderr?: string };
+        return failure.code === 1 && failure.stdout === ''
+          && (failure.stderr ?? '').trim() === `Production requires database.urlEnv in ${databaseEnv}`;
+      },
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
