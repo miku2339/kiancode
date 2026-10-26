@@ -917,6 +917,61 @@ test('a cancellation after the runner returns does not record completion', async
   } finally { await service.close(); await store.close(); }
 });
 
+test('a runtime event reserved after a cancellation is not recorded', async () => {
+  const store = new CancelOnSequenceReadStore(new SqliteStore());
+  let cancel!: () => Promise<void>;
+  const service = new TaskService(store, async ({ task, onEvent }) => {
+    store.beforeSequenceRead = cancel;
+    await onEvent({ type: 'tool_call', taskId: task.id, toolCall: { id: 'late-call', name: 'late.tool', input: {} } });
+    return { text: 'must not complete' };
+  });
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'cancel while an event is reserved');
+    cancel = async () => { await service.control(principal.id, task.id, 'cancel'); };
+    await service.drain();
+
+    assert.equal((await store.get<Task>('task', task.id, principal.id))?.data.state, 'cancelled');
+    const types = (await service.events(principal.id, task.id)).map((event) => event.data.type);
+    assert.deepEqual(types, ['queued', 'cancel']);
+  } finally { await service.close(); await store.close(); }
+});
+
+class CancelOnSequenceReadStore implements Store {
+  public beforeSequenceRead?: () => Promise<void>;
+
+  public constructor(private readonly delegate: Store) {}
+
+  public create<T>(kind: string, ownerId: string, data: T, id?: string): Promise<Entity<T>> {
+    return this.delegate.create(kind, ownerId, data, id);
+  }
+
+  public async get<T>(kind: string, id: string, ownerId: string): Promise<Entity<T> | undefined> {
+    const hook = this.beforeSequenceRead;
+    if (kind === 'event_sequence' && hook) {
+      this.beforeSequenceRead = undefined;
+      await hook();
+    }
+    return this.delegate.get(kind, id, ownerId);
+  }
+
+  public scan<T>(kind: string, ownerId?: string): Promise<Array<Entity<T>>> {
+    return this.delegate.scan(kind, ownerId);
+  }
+
+  public put<T>(kind: string, id: string, ownerId: string, data: T, revision: number): Promise<Entity<T>> {
+    return this.delegate.put(kind, id, ownerId, data, revision);
+  }
+
+  public remove(kind: string, id: string, ownerId: string, revision: number): Promise<boolean> {
+    return this.delegate.remove(kind, id, ownerId, revision);
+  }
+
+  public close(): Promise<void> {
+    return this.delegate.close();
+  }
+}
+
 class CancelBeforeCompletionStore implements Store {
   public service?: TaskService;
 

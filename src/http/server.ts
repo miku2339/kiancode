@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { z, ZodError } from 'zod';
 import { bearer, type Authenticator, requireOwner, requireScope, tokenHash } from '../auth.js';
 import { DomainError, type Principal, type ToolDefinition, type Workspace } from '../contracts.js';
-import type { Conversation, Message, Memory, Task, TaskState } from '../domain.js';
+import type { Conversation, Message, Memory, Task, TaskEvent, TaskState } from '../domain.js';
 import type { Entity, Store } from '../storage/store.js';
 import { orderMessages, TaskService, type TaskRunner } from '../tasks.js';
 import { DeviceService, registerDeviceRoutes } from '../devices.js';
@@ -69,6 +69,13 @@ const streamStopEvents: Partial<Record<TaskState, readonly string[]>> = {
 };
 const streamRequiredEventStates = new Set<TaskState>(['completed', 'failed', 'cancelled']);
 const streamStopGraceMs = 2_000;
+// Control and reconciliation events name the state they produced; other events are named after it.
+const streamStatefulEvents = new Set(['cancel', 'pause', 'reconcile']);
+
+function announcesStreamState(event: TaskEvent, state: TaskState, expected: readonly string[]): boolean {
+  if (!expected.includes(event.type)) return false;
+  return !streamStatefulEvents.has(event.type) || (event.payload as { state?: unknown }).state === state;
+}
 
 export interface ServerLoggerOptions {
   level: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace';
@@ -585,8 +592,12 @@ export async function createServer(options: ServerOptions) {
         const expected = streamStopEvents[current.data.state];
         if (expected) {
           stoppedAt ??= Date.now();
-          const delivered = expected.includes(events.at(-1)?.data.type ?? '');
-          if (delivered || (!streamRequiredEventStates.has(current.data.state)
+          const state = current.data.state;
+          // Durable terminal states announce themselves once; later events must not hold the stream open.
+          const delivered = streamRequiredEventStates.has(state)
+            ? events.some((row) => announcesStreamState(row.data, state, expected))
+            : events.length > 0 && announcesStreamState(events.at(-1)!.data, state, expected);
+          if (delivered || (!streamRequiredEventStates.has(state)
             && Date.now() - stoppedAt >= streamStopGraceMs)) break;
         } else {
           stoppedAt = undefined;

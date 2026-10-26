@@ -434,8 +434,12 @@ export class TaskService {
       .sort((left, right) => left.data.sequence - right.data.sequence);
   }
 
-  private async event(task: Pick<Entity<Task>, 'id' | 'ownerId'>, event: { type: string; [key: string]: unknown }): Promise<void> {
-    const sequence = await this.nextEventSequence(task.ownerId, task.id);
+  private async event(
+    task: Pick<Entity<Task>, 'id' | 'ownerId'>,
+    event: { type: string; [key: string]: unknown },
+    guard?: () => Promise<void>,
+  ): Promise<void> {
+    const sequence = await this.nextEventSequence(task.ownerId, task.id, guard);
     await this.store.create<TaskEvent>('event', task.ownerId, {
       taskId: task.id,
       sequence,
@@ -445,9 +449,11 @@ export class TaskService {
     }, `${task.id}:${String(sequence).padStart(12, '0')}`);
   }
 
-  private async nextEventSequence(ownerId: string, taskId: string): Promise<number> {
+  // A guard runs after the cursor read, so any event reserved after it passes has a later sequence.
+  private async nextEventSequence(ownerId: string, taskId: string, guard?: () => Promise<void>): Promise<number> {
     for (let attempt = 0; attempt < 16; attempt += 1) {
       const cursor = await this.store.get<EventSequence>('event_sequence', taskId, ownerId);
+      await guard?.();
       if (!cursor) {
         try {
           const existing = (await this.store.scan<TaskEvent>('event', ownerId))
@@ -1144,7 +1150,12 @@ export class TaskService {
       }
       const persisted = { ...runtimeEvent };
       delete persisted.checkpointMessages;
-      await this.event(task, persisted);
+      await this.event(task, persisted, async () => {
+        const current = await this.store.get<Task>('task', task.id, task.ownerId);
+        if (!current || current.data.state !== 'running' || current.data.workerId !== this.workerId) {
+          throw new DomainError('lease_lost', 'Execution lease lost', 409);
+        }
+      });
     });
     const leaseTimer = setInterval(() => {
       void this.change(task.ownerId, task.id, (current) => {

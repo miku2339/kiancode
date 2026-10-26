@@ -83,3 +83,87 @@ test('a task stream delivers the completion event persisted after the completed 
     await server.close();
   }
 });
+
+test('a cancelled task stream ends when a later event follows its cancellation', { timeout: 15_000 }, async () => {
+  const store = new SqliteStore();
+  const server = await createServer({
+    store,
+    authenticate: developmentAuth(token),
+    runner: async () => ({ text: 'unused' }),
+  });
+  try {
+    const thread = await store.create('conversation', owner.id, conversation);
+    const task = await server.tasks.enqueue(owner, thread.id, 'cancel before running');
+    await server.tasks.control(owner.id, task.id, 'cancel');
+    await appendEvent(store, task.id, 3, { type: 'token', content: 'written after cancellation' });
+
+    const stream = await streamWithin(server, task.id, 10_000);
+
+    assert.equal(stream.statusCode, 200, stream.body);
+    assert.equal((stream.body.match(/event: cancel/g) ?? []).length, 1, stream.body);
+    assert.match(stream.body, /event: token/);
+  } finally {
+    await server.close();
+  }
+});
+
+test('an earlier reconciliation does not end a completed stream before its completion event', { timeout: 15_000 }, async () => {
+  const store = new DelayedCompletionEventStore(new SqliteStore(), 2_500);
+  const server = await createServer({
+    store,
+    authenticate: developmentAuth(token),
+    runner: async () => ({ text: 'completed after reconciliation' }),
+  });
+  try {
+    const thread = await store.create('conversation', owner.id, conversation);
+    const task = await server.tasks.enqueue(owner, thread.id, 'resume after reconciliation');
+    await appendEvent(store, task.id, 2, { type: 'reconcile', state: 'queued', resolution: 'not_applied' });
+    const draining = server.tasks.drain();
+    const deadline = Date.now() + 10_000;
+    while ((await store.get<Task>('task', task.id, owner.id))?.data.state !== 'completed') {
+      if (Date.now() >= deadline) throw new Error('Timed out waiting for the completed state');
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+
+    const stream = await streamWithin(server, task.id, 10_000);
+    await draining;
+
+    assert.equal(stream.statusCode, 200, stream.body);
+    assert.equal((stream.body.match(/event: completed/g) ?? []).length, 1, stream.body);
+  } finally {
+    await server.close();
+  }
+});
+
+async function appendEvent(
+  store: Store,
+  taskId: string,
+  sequence: number,
+  payload: { type: string; [key: string]: unknown },
+): Promise<void> {
+  await store.create<TaskEvent>('event', owner.id, {
+    taskId,
+    sequence,
+    type: payload.type,
+    payload,
+    at: new Date().toISOString(),
+  }, `${taskId}:${String(sequence).padStart(12, '0')}`);
+}
+
+async function streamWithin(
+  server: Awaited<ReturnType<typeof createServer>>,
+  taskId: string,
+  timeoutMs: number,
+): Promise<Awaited<ReturnType<Awaited<ReturnType<typeof createServer>>['app']['inject']>>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      server.app.inject({ method: 'GET', url: `/v1/tasks/${taskId}/stream`, headers }),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('Timed out waiting for the task stream to end')), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
