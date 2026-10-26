@@ -59,6 +59,125 @@ class FailingDispatchEventStore implements Store {
   }
 }
 
+class FailingReleaseEventStore implements Store {
+  public failNextRelease = true;
+
+  public constructor(private readonly delegate: Store) {}
+
+  public create<T>(kind: string, ownerId: string, data: T, id?: string): Promise<Entity<T>> {
+    if (kind === 'event' && this.failNextRelease && (data as TaskEvent).type === 'model_call_released') {
+      this.failNextRelease = false;
+      throw new Error('release event persistence failed');
+    }
+    return this.delegate.create(kind, ownerId, data, id);
+  }
+
+  public get<T>(kind: string, id: string, ownerId: string): Promise<Entity<T> | undefined> {
+    return this.delegate.get(kind, id, ownerId);
+  }
+
+  public scan<T>(kind: string, ownerId?: string): Promise<Array<Entity<T>>> {
+    return this.delegate.scan(kind, ownerId);
+  }
+
+  public put<T>(kind: string, id: string, ownerId: string, data: T, revision: number): Promise<Entity<T>> {
+    return this.delegate.put(kind, id, ownerId, data, revision);
+  }
+
+  public remove(kind: string, id: string, ownerId: string, revision: number): Promise<boolean> {
+    return this.delegate.remove(kind, id, ownerId, revision);
+  }
+
+  public close(): Promise<void> {
+    return this.delegate.close();
+  }
+}
+
+test('a missing release event is repaired before retry approval and later resume', async () => {
+  const store = new FailingReleaseEventStore(new SqliteStore());
+  let modelCalls = 0;
+  const provider: ModelProvider = {
+    id: 'release-recovery-provider',
+    locality: 'local',
+    async chat() {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        throw notDispatched('waiting_for_device', 'Paused before dispatch', 503);
+      }
+      if (modelCalls === 2) {
+        return {
+          message: {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'publish-1', name: 'publish', arguments: {} }],
+          },
+          usage: { inputTokens: 2, outputTokens: 1 },
+        };
+      }
+      return { message: { role: 'assistant', content: 'complete' }, usage: { inputTokens: 2, outputTokens: 1 } };
+    },
+  };
+  let executions = 0;
+  const tool: ToolDefinition = {
+    name: 'publish',
+    description: 'Publish',
+    inputSchema: { type: 'object' },
+    requiredCapabilities: [],
+    sideEffect: 'external',
+    async execute() {
+      executions += 1;
+      return { content: 'published' };
+    },
+  };
+  const runtime = new AgentRuntime({
+    providers: [provider],
+    models: [{ id: 'local-model', providerId: provider.id, locality: 'local', capabilities: ['tools'] }],
+    tools: [tool],
+  });
+  let tasks = new TaskService(store, createTaskRunner(store, runtime, [tool]), {
+    reauthorize: async (current) => current,
+  });
+  try {
+    const thread = await store.create<Conversation>('conversation', principal.id, conversation);
+    const queued = await tasks.enqueue(principal, thread.id, 'publish after reconnect');
+    await tasks.drain();
+    let task = (await store.get<Task>('task', queued.id, principal.id))!;
+    assert.equal(task.data.state, 'failed');
+    assert.equal((task.data.usage as { calls?: number } | undefined)?.calls, 0);
+    assert.equal((await tasks.events(principal.id, queued.id)).some((event) => event.data.type === 'model_call_released'), false);
+    task = await store.put('task', task.id, task.ownerId, {
+      ...task.data,
+      state: 'waiting_for_device',
+      error: 'Restart after interrupted release persistence',
+      nextAttemptAt: new Date(0).toISOString(),
+    }, task.revision);
+
+    await tasks.close();
+    tasks = new TaskService(store, createTaskRunner(store, runtime, [tool]), {
+      reauthorize: async (current) => current,
+    });
+    await tasks.drain();
+    task = (await store.get<Task>('task', queued.id, principal.id))!;
+    assert.equal(task.data.state, 'waiting_for_approval', task.data.error);
+    assert.deepEqual(
+      (await tasks.events(principal.id, queued.id))
+        .filter((event) => ['model_call', 'model_call_released'].includes(event.data.type))
+        .map((event) => event.data.type),
+      ['model_call', 'model_call_released', 'model_call'],
+    );
+
+    await tasks.control(principal.id, queued.id, 'resume', [task.data.pendingActions[0]!.hash], principal);
+    await tasks.drain();
+    task = (await store.get<Task>('task', queued.id, principal.id))!;
+    assert.equal(task.data.state, 'completed', task.data.error);
+    assert.equal(task.data.result, 'complete');
+    assert.equal(executions, 1);
+  } finally {
+    await tasks.close();
+    await store.close();
+  }
+});
+
 test('a not-dispatched retry keeps a fresh approval and completes once after rebuilding the runtime', async () => {
   const store = new SqliteStore();
   let modelCalls = 0;

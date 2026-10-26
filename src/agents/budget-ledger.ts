@@ -225,7 +225,64 @@ export class BudgetLedger {
     if (!Number.isSafeInteger(call) || call < 1) {
       throw new DomainError('invalid_usage', 'Model call number must be a positive safe integer');
     }
-    return this.reserve(ownerId, id, `${taskId}:model:${call}`, { calls: 1, tokens: tokenReservation });
+    const reservationId = `${taskId}:model:${call}`;
+    const requested = { calls: 1, tokens: tokenReservation };
+    validateUnits(requested);
+    return this.change(ownerId, id, (record) => {
+      const previous = record.reservations[reservationId];
+      if (previous && previous.state !== 'released' && !sameUnits(previous.requested, requested)) {
+        throw new DomainError('idempotency_conflict', 'Reservation ID belongs to different units', 409);
+      }
+      if (previous && previous.state !== 'released') return record;
+      const held = reserved(record);
+      if (record.used.calls + held.calls + requested.calls > record.limits.maxCalls
+        || record.used.tokens + held.tokens + requested.tokens > record.limits.maxTokens) {
+        throw delegationExceeded(record, held, requested, 'budget_exceeded');
+      }
+      return {
+        ...record,
+        reservations: {
+          ...record.reservations,
+          [reservationId]: { requested, state: 'reserved' },
+        },
+      };
+    });
+  }
+
+  public async releaseModelCall(
+    ownerId: string,
+    id: string,
+    taskId: string,
+    call: number,
+  ): Promise<BudgetSnapshot> {
+    if (!Number.isSafeInteger(call) || call < 1) {
+      throw new DomainError('invalid_usage', 'Model call number must be a positive safe integer');
+    }
+    const reservationId = `${taskId}:model:${call}`;
+    return this.change(ownerId, id, (record) => {
+      const previous = record.reservations[reservationId];
+      if (!previous) return record;
+      if (previous.state === 'charged') {
+        throw new DomainError('reservation_charged', 'Charged usage cannot be released', 409);
+      }
+      const cursors = record.runtimeUsage ?? {};
+      const cursor = cursors[taskId] ?? zero();
+      if (cursor.calls !== call && cursor.calls !== call - 1) {
+        throw new DomainError('invalid_usage_sequence', 'Released model call does not match runtime usage', 409);
+      }
+      const runtimeUsage = cursor.calls === call
+        ? { ...cursors, [taskId]: { calls: call - 1, tokens: cursor.tokens } }
+        : cursors;
+      if (previous.state === 'released' && runtimeUsage === cursors) return record;
+      return {
+        ...record,
+        reservations: {
+          ...record.reservations,
+          [reservationId]: { ...previous, state: 'released' },
+        },
+        runtimeUsage,
+      };
+    });
   }
 
   public async chargeModelUsage(
@@ -381,6 +438,25 @@ export class BudgetLedger {
           || record.used.tokens + held.tokens + requestedTokens > record.limits.maxTokens;
         reservation = {
           requested: { calls: 1, tokens: requestedTokens },
+          state: 'reserved',
+          ...(violation ? { violation: 'budget_violation' as const } : {}),
+        };
+        next = {
+          ...record,
+          reservations: { ...record.reservations, [reservationId]: reservation },
+        };
+      } else if (reservation.state === 'released') {
+        const taskHeld = taskReservedTokens(record, taskId);
+        const requestedTokens = accountedTokens - usage.totalTokens - taskHeld;
+        if (!Number.isSafeInteger(requestedTokens) || requestedTokens < 1) {
+          throw new DomainError('invalid_usage_sequence', 'Released model reservation does not match runtime usage', 409);
+        }
+        const requested = { calls: 1, tokens: requestedTokens };
+        const held = reserved(record);
+        violation = record.used.calls + held.calls + requested.calls > record.limits.maxCalls
+          || record.used.tokens + held.tokens + requested.tokens > record.limits.maxTokens;
+        reservation = {
+          requested,
           state: 'reserved',
           ...(violation ? { violation: 'budget_violation' as const } : {}),
         };

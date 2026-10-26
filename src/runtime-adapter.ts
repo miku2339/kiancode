@@ -163,13 +163,42 @@ async function recoveredRunUsage(
   ownerId: string,
   taskId: string,
   stored: RunUsage | undefined,
+  onEvent?: (event: { type: string; [key: string]: unknown }) => Promise<void>,
 ): Promise<RunUsage | undefined> {
-  if (!stored?.calls || stored.accountedTokens !== undefined) return stored;
   const events = (await store.scan<TaskEvent>('event', ownerId))
     .filter((event) => event.data.taskId === taskId
-      && (event.data.type === 'model_call' || event.data.type === 'usage'))
+      && ['model_call', 'model_call_released', 'usage'].includes(event.data.type))
     .sort((left, right) => left.data.sequence - right.data.sequence);
   if (!events.length) return stored;
+  const last = events.at(-1);
+  if (stored && onEvent && last?.data.type === 'model_call') {
+    const payload = last.data.payload as {
+      taskId?: string;
+      modelId?: string;
+      call?: number;
+      reservedTokens?: number;
+      usage?: RunUsage;
+    };
+    const eventAccounted = payload.usage?.accountedTokens ?? payload.usage?.totalTokens;
+    const storedAccounted = stored.accountedTokens ?? stored.totalTokens;
+    if (payload.taskId === taskId && typeof payload.modelId === 'string'
+      && Number.isSafeInteger(payload.call) && payload.call === stored.calls + 1
+      && Number.isSafeInteger(payload.reservedTokens) && payload.reservedTokens! > 0
+      && payload.usage?.calls === payload.call
+      && payload.usage.totalTokens === stored.totalTokens
+      && eventAccounted === storedAccounted + payload.reservedTokens!) {
+      await onEvent({
+        type: 'model_call_released',
+        taskId,
+        modelId: payload.modelId,
+        call: payload.call,
+        reservedTokens: payload.reservedTokens,
+        usage: { ...stored },
+      });
+      return stored;
+    }
+  }
+  if (!stored?.calls || stored.accountedTokens !== undefined) return stored;
 
   let usage: RunUsage = { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   const reservations = new Map<number, number>();
@@ -218,6 +247,22 @@ async function recoveredRunUsage(
         throw new DomainError('invalid_usage_sequence', 'Stored model call accounting is inconsistent', 409);
       }
       reservations.set(call!, reservedTokens!);
+    } else if (event.data.type === 'model_call_released') {
+      const call = payload.call;
+      const reservedTokens = payload.reservedTokens;
+      if (!payload.usage || !Number.isSafeInteger(call) || call !== usage.calls
+        || payload.usage.calls !== call! - 1 || payload.usage.totalTokens !== usage.totalTokens
+        || reservations.get(call!) !== reservedTokens) {
+        throw new DomainError('invalid_usage_sequence', 'Stored model call release event is invalid', 409);
+      }
+      const nextAccounted = accounted() - reservedTokens!;
+      if (nextAccounted < payload.usage.totalTokens
+        || (payload.usage.accountedTokens ?? payload.usage.totalTokens) !== nextAccounted) {
+        throw new DomainError('invalid_usage_sequence', 'Stored model call release accounting is inconsistent', 409);
+      }
+      usage = { ...payload.usage };
+      setAccounted(nextAccounted);
+      reservations.delete(call!);
     } else if (payload.usage) {
       applyActual(payload.usage);
       if (payload.usage.accountedTokens !== undefined
@@ -449,10 +494,16 @@ export function createTaskRunner(
       await coordinator.verifyIntegration(task.ownerId, verificationPlanId);
       integrationVerified = true;
     };
-    const priorUsage = await recoveredRunUsage(store, task.ownerId, task.id, task.data.usage as RunUsage | undefined);
+    const priorUsage = await recoveredRunUsage(
+      store,
+      task.ownerId,
+      task.id,
+      task.data.usage as RunUsage | undefined,
+      onEvent,
+    );
     if (coordinator && task.data.orchestration) {
       const prior = priorUsage;
-      if (prior?.calls) {
+      if (prior) {
         await coordinator.reconcileTaskBudget(
           task.ownerId,
           task.data.orchestration.budgetId,
@@ -495,6 +546,16 @@ export function createTaskRunner(
               task.data.orchestration.budgetId,
               task.id,
               event.usage,
+            );
+            return;
+          }
+          if (event.type === 'model_call_released') {
+            await onEvent(event);
+            await coordinator.budgets.releaseModelCall(
+              task.ownerId,
+              task.data.orchestration.budgetId,
+              task.id,
+              event.call,
             );
             return;
           }

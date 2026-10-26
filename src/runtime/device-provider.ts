@@ -1,4 +1,4 @@
-import { DomainError, type ToolContext, type ToolDefinition, type ToolResult } from '../contracts.js';
+import { DomainError, type ToolContext, type ToolDefinition, type ToolResult, type Workspace } from '../contracts.js';
 import { OllamaProvider, OpenAICompatibleProvider } from './providers.js';
 import type {
   ChatMessage,
@@ -13,6 +13,10 @@ import type { EphemeralAttachmentPayload, EphemeralPayloadStore } from './visual
 const LOCAL_INFERENCE_TIMEOUT_MS = 120_000;
 
 export interface DeviceModelDispatcher {
+  assertModelAvailable?(
+    deviceId: string,
+    context: ToolContext,
+  ): Promise<void>;
   executeModel(
     deviceId: string,
     input: Record<string, unknown>,
@@ -59,6 +63,20 @@ export class DeviceModelProvider implements ModelProvider {
     this.id = options.id;
     this.dispatcher = options.dispatcher;
     this.ephemeralPayloads = options.ephemeralPayloads;
+  }
+
+  public async isAvailable(
+    model: ModelConfig,
+    _workspace: Workspace | undefined,
+    signal: AbortSignal,
+    context?: NonNullable<ChatRequest['context']>,
+  ): Promise<boolean> {
+    if (!model.deviceId || !context) return false;
+    await this.dispatcher.assertModelAvailable?.(model.deviceId, {
+      ...context,
+      signal,
+    });
+    return true;
   }
 
   public async chat(request: ChatRequest): Promise<ChatResponse> {

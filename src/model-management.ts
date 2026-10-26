@@ -1,7 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { requireOwner, requireScope } from './auth.js';
-import { DomainError, type Principal, type ToolDefinition } from './contracts.js';
+import { DomainError, isNotDispatched, notDispatched, type Principal, type ToolDefinition } from './contracts.js';
 import type { Store } from './storage/store.js';
 import { AgentRuntime, estimateTokens, type ChatRequest, type ChatResponse, type ModelConfig, type ModelProvider } from './runtime/index.js';
 
@@ -183,16 +183,21 @@ export class ModelManagement {
     const resolved = await this.provider(actor.id, row.data.providerId);
     if (!resolved.settings.enabled) throw new DomainError('provider_disabled', 'Provider is disabled', 409);
     const provider = this.options.createProvider({ ...resolved.settings, id: resolved.id, ...(resolved.apiKey ? { apiKey: resolved.apiKey } : {}) });
-    const limitedProvider: ModelProvider = { id: provider.id, locality: provider.locality, chat: (request) => this.runtimeLimits.chat(provider, request) };
+    const meteredProvider: ModelProvider = {
+      id: provider.id,
+      locality: provider.locality,
+      ...(provider.isAvailable ? { isAvailable: provider.isAvailable.bind(provider) } : {}),
+      chat: (request) => this.meteredChat(actor.id, provider, request, row.data.dailyTokenLimit),
+    };
     const model: ModelConfig = { id, model: row.data.model, deviceId: row.data.deviceId, providerId: resolved.id, locality: resolved.settings.locality, capabilities: [] };
     const verified = ['text'];
     const signal = AbortSignal.timeout(120_000);
     const taskId = `model-probe:${randomUUID()}`;
     const probe = await this.options.store.create('model_probe', actor.id, { modelId: id, deviceId: row.data.deviceId, state: 'running', expiresAt: new Date(this.now() + 120_000).toISOString() }, taskId);
-    const request = (messages: ChatRequest['messages'], tools: ToolDefinition[] = []) => this.meteredChat(actor.id, limitedProvider, { model, messages, tools, signal, maxOutputTokens: 4096, context: { principal: actor, taskId } }, row.data.dailyTokenLimit);
+    const request = (messages: ChatRequest['messages'], tools: ToolDefinition[] = []) => this.runtimeLimits.chat(meteredProvider, { model, messages, tools, signal, maxOutputTokens: 4096, context: { principal: actor, taskId } });
     try {
       let streamed = false;
-      const text = await this.meteredChat(actor.id, limitedProvider, { model, messages: [{ role: 'user', content: 'Reply exactly MODEL_READY.' }], tools: [], signal, maxOutputTokens: 4096, context: { principal: actor, taskId }, onToken: () => { streamed = true; } }, row.data.dailyTokenLimit);
+      const text = await this.runtimeLimits.chat(meteredProvider, { model, messages: [{ role: 'user', content: 'Reply exactly MODEL_READY.' }], tools: [], signal, maxOutputTokens: 4096, context: { principal: actor, taskId }, onToken: () => { streamed = true; } });
       if (streamed) verified.push('streaming');
       if (text.message.content.trim() !== 'MODEL_READY') throw new DomainError('model_probe_failed', 'The model did not complete the text probe', 422);
       if (capabilities.includes('tools')) {
@@ -272,6 +277,20 @@ export class ModelManagement {
   }
 
   private async meteredChat(ownerId: string, provider: ModelProvider, request: ChatRequest, limit?: number): Promise<ChatResponse> {
+    if (provider.isAvailable && !(await provider.isAvailable(
+      request.model,
+      request.context?.workspace,
+      request.signal,
+      request.context,
+    ))) {
+      throw notDispatched(
+        request.model.locality === 'local' ? 'waiting_for_device' : 'model_unavailable',
+        request.model.locality === 'local'
+          ? `Local model device ${request.model.deviceId ?? request.context?.workspace?.deviceId ?? 'unknown'} is unavailable.`
+          : `Model ${request.model.id} is unavailable.`,
+        503,
+      );
+    }
     const day = new Date(this.now()).toISOString().slice(0, 10);
     const modelId = request.model.id;
     const reserved = estimateTokens(JSON.stringify(request.messages))
@@ -284,7 +303,15 @@ export class ModelManagement {
     let response: ChatResponse;
     try { response = await provider.chat(request); }
     catch (error) {
-      await this.changeUsage(ownerId, modelId, day, (row) => ({ ...row, failedCalls: row.failedCalls + 1 })).catch(() => undefined);
+      if (isNotDispatched(error)) {
+        await this.changeUsage(ownerId, modelId, day, (row) => ({
+          ...row,
+          reservedTokens: Math.max(0, row.reservedTokens - reserved),
+          calls: Math.max(0, row.calls - 1),
+        }));
+      } else {
+        await this.changeUsage(ownerId, modelId, day, (row) => ({ ...row, failedCalls: row.failedCalls + 1 })).catch(() => undefined);
+      }
       throw error;
     }
     const inputTokens = response.usage?.inputTokens;

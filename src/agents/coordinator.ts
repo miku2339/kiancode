@@ -804,7 +804,7 @@ export class AgentCoordinator {
   ): Promise<void> {
     const validateUsage = (usage: { calls: number; totalTokens: number; accountedTokens?: number }): number => {
       const accounted = usage.accountedTokens ?? usage.totalTokens;
-      if (!Number.isSafeInteger(usage.calls) || usage.calls < 1
+      if (!Number.isSafeInteger(usage.calls) || usage.calls < 0
         || !Number.isSafeInteger(usage.totalTokens) || usage.totalTokens < 0
         || !Number.isSafeInteger(accounted) || accounted < usage.totalTokens) {
         throw new DomainError('invalid_usage_sequence', 'Runtime usage snapshot is invalid', 409);
@@ -817,6 +817,7 @@ export class AgentCoordinator {
     const modelEvents = events.filter((event) => event.data.type === 'model_call');
     if (modelEvents.length === 0) {
       validateUsage(finalUsage);
+      if (finalUsage.calls === 0) return;
       if ((finalUsage.accountedTokens ?? finalUsage.totalTokens) === finalUsage.totalTokens) {
         await this.budgets.adoptRuntimeUsage(ownerId, budgetId, taskId, finalUsage);
       } else {
@@ -830,7 +831,24 @@ export class AgentCoordinator {
       totalTokens: 0,
     };
     let lastReservedTokens = 0;
-    for (const event of events) {
+    const lastModelCallIndex = new Map<number, number>();
+    const pendingModelCallIndex = new Map<number, number>();
+    const releaseIndexByModelCall = new Map<number, number>();
+    for (const [index, event] of events.entries()) {
+      const call = (event.data.payload as { call?: number }).call;
+      if (!Number.isSafeInteger(call)) continue;
+      if (event.data.type === 'model_call') {
+        lastModelCallIndex.set(call!, index);
+        pendingModelCallIndex.set(call!, index);
+      } else if (event.data.type === 'model_call_released') {
+        const modelCallIndex = pendingModelCallIndex.get(call!);
+        if (modelCallIndex !== undefined) {
+          releaseIndexByModelCall.set(modelCallIndex, index);
+          pendingModelCallIndex.delete(call!);
+        }
+      }
+    }
+    for (const [index, event] of events.entries()) {
       const payload = event.data.payload as {
         call?: number;
         reservedTokens?: number;
@@ -892,7 +910,25 @@ export class AgentCoordinator {
           };
           lastReservedTokens = payload.reservedTokens!;
         }
-        await this.budgets.reconcileModelUsage(ownerId, budgetId, taskId, replayed);
+        const releaseIndex = releaseIndexByModelCall.get(index);
+        if (releaseIndex === undefined || (lastModelCallIndex.get(payload.call!) ?? -1) <= releaseIndex) {
+          await this.budgets.reconcileModelUsage(ownerId, budgetId, taskId, replayed);
+        }
+      } else if (event.data.type === 'model_call_released') {
+        const currentAccounted = replayed.accountedTokens ?? replayed.totalTokens;
+        if (!payload.usage || payload.call !== replayed.calls
+          || payload.usage.calls !== replayed.calls - 1
+          || payload.usage.totalTokens !== replayed.totalTokens
+          || !Number.isSafeInteger(payload.reservedTokens) || payload.reservedTokens! < 1
+          || (payload.usage.accountedTokens ?? payload.usage.totalTokens)
+            !== currentAccounted - payload.reservedTokens!) {
+          throw new DomainError('invalid_usage_sequence', 'Model call release event is inconsistent', 409);
+        }
+        if ((lastModelCallIndex.get(payload.call!) ?? -1) < index) {
+          await this.budgets.releaseModelCall(ownerId, budgetId, taskId, payload.call!);
+        }
+        replayed = payload.usage;
+        lastReservedTokens = 0;
       } else if (event.data.type === 'usage' && payload.usage) {
         const totalDelta = payload.usage.totalTokens - replayed.totalTokens;
         const accounted = payload.usage.accountedTokens ?? (totalDelta === 0
@@ -910,6 +946,19 @@ export class AgentCoordinator {
         replayed = normalized;
         await this.budgets.reconcileModelUsage(ownerId, budgetId, taskId, replayed);
       }
+    }
+    if (finalUsage.calls === replayed.calls - 1) {
+      const replayedAccounted = replayed.accountedTokens ?? replayed.totalTokens;
+      const finalAccounted = finalUsage.accountedTokens ?? finalUsage.totalTokens;
+      if (finalUsage.totalTokens !== replayed.totalTokens || lastReservedTokens < 1
+        || finalAccounted !== replayedAccounted - lastReservedTokens) {
+        throw new DomainError('invalid_usage_sequence', 'Final runtime usage does not match a released model call', 409);
+      }
+      await this.budgets.releaseModelCall(ownerId, budgetId, taskId, replayed.calls);
+      replayed = finalUsage;
+      lastReservedTokens = 0;
+    } else if (finalUsage.calls < replayed.calls) {
+      throw new DomainError('invalid_usage_sequence', 'Final runtime usage cannot release multiple model calls', 409);
     }
     if (finalUsage.calls > 0) {
       const totalDelta = finalUsage.totalTokens - replayed.totalTokens;

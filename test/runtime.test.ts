@@ -1040,6 +1040,56 @@ test('serializes calls to local providers across owners', async () => {
   assert.equal(maximum, 1);
 });
 
+test('waits for the local provider slot before reserving a newly unavailable call', async () => {
+  let available = true;
+  let chats = 0;
+  let releaseFirst: (() => void) | undefined;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const provider: ModelProvider = {
+    id: 'queued-local',
+    locality: 'local',
+    async isAvailable() {
+      return available;
+    },
+    async chat() {
+      chats += 1;
+      if (chats === 1) await firstGate;
+      return { message: { role: 'assistant', content: 'done' }, usage: { inputTokens: 1, outputTokens: 1 } };
+    },
+  };
+  const runtime = new AgentRuntime({
+    providers: [provider],
+    models: [{ id: 'local-model', providerId: provider.id, locality: 'local', capabilities: [] }],
+  });
+  const first = runtime.run({
+    principal,
+    taskId: 'slot-first',
+    prompt: 'run',
+    mode: 'ask',
+    modelPolicy: 'local',
+  });
+  while (chats === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+  const secondEvents: RuntimeEvent[] = [];
+  const second = runtime.run({
+    principal: { ...principal, id: 'owner-2' },
+    taskId: 'slot-second',
+    prompt: 'run',
+    mode: 'ask',
+    modelPolicy: 'local',
+    onEvent: (event) => { secondEvents.push(event); },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(secondEvents.some((event) => event.type === 'model_call'), false);
+
+  available = false;
+  releaseFirst?.();
+  await first;
+  await assert.rejects(second, (error: unknown) => error instanceof DomainError
+    && error.code === 'waiting_for_device');
+  assert.equal(chats, 1);
+  assert.equal(secondEvents.some((event) => event.type === 'model_call'), false);
+});
+
 test('returns waiting_for_device when the selected local model is offline', async () => {
   let cloudCalls = 0;
   const local: ModelProvider = {
@@ -1084,6 +1134,57 @@ test('returns waiting_for_device when the selected local model is offline', asyn
       && error.code === 'waiting_for_device',
   );
   assert.equal(cloudCalls, 0);
+});
+
+test('rechecks local availability before each model call without reserving a blocked follow-up', async () => {
+  let available = true;
+  let chats = 0;
+  const events: RuntimeEvent[] = [];
+  const local: ModelProvider = {
+    id: 'pausing-local',
+    locality: 'local',
+    async isAvailable() {
+      return available;
+    },
+    async chat() {
+      chats += 1;
+      available = false;
+      return {
+        message: {
+          role: 'assistant',
+          content: '',
+          toolCalls: [{ id: 'read-1', name: 'read_once', arguments: {} }],
+        },
+        usage: { inputTokens: 2, outputTokens: 1 },
+      };
+    },
+  };
+  const tool: ToolDefinition = {
+    name: 'read_once',
+    description: 'Read once',
+    inputSchema: { type: 'object' },
+    requiredCapabilities: [],
+    sideEffect: 'read',
+    async execute() {
+      return { content: 'read' };
+    },
+  };
+  const runtime = new AgentRuntime({
+    providers: [local],
+    models: [{ id: 'local-model', providerId: local.id, locality: 'local', capabilities: ['tools'] }],
+    tools: [tool],
+  });
+
+  await assert.rejects(runtime.run({
+    principal,
+    taskId: 'pause-between-calls',
+    prompt: 'read then answer',
+    mode: 'act',
+    modelPolicy: 'local',
+    onEvent: (event) => { events.push(event); },
+  }), (error: unknown) => error instanceof DomainError && error.code === 'waiting_for_device');
+  assert.equal(chats, 1);
+  assert.equal(events.filter((event) => event.type === 'model_call').length, 1);
 });
 
 test('does not expose tools outside the principal scopes', async () => {

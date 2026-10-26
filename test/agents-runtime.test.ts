@@ -6,9 +6,66 @@ import { AgentRuntime, type ModelProvider } from '../src/runtime/index.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
 import { TaskService } from '../src/tasks.js';
 import type { Conversation, Task, TaskEvent } from '../src/domain.js';
-import { DomainError } from '../src/contracts.js';
+import { DomainError, notDispatched } from '../src/contracts.js';
 
 const principal = { id: 'owner', level: 1 as const, scopes: ['*'], expiresAt: new Date(Date.now() + 3_600_000).toISOString() };
+
+test('an undispatched child model call releases shared budget before its durable retry', async () => {
+  const store = new SqliteStore();
+  let now = Date.now();
+  let calls = 0;
+  const provider: ModelProvider = {
+    id: 'local-model',
+    locality: 'local',
+    async isAvailable() {
+      return true;
+    },
+    async chat() {
+      calls += 1;
+      if (calls === 1) throw notDispatched('waiting_for_device', 'Device paused before dispatch', 503);
+      return { message: { role: 'assistant', content: 'retried' }, usage: { inputTokens: 3, outputTokens: 2 } };
+    },
+  };
+  const runtime = new AgentRuntime({
+    providers: [provider],
+    models: [{ id: 'local-model', providerId: provider.id, locality: 'local', capabilities: [] }],
+  });
+  const coordinator = new AgentCoordinator(store);
+  const tasks = new TaskService(store, createTaskRunner(store, runtime, [], undefined, coordinator), {
+    now: () => now,
+  });
+  try {
+    const conversation = await store.create<Conversation>('conversation', principal.id, {
+      title: 'Release child budget', scope: 'private', modelPolicy: 'local', strategy: 'single', mode: 'ask', archived: false,
+    });
+    const parent = await tasks.enqueue(principal, conversation.id, 'Coordinate');
+    const plan = await coordinator.prepare(principal.id, parent.id, {
+      key: 'release-child-call',
+      children: [{ key: 'worker', prompt: 'Run locally' }],
+      budget: { maxCalls: 1, maxTokens: 10_000 },
+    });
+    const childId = plan.data.childIds[0]!;
+
+    await tasks.drain();
+    const waiting = await store.get<Task>('task', childId, principal.id);
+    assert.equal(waiting?.data.state, 'waiting_for_device');
+    assert.equal((waiting?.data.usage as { calls?: number } | undefined)?.calls, 0);
+    assert.deepEqual((await coordinator.budgets.get(principal.id, plan.data.budgetId)).reserved, {
+      calls: 0,
+      tokens: 0,
+    });
+
+    now += 10_001;
+    await tasks.drain();
+    assert.equal((await store.get<Task>('task', childId, principal.id))?.data.state, 'completed');
+    const budget = await coordinator.budgets.get(principal.id, plan.data.budgetId);
+    assert.deepEqual(budget.used, { calls: 1, tokens: 5 });
+    assert.deepEqual(budget.reserved, { calls: 0, tokens: 0 });
+  } finally {
+    await tasks.close();
+    await store.close();
+  }
+});
 
 test('agent.delegate creates one durable restricted child and resumes the parent from its checkpoint', async () => {
   const store = new SqliteStore();

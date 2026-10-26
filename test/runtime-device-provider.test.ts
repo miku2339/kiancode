@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { Principal, ToolContext, ToolResult } from '../src/contracts.js';
+import { DomainError, type Principal, type ToolContext, type ToolResult } from '../src/contracts.js';
 import { DeviceService } from '../src/devices.js';
 import {
   AgentRuntime,
@@ -54,6 +54,56 @@ test('DeviceModelProvider dispatches model generation without workspace access',
   assert.equal(received?.context.taskId, 'device-task');
   assert.equal(received?.context.workspace, undefined);
   assert.equal(received?.input.modelId, 'qwen-local');
+});
+
+test('device model readiness is owner-aware and rejects known unavailable devices before dispatch', async (t) => {
+  let now = Date.now();
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  const devices = new DeviceService(store, () => now);
+  const device = await store.create('device', principal.id, {
+    name: 'Mac', capabilities: ['model:generate'], reportedCapabilities: ['model:generate'],
+    workspaceIds: [], lastSeen: new Date(now).toISOString(), paused: true,
+  }, 'readiness-device');
+  const provider = new DeviceModelProvider({ id: 'device-models', dispatcher: devices });
+  const runtime = new AgentRuntime({
+    providers: [provider],
+    models: [{
+      id: 'local', providerId: provider.id, locality: 'local', deviceId: device.id, capabilities: [],
+    }],
+  });
+  const assertBlocked = async (actor: Principal, expectedCode: string) => {
+    const events: string[] = [];
+    await assert.rejects(runtime.run({
+      principal: actor,
+      taskId: `blocked-${expectedCode}`,
+      prompt: 'answer',
+      mode: 'ask',
+      modelId: 'local',
+      onEvent: (event) => { events.push(event.type); },
+    }), (error: unknown) => error instanceof DomainError && error.code === expectedCode);
+    assert.equal(events.includes('model_call'), false);
+    assert.equal((await store.scan('device_job', principal.id)).length, 0);
+  };
+
+  await assertBlocked(principal, 'waiting_for_device');
+  let current = (await store.get<typeof device.data>('device', device.id, principal.id))!;
+  await store.put('device', device.id, principal.id, {
+    ...current.data, paused: false, reportedCapabilities: [],
+  }, current.revision);
+  await assertBlocked(principal, 'waiting_for_device');
+  current = (await store.get<typeof device.data>('device', device.id, principal.id))!;
+  await store.put('device', device.id, principal.id, {
+    ...current.data, reportedCapabilities: ['model:generate'],
+  }, current.revision);
+  now += 45_001;
+  await assertBlocked(principal, 'waiting_for_device');
+  await assertBlocked({ ...principal, id: 'other-owner' }, 'device_revoked');
+  current = (await store.get<typeof device.data>('device', device.id, principal.id))!;
+  await store.put('device', device.id, principal.id, {
+    ...current.data, revokedAt: new Date(now).toISOString(),
+  }, current.revision);
+  await assertBlocked(principal, 'device_revoked');
 });
 
 test('DeviceModelProvider keeps a valid answer when usage is missing or partial', async () => {

@@ -6,9 +6,11 @@ import { SqliteStore } from '../src/storage/sqlite.js';
 import type { Principal } from '../src/contracts.js';
 import { DomainError } from '../src/contracts.js';
 import { registerModelManagementRoutes } from '../src/http/model-management.js';
-import type { ChatRequest } from '../src/runtime/index.js';
+import type { ChatRequest, RunUsage } from '../src/runtime/index.js';
 import { DeviceModelProvider } from '../src/runtime/index.js';
 import { DeviceService } from '../src/devices.js';
+import { TaskService } from '../src/tasks.js';
+import type { Conversation, Task } from '../src/domain.js';
 
 const owner: Principal = { id: 'one', level: 1, scopes: ['*'] };
 const other: Principal = { ...owner, id: 'two' };
@@ -171,6 +173,206 @@ test('device model probes have bounded execution records and flow through author
   assert.deepEqual((await pending).capabilities, ['text', 'streaming']);
   assert.equal((await store.scan<{ state: string }>('model_probe'))[0]?.data.state, 'finished');
   assert.equal((await store.scan('task')).length, 0);
+});
+
+test('paused device probes do not consume daily quota or create model jobs', async (t) => {
+  const { store, options } = setup(); t.after(() => store.close());
+  const devices = new DeviceService(store);
+  const pairing = await devices.createPairing(owner, ['model:generate'], []);
+  const paired = await devices.pair({ code: pairing.code, name: 'Paused Mac', capabilities: ['model:generate'] });
+  const service = new ModelManagement({
+    ...options,
+    createProvider: ({ id }) => new DeviceModelProvider({ id, dispatcher: devices }),
+  });
+  await service.saveProvider(owner, 'device', { name: 'Mac', type: 'device', locality: 'local', enabled: true }, 0);
+  await service.saveModel(owner, 'local', { ...modelSettings, providerId: 'device', deviceId: paired.deviceId }, 0);
+  await devices.control(owner.id, paired.deviceId, 'pause');
+
+  await assert.rejects(service.probe(owner, 'local'), code('waiting_for_device'));
+  assert.deepEqual(await service.usage(owner.id), []);
+  assert.equal((await store.scan('device_job', owner.id)).length, 0);
+});
+
+test('a queued local probe checks readiness before reserving daily quota', async (t) => {
+  let otherAvailable = true;
+  let ownerStarted = false;
+  let releaseOwner: (() => void) | undefined;
+  const ownerGate = new Promise<void>((resolve) => { releaseOwner = resolve; });
+  const localSettings: ProviderSettings = {
+    name: 'Local', type: 'ollama', locality: 'local', baseUrl: 'http://localhost:11434', enabled: true,
+  };
+  const { store, service } = setup({
+    createProvider: (provider) => ({
+      id: provider.id,
+      locality: provider.locality,
+      async isAvailable(_model, _workspace, _signal, context) {
+        return context?.principal.id === owner.id || otherAvailable;
+      },
+      async chat(request) {
+        if (request.context?.principal.id === owner.id) {
+          ownerStarted = true;
+          await ownerGate;
+        }
+        return verifiedResponse(request);
+      },
+    }),
+  });
+  t.after(() => store.close());
+  for (const actor of [owner, other]) {
+    await service.saveProvider(actor, 'local', localSettings, 0);
+    await service.saveModel(actor, 'model', { ...modelSettings, providerId: 'local' }, 0);
+  }
+
+  const first = service.probe(owner, 'model');
+  while (!ownerStarted) await new Promise<void>((resolve) => setImmediate(resolve));
+  const second = service.probe(other, 'model');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(await service.usage(other.id), []);
+
+  otherAvailable = false;
+  releaseOwner?.();
+  await first;
+  await assert.rejects(second, code('waiting_for_device'));
+  assert.deepEqual(await service.usage(other.id), []);
+});
+
+test('repeated device waits across runtime restarts preserve task and daily budgets until the device resumes', async (t) => {
+  let now = Date.now();
+  const { store, options } = setup({ now: () => now }); t.after(() => store.close());
+  const devices = new DeviceService(store, () => now);
+  const pairing = await devices.createPairing(owner, ['model:generate'], []);
+  const paired = await devices.pair({ code: pairing.code, name: 'Restarting Mac', capabilities: ['model:generate'] });
+  const managedOptions: ModelManagementOptions = {
+    ...options,
+    createProvider: ({ id }) => new DeviceModelProvider({ id, dispatcher: devices }),
+  };
+  const service = new ModelManagement(managedOptions);
+  await service.saveProvider(owner, 'device', { name: 'Mac', type: 'device', locality: 'local', enabled: true }, 0);
+  await service.saveModel(owner, 'local', { ...modelSettings, providerId: 'device', deviceId: paired.deviceId }, 0);
+  const probing = service.probe(owner, 'local');
+  let authenticated = await devices.authenticate(`Bearer ${paired.token}`, paired.deviceId);
+  let jobs = (await devices.poll(authenticated)).jobs;
+  for (let attempt = 0; jobs.length === 0 && attempt < 50; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    jobs = (await devices.poll(authenticated)).jobs;
+  }
+  assert.equal(jobs.length, 1);
+  await devices.submit(authenticated, jobs[0]!.id, {
+    status: 'confirmed', result: { content: JSON.stringify(reply('MODEL_READY')) },
+  });
+  await probing;
+  await service.saveModel(owner, 'local', {
+    ...modelSettings, providerId: 'device', deviceId: paired.deviceId, enabled: true,
+  }, 2);
+  const conversation = await store.create<Conversation>('conversation', owner.id, {
+    title: 'Local model', scope: 'private', modelPolicy: 'local', strategy: 'single', mode: 'ask',
+    modelId: 'local', archived: false,
+  });
+  let pauseAfterModelCall = false;
+  const createTasks = () => new TaskService(store, async ({ task, signal, onEvent }) => {
+    const runtime = await new ModelManagement(managedOptions).runtime(owner.id);
+    const result = await runtime.run({
+      principal: task.data.principal,
+      taskId: task.id,
+      mode: 'ask',
+      prompt: task.data.prompt,
+      modelId: 'local',
+      budgets: { maxCalls: 2, maxTokens: 8_000 },
+      priorUsage: task.data.usage as RunUsage | undefined,
+      signal,
+      onEvent: async (event) => {
+        await onEvent(event);
+        if (pauseAfterModelCall && event.type === 'model_call') {
+          pauseAfterModelCall = false;
+          await devices.control(owner.id, paired.deviceId, 'pause');
+        }
+      },
+    });
+    return { text: result.content, messages: result.messages, usage: result.usage };
+  }, { now: () => now });
+  let tasks = createTasks();
+  const task = await tasks.enqueue(owner, conversation.id, 'continue when ready', 'same-task');
+  await devices.control(owner.id, paired.deviceId, 'pause');
+  const usageBeforeWaits = await service.usage(owner.id);
+  const jobsBeforeWaits = await store.scan('device_job', owner.id);
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await tasks.drain();
+    const waiting = await store.get<Task>('task', task.id, owner.id);
+    assert.equal(waiting?.data.state, 'waiting_for_device');
+    assert.equal(waiting?.data.usage, undefined);
+    assert.equal((await tasks.events(owner.id, task.id)).some((event) => event.data.type === 'model_call'), false);
+    await tasks.close();
+    now += 10_001;
+    tasks = createTasks();
+  }
+  assert.deepEqual(await service.usage(owner.id), usageBeforeWaits);
+  assert.equal((await store.scan('device_job', owner.id)).length, jobsBeforeWaits.length);
+
+  await devices.control(owner.id, paired.deviceId, 'resume');
+  authenticated = await devices.authenticate(`Bearer ${paired.token}`, paired.deviceId);
+  await devices.heartbeat(authenticated, ['model:generate']);
+  authenticated = await devices.authenticate(`Bearer ${paired.token}`, paired.deviceId);
+  const resumed = tasks.drain();
+  jobs = (await devices.poll(authenticated)).jobs;
+  for (let attempt = 0; jobs.length === 0 && attempt < 50; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    jobs = (await devices.poll(authenticated)).jobs;
+  }
+  assert.equal(jobs.length, 1);
+  await devices.submit(authenticated, jobs[0]!.id, {
+    status: 'confirmed', result: { content: JSON.stringify(reply('resumed')) },
+  });
+  await resumed;
+  const completed = await store.get<Task>('task', task.id, owner.id);
+  assert.equal(completed?.data.state, 'completed');
+  assert.equal(completed?.data.result, 'resumed');
+  assert.equal((completed?.data.usage as { calls?: number } | undefined)?.calls, 1);
+  const usageAfterResume = await service.usage(owner.id);
+  assert.equal(usageAfterResume[0]!.calls, usageBeforeWaits[0]!.calls + 1);
+  assert.equal((await store.scan('device_job', owner.id)).length, jobsBeforeWaits.length + 1);
+
+  const usageBeforeRace = await service.usage(owner.id);
+  const jobsBeforeRace = await store.scan('device_job', owner.id);
+  const raceTask = await tasks.enqueue(owner, conversation.id, 'pause after reservation', 'race-task');
+  pauseAfterModelCall = true;
+  await tasks.drain();
+  const raceWaiting = await store.get<Task>('task', raceTask.id, owner.id);
+  assert.equal(raceWaiting?.data.state, 'waiting_for_device');
+  assert.equal((raceWaiting?.data.usage as RunUsage | undefined)?.calls, 0);
+  assert.deepEqual(await service.usage(owner.id), usageBeforeRace);
+  assert.equal((await store.scan('device_job', owner.id)).length, jobsBeforeRace.length);
+  assert.deepEqual(
+    (await tasks.events(owner.id, raceTask.id))
+      .filter((event) => ['model_call', 'model_call_released'].includes(event.data.type))
+      .map((event) => event.data.type),
+    ['model_call', 'model_call_released'],
+  );
+
+  await tasks.close();
+  now += 10_001;
+  await devices.control(owner.id, paired.deviceId, 'resume');
+  authenticated = await devices.authenticate(`Bearer ${paired.token}`, paired.deviceId);
+  await devices.heartbeat(authenticated, ['model:generate']);
+  authenticated = await devices.authenticate(`Bearer ${paired.token}`, paired.deviceId);
+  tasks = createTasks();
+  const raceResumed = tasks.drain();
+  jobs = (await devices.poll(authenticated)).jobs;
+  for (let attempt = 0; jobs.length === 0 && attempt < 50; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    jobs = (await devices.poll(authenticated)).jobs;
+  }
+  assert.equal(jobs.length, 1);
+  await devices.submit(authenticated, jobs[0]!.id, {
+    status: 'confirmed', result: { content: JSON.stringify(reply('race resumed')) },
+  });
+  await raceResumed;
+  const raceCompleted = await store.get<Task>('task', raceTask.id, owner.id);
+  assert.equal(raceCompleted?.data.state, 'completed');
+  assert.equal((raceCompleted?.data.usage as RunUsage | undefined)?.calls, 1);
+  assert.equal((await service.usage(owner.id))[0]!.calls, usageBeforeRace[0]!.calls + 1);
+  assert.equal((await store.scan('device_job', owner.id)).length, jobsBeforeRace.length + 1);
+  await tasks.close();
 });
 
 test('revoked device models can be disabled without weakening device or ownership checks', async (t) => {

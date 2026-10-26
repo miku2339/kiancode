@@ -63,7 +63,12 @@ export interface ChatResponse {
 export interface ModelProvider {
   readonly id: string;
   readonly locality: ModelLocality;
-  isAvailable?(model: ModelConfig, workspace: Workspace | undefined, signal: AbortSignal): Promise<boolean>;
+  isAvailable?(
+    model: ModelConfig,
+    workspace: Workspace | undefined,
+    signal: AbortSignal,
+    context?: NonNullable<ChatRequest['context']>,
+  ): Promise<boolean>;
   probeCapabilities?(model: ModelConfig, signal: AbortSignal): Promise<string[]>;
   chat(request: ChatRequest): Promise<ChatResponse>;
 }
@@ -98,6 +103,7 @@ export interface RunBudgets {
 export type RuntimeEvent =
   | { type: 'start'; taskId: string; strategy: ExecutionStrategy }
   | { type: 'model_call'; taskId: string; modelId: string; call: number; reservedTokens?: number; usage: RunUsage }
+  | { type: 'model_call_released'; taskId: string; modelId: string; call: number; reservedTokens: number; usage: RunUsage }
   | { type: 'token'; taskId: string; content: string }
   | { type: 'tool_call'; taskId: string; toolCall: ToolCall; toolOccurrenceId?: string }
   | { type: 'approval_required'; taskId: string; toolCall: ToolCall; toolOccurrenceId?: string; actionHash?: string }

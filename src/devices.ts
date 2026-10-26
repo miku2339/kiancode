@@ -201,12 +201,19 @@ export class DeviceService {
     return { ...definition, execute: (input, context) => this.execute(definition, input, context) };
   }
 
-  async executeModel(deviceId: string, input: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+  public async assertModelAvailable(deviceId: string, context: ToolContext): Promise<void> {
     requireScope(context.principal, 'model:generate');
     const device = await this.store.get<Device>('device', deviceId, context.principal.id);
-    if (!device || device.data.revokedAt) throw new DomainError('device_revoked', 'Model device is no longer authorized', 403);
-    if (!device.data.capabilities.includes('model:generate')) throw new DomainError('forbidden', 'Local model execution is not granted', 403);
-    if (device.data.paused || !device.data.reportedCapabilities.includes('model:generate') || !device.data.lastSeen || this.now() - Date.parse(device.data.lastSeen) > 45000) throw new DomainError('waiting_for_device', 'Waiting for the authorized local model device');
+    if (!device || device.data.revokedAt) throw notDispatched('device_revoked', 'Model device is no longer authorized', 403);
+    if (!device.data.capabilities.includes('model:generate')) throw notDispatched('forbidden', 'Local model execution is not granted', 403);
+    if (device.data.paused || !device.data.reportedCapabilities.includes('model:generate')
+      || !device.data.lastSeen || this.now() - Date.parse(device.data.lastSeen) > 45000) {
+      throw notDispatched('waiting_for_device', 'Waiting for the authorized local model device', 503);
+    }
+  }
+
+  async executeModel(deviceId: string, input: Record<string, unknown>, context: ToolContext): Promise<ToolResult> {
+    await this.assertModelAvailable(deviceId, context);
     return this.dispatch({ id: randomUUID(), deviceId, principal: context.principal, taskId: context.taskId, toolName: 'model.generate', input, requiredCapabilities: ['model:generate'], expiresAt: new Date(this.now() + 300000).toISOString(), dispatchedAt: '' }, context);
   }
 

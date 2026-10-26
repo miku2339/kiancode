@@ -206,15 +206,7 @@ export class AgentRuntime {
     if (!provider) {
       throw new DomainError('provider_not_found', `Provider ${model.providerId} is not registered.`, 500);
     }
-    if (provider.isAvailable && !(await provider.isAvailable(model, input.workspace, signal))) {
-      throw new DomainError(
-        model.locality === 'local' ? 'waiting_for_device' : 'model_unavailable',
-        model.locality === 'local'
-          ? `Local model device ${model.deviceId ?? input.workspace?.deviceId ?? 'unknown'} is unavailable.`
-          : `Model ${model.id} is unavailable.`,
-        503,
-      );
-    }
+    await this.assertProviderAvailable(provider, model, input, signal);
     if (provider.probeCapabilities) {
       const probed = new Set(await provider.probeCapabilities(model, signal));
       const unsupported = [...requiredCapabilities].filter((capability) => !probed.has(capability));
@@ -258,35 +250,56 @@ export class AgentRuntime {
 
     while (true) {
       this.assertNotAborted(signal);
-      const inputReservation = messages.reduce((sum, message) => sum + estimateTokens(message.content) + (message.attachments?.length ?? 0) * 16_384, 0)
-        + estimateTokens(JSON.stringify(modelTools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))));
-      const maxOutputTokens = Math.min(
-        Math.max(1, Math.min(input.maxOutputTokens ?? 4096, 16_384)),
-        options.budget.availableTokens() - inputReservation,
-      );
-      if (maxOutputTokens < 1) {
-        throw options.budget.tokensExhausted(inputReservation + 1);
-      }
-      const reservedTokens = inputReservation + maxOutputTokens;
-      options.budget.reserveCall(reservedTokens);
-      usage = options.budget.snapshot();
-      await input.onEvent?.({ type: 'model_call', taskId: input.taskId, modelId: model.id, call: usage.calls, reservedTokens, usage: { ...usage } });
-      const request = {
-        model,
-        messages: [...messages],
-        tools: modelTools,
-        signal,
-        maxOutputTokens,
-        context: {
-          principal: input.principal,
-          ...(input.workspace ? { workspace: input.workspace } : {}),
-          taskId: input.taskId,
-        },
-        onToken: async (content: string) => input.onEvent?.({ type: 'token' as const, taskId: input.taskId, content }),
+      const invoke = async (): Promise<{ response: ChatResponse; reservedTokens: number }> => {
+        await this.assertProviderAvailable(provider, model, input, signal);
+        const inputReservation = messages.reduce((sum, message) => sum + estimateTokens(message.content) + (message.attachments?.length ?? 0) * 16_384, 0)
+          + estimateTokens(JSON.stringify(modelTools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))));
+        const maxOutputTokens = Math.min(
+          Math.max(1, Math.min(input.maxOutputTokens ?? 4096, 16_384)),
+          options.budget.availableTokens() - inputReservation,
+        );
+        if (maxOutputTokens < 1) {
+          throw options.budget.tokensExhausted(inputReservation + 1);
+        }
+        const reservedTokens = inputReservation + maxOutputTokens;
+        options.budget.reserveCall(reservedTokens);
+        usage = options.budget.snapshot();
+        const call = usage.calls;
+        await input.onEvent?.({ type: 'model_call', taskId: input.taskId, modelId: model.id, call, reservedTokens, usage: { ...usage } });
+        const request: ChatRequest = {
+          model,
+          messages: [...messages],
+          tools: modelTools,
+          signal,
+          maxOutputTokens,
+          context: {
+            principal: input.principal,
+            ...(input.workspace ? { workspace: input.workspace } : {}),
+            taskId: input.taskId,
+          },
+          onToken: async (content: string) => input.onEvent?.({ type: 'token' as const, taskId: input.taskId, content }),
+        };
+        try {
+          return { response: await provider.chat(request), reservedTokens };
+        } catch (error) {
+          if (isNotDispatched(error)) {
+            options.budget.releaseCall(reservedTokens);
+            usage = options.budget.snapshot();
+            await input.onEvent?.({
+              type: 'model_call_released',
+              taskId: input.taskId,
+              modelId: model.id,
+              call,
+              reservedTokens,
+              usage: { ...usage },
+            });
+          }
+          throw error;
+        }
       };
-      const response = model.locality === 'local'
-        ? await this.localProviderLimiter.use(provider.id, signal, () => provider.chat(request))
-        : await provider.chat(request);
+      const { response, reservedTokens } = model.locality === 'local'
+        ? await this.localProviderLimiter.use(provider.id, signal, invoke)
+        : await invoke();
       const settled = options.budget.settleCall(response.usage, reservedTokens);
       usage = options.budget.snapshot();
       await input.onEvent?.({
@@ -332,6 +345,28 @@ export class AgentRuntime {
         return this.waitingForChildrenResult(model, usage, options.strategy, messages);
       }
     }
+  }
+
+  private async assertProviderAvailable(
+    provider: ModelProvider,
+    model: ModelConfig,
+    input: RunInput,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!provider.isAvailable) return;
+    const available = await provider.isAvailable(model, input.workspace, signal, {
+      principal: input.principal,
+      ...(input.workspace ? { workspace: input.workspace } : {}),
+      taskId: input.taskId,
+    });
+    if (available) return;
+    throw new DomainError(
+      model.locality === 'local' ? 'waiting_for_device' : 'model_unavailable',
+      model.locality === 'local'
+        ? `Local model device ${model.deviceId ?? input.workspace?.deviceId ?? 'unknown'} is unavailable.`
+        : `Model ${model.id} is unavailable.`,
+      503,
+    );
   }
 
   private async executeToolCalls(
@@ -683,6 +718,16 @@ class BudgetLedger {
     }
     this.usage.calls += 1;
     this.setAccountedTokens(this.accountedTokens() + tokens);
+  }
+
+  public releaseCall(tokens: number): void {
+    const accounted = this.accountedTokens();
+    if (!Number.isSafeInteger(tokens) || tokens < 1 || this.usage.calls < 1
+      || accounted - tokens < this.usage.totalTokens) {
+      throw new DomainError('invalid_usage_sequence', 'Task model reservation cannot be released.', 409);
+    }
+    this.usage.calls -= 1;
+    this.setAccountedTokens(accounted - tokens);
   }
 
   public settleCall(

@@ -62,6 +62,26 @@ test('runtime event helpers charge cumulative usage deltas in order', async () =
   }
 });
 
+test('an undispatched model call releases and can reuse its shared call slot', async () => {
+  const store = new SqliteStore();
+  const ledger = new BudgetLedger(store);
+  try {
+    await ledger.create('owner', 'release-budget', 'root-task', { maxCalls: 1, maxTokens: 50 });
+    await ledger.reserveModelCall('owner', 'release-budget', 'child', 1, 35);
+    const released = await ledger.releaseModelCall('owner', 'release-budget', 'child', 1);
+    assert.deepEqual(released.reserved, { calls: 0, tokens: 0 });
+    await ledger.reserveModelCall('owner', 'release-budget', 'child', 1, 45);
+    const charged = await ledger.chargeModelUsage('owner', 'release-budget', 'child', {
+      calls: 1,
+      totalTokens: 7,
+    });
+    assert.deepEqual(charged.used, { calls: 1, tokens: 7 });
+    assert.deepEqual(charged.reserved, { calls: 0, tokens: 0 });
+  } finally {
+    await store.close();
+  }
+});
+
 test('a provider overrun records actual usage and reports a budget violation', async () => {
   const store = new SqliteStore();
   const ledger = new BudgetLedger(store);

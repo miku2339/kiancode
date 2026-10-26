@@ -169,6 +169,122 @@ test('reconciliation restores one lost reservation before a new call and never d
   } finally { await service.close(); await store.close(); }
 });
 
+test('reconciliation releases an undispatched call before replaying the same call number', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async () => ({ text: 'unused' }));
+  const coordinator = new AgentCoordinator(store);
+  try {
+    const parent = await rootTask(store, service);
+    const budgetId = 'released-call-recovery-budget';
+    await coordinator.budgets.create(principal.id, budgetId, parent.id, { maxCalls: 1, maxTokens: 50 });
+    const snapshots = [
+      {
+        type: 'model_call', call: 1, reservedTokens: 40,
+        usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 40 },
+      },
+      {
+        type: 'model_call_released', call: 1, reservedTokens: 40,
+        usage: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      },
+      {
+        type: 'model_call', call: 1, reservedTokens: 45,
+        usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 45 },
+      },
+      {
+        type: 'usage',
+        usage: { calls: 1, inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+      },
+    ];
+    for (const [index, payload] of snapshots.entries()) {
+      await store.create<TaskEvent>('event', principal.id, {
+        taskId: parent.id,
+        sequence: index + 1,
+        type: payload.type,
+        payload,
+        at: new Date().toISOString(),
+      }, `${parent.id}:released:${index + 1}`);
+    }
+
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, snapshots[3]!.usage!);
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, snapshots[3]!.usage!);
+    const snapshot = await coordinator.budgets.get(principal.id, budgetId);
+    assert.deepEqual(snapshot.used, { calls: 1, tokens: 7 });
+    assert.deepEqual(snapshot.reserved, { calls: 0, tokens: 0 });
+  } finally {
+    await service.close();
+    await store.close();
+  }
+});
+
+test('reconciliation idempotently releases a terminal undispatched call', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async () => ({ text: 'unused' }));
+  const coordinator = new AgentCoordinator(store);
+  try {
+    const parent = await rootTask(store, service);
+    const budgetId = 'terminal-release-recovery-budget';
+    await coordinator.budgets.create(principal.id, budgetId, parent.id, { maxCalls: 1, maxTokens: 50 });
+    for (const [index, payload] of [
+      {
+        type: 'model_call', call: 1, reservedTokens: 40,
+        usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 40 },
+      },
+      {
+        type: 'model_call_released', call: 1, reservedTokens: 40,
+        usage: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      },
+    ].entries()) {
+      await store.create<TaskEvent>('event', principal.id, {
+        taskId: parent.id,
+        sequence: index + 1,
+        type: payload.type,
+        payload,
+        at: new Date().toISOString(),
+      }, `${parent.id}:terminal-release:${index + 1}`);
+    }
+    const finalUsage = { calls: 0, totalTokens: 0 };
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, finalUsage);
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, finalUsage);
+    const snapshot = await coordinator.budgets.get(principal.id, budgetId);
+    assert.deepEqual(snapshot.used, { calls: 0, tokens: 0 });
+    assert.deepEqual(snapshot.reserved, { calls: 0, tokens: 0 });
+  } finally {
+    await service.close();
+    await store.close();
+  }
+});
+
+test('reconciliation recovers a release when task usage persisted before its event', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async () => ({ text: 'unused' }));
+  const coordinator = new AgentCoordinator(store);
+  try {
+    const parent = await rootTask(store, service);
+    const budgetId = 'release-event-crash-budget';
+    await coordinator.budgets.create(principal.id, budgetId, parent.id, { maxCalls: 1, maxTokens: 50 });
+    await store.create<TaskEvent>('event', principal.id, {
+      taskId: parent.id,
+      sequence: 1,
+      type: 'model_call',
+      payload: {
+        type: 'model_call', call: 1, reservedTokens: 40,
+        usage: { calls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0, accountedTokens: 40 },
+      },
+      at: new Date().toISOString(),
+    }, `${parent.id}:release-crash:model-call`);
+    const finalUsage = { calls: 0, totalTokens: 0 };
+
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, finalUsage);
+    await coordinator.reconcileTaskBudget(principal.id, budgetId, parent.id, finalUsage);
+    const snapshot = await coordinator.budgets.get(principal.id, budgetId);
+    assert.deepEqual(snapshot.used, { calls: 0, tokens: 0 });
+    assert.deepEqual(snapshot.reserved, { calls: 0, tokens: 0 });
+  } finally {
+    await service.close();
+    await store.close();
+  }
+});
+
 test('event replay rejects mismatched call identity before changing the shared ledger', async () => {
   const store = new SqliteStore();
   const service = new TaskService(store, async () => ({ text: 'unused' }));
