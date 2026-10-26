@@ -348,6 +348,8 @@ test('an unknown task without a side effect can be abandoned idempotently withou
 test('invalid or expired reconciliation attempts perform no writes', async () => {
   const harness = await unknownTask();
   try {
+    // Reading the events publishes the unknown version's transition event before the attempts.
+    await harness.service.events(principal.id, harness.taskId);
     const before = await harness.store.scan('event', principal.id);
     await assert.rejects(
       harness.service.reconcileOutcome(principal, harness.taskId, { resolution: 'applied', toolOccurrenceId: 'wrong' }),

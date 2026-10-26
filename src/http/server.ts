@@ -5,9 +5,9 @@ import { isDeepStrictEqual } from 'node:util';
 import { z, ZodError } from 'zod';
 import { bearer, type Authenticator, requireOwner, requireScope, tokenHash } from '../auth.js';
 import { DomainError, type Principal, type ToolDefinition, type Workspace } from '../contracts.js';
-import type { Conversation, Message, Memory, Task, TaskEvent, TaskState } from '../domain.js';
+import type { Conversation, Message, Memory, Task } from '../domain.js';
 import type { Entity, Store } from '../storage/store.js';
-import { orderMessages, TaskService, type TaskRunner } from '../tasks.js';
+import { orderMessages, taskTransitionEventId, TaskService, type TaskRunner } from '../tasks.js';
 import { DeviceService, registerDeviceRoutes } from '../devices.js';
 import { ArtifactService, registerArtifactRoutes } from '../artifacts.js';
 import type { AccessService } from '../access.js';
@@ -56,26 +56,6 @@ const agentSchema = z.object({
 
 const tickDegradedAfter = 3;
 const tickLogEvery = 60;
-// States that end a task stream, with the event types that announce each one. Durable terminal
-// states wait for their event; states that can be reached without one end after the grace period.
-const streamStopEvents: Partial<Record<TaskState, readonly string[]>> = {
-  completed: ['completed', 'reconcile'],
-  failed: ['failed'],
-  cancelled: ['cancel', 'reconcile'],
-  unknown: ['cancel', 'pause', 'reconcile'],
-  waiting_for_approval: ['waiting_for_approval'],
-  waiting_for_device: [],
-  paused: ['pause'],
-};
-const streamRequiredEventStates = new Set<TaskState>(['completed', 'failed', 'cancelled']);
-const streamStopGraceMs = 2_000;
-// Control and reconciliation events name the state they produced; other events are named after it.
-const streamStatefulEvents = new Set(['cancel', 'pause', 'reconcile']);
-
-function announcesStreamState(event: TaskEvent, state: TaskState, expected: readonly string[]): boolean {
-  if (!expected.includes(event.type)) return false;
-  return !streamStatefulEvents.has(event.type) || (event.payload as { state?: unknown }).state === state;
-}
 
 export interface ServerLoggerOptions {
   level: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace';
@@ -576,11 +556,10 @@ export async function createServer(options: ServerOptions) {
     let closed = false;
     reply.raw.on('close', () => { closed = true; });
     const started = Date.now();
-    let stoppedAt: number | undefined;
     try {
       while (!closed && Date.now() - started < 55000) {
-        // Task state is persisted before its transition event, so read the state first and keep
-        // streaming until that event has been delivered.
+        // Reading the events publishes a stopped version's transition event, so read the state first
+        // and end once the event for that version has been delivered; later events cannot hold it open.
         const current = await store.get<Task>('task', taskId, owner.id);
         const events = await tasks.events(owner.id, taskId);
         for (const row of events) {
@@ -589,19 +568,8 @@ export async function createServer(options: ServerOptions) {
           reply.raw.write(`id: ${sequence}\nevent: ${row.data.type}\ndata: ${JSON.stringify(row.data)}\n\n`);
         }
         if (!current) break;
-        const expected = streamStopEvents[current.data.state];
-        if (expected) {
-          stoppedAt ??= Date.now();
-          const state = current.data.state;
-          // Durable terminal states announce themselves once; later events must not hold the stream open.
-          const delivered = streamRequiredEventStates.has(state)
-            ? events.some((row) => announcesStreamState(row.data, state, expected))
-            : events.length > 0 && announcesStreamState(events.at(-1)!.data, state, expected);
-          if (delivered || (!streamRequiredEventStates.has(state)
-            && Date.now() - stoppedAt >= streamStopGraceMs)) break;
-        } else {
-          stoppedAt = undefined;
-        }
+        const transitionId = taskTransitionEventId(current);
+        if (transitionId && events.some((row) => row.id === transitionId)) break;
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
     } catch { if (!closed) reply.raw.write('event: unavailable\ndata: {}\n\n'); }

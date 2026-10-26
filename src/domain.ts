@@ -116,6 +116,15 @@ export interface Task {
   automationSource?: { type: 'schedule' | 'event_trigger'; id: string; version: number };
   reconciliation?: TaskReconciliationRecord;
   reconciliationRestoration?: TaskReconciliationRestoration;
+  transition?: TaskTransition;
+}
+
+// The event announcing a state, written with the state so any instance can publish it idempotently.
+export interface TaskTransition {
+  eventId: string;
+  state: TaskState;
+  at: string;
+  payload: { type: string; [key: string]: unknown };
 }
 
 export interface TaskEvent {

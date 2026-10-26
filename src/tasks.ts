@@ -21,6 +21,7 @@ import type {
   TaskReconciliationRecord,
   TaskReconciliationResolution,
   TaskState,
+  TaskTransition,
 } from './domain.js';
 import type { NotificationInput, NotificationService } from './notifications.js';
 import type { Entity, Store } from './storage/store.js';
@@ -277,6 +278,12 @@ class DurableRuntimeEventStream {
 }
 
 const terminalStates: TaskState[] = ['completed', 'failed', 'cancelled', 'unknown'];
+const stoppedStates: TaskState[] = [
+  ...terminalStates,
+  'waiting_for_approval',
+  'waiting_for_device',
+  'paused',
+];
 const dependencyFailureStates: TaskState[] = ['failed', 'cancelled', 'unknown'];
 
 export class TaskService {
@@ -428,7 +435,7 @@ export class TaskService {
     if (!task) {
       throw new DomainError('not_found', 'Task not found', 404);
     }
-    if (task.data.state === 'failed') await this.ensureFailedEvent(task);
+    await this.ensureTransitionEvent(task);
     return (await this.store.scan<TaskEvent>('event', ownerId))
       .filter((row) => row.data.taskId === taskId && row.data.sequence > after)
       .sort((left, right) => left.data.sequence - right.data.sequence);
@@ -524,14 +531,18 @@ export class TaskService {
     throw new DomainError('busy', 'Task event stream is busy; retry', 409);
   }
 
-  private async change(ownerId: string, id: string, change: (task: Task) => Task): Promise<Entity<Task>> {
+  private async change(
+    ownerId: string,
+    id: string,
+    change: (task: Task, revision: number) => Task,
+  ): Promise<Entity<Task>> {
     for (let attempt = 0; attempt < 16; attempt += 1) {
       const row = await this.store.get<Task>('task', id, ownerId);
       if (!row) {
         throw new DomainError('not_found', 'Task not found', 404);
       }
       try {
-        const updated = change(row.data);
+        const updated = change(row.data, row.revision);
         if (updated === row.data) return row;
         return await this.store.put('task', id, ownerId, updated, row.revision);
       } catch (error) {
@@ -551,24 +562,28 @@ export class TaskService {
     actor?: Principal,
   ): Promise<Entity<Task>> {
     const before = action === 'resume' ? false : await this.hasUnresolvedSideEffect(ownerId, id);
-    let row = await this.change(ownerId, id, (task) => {
+    let row = await this.change(ownerId, id, (task, revision) => {
       if (terminalStates.includes(task.state)) {
         throw new DomainError('terminal_task', 'Task has already stopped', 409);
       }
       if (action === 'cancel') {
+        const state: TaskState = before ? 'unknown' : 'cancelled';
         return {
           ...task,
           cancelRequested: true,
-          state: before ? 'unknown' : 'cancelled',
+          state,
           ...(before ? { error: 'Cancellation was requested after a side effect was dispatched; verify its outcome.' } : {}),
+          transition: this.recordTransition(id, revision, state, { type: action, state }),
         };
       }
       if (action === 'pause') {
+        const state: TaskState = before ? 'unknown' : 'paused';
         return {
           ...task,
           pauseRequested: true,
-          state: before ? 'unknown' : 'paused',
+          state,
           ...(before ? { error: 'Pause was requested after a side effect was dispatched; verify its outcome.' } : {}),
+          transition: this.recordTransition(id, revision, state, { type: action, state }),
         };
       }
       if (task.state === 'running') {
@@ -603,19 +618,23 @@ export class TaskService {
           task.accountTaskGrant?.delegationExpiresAt,
         ),
         approvedActionHashes: [...approved],
+        transition: undefined,
       };
     });
-    if (action !== 'resume') {
-      this.active.get(id)?.controller.abort(new DOMException(action, 'AbortError'));
-      if (!before && await this.hasUnresolvedSideEffect(ownerId, id)) {
-        row = await this.change(ownerId, id, (task) => ({
-          ...task,
-          state: 'unknown',
-          error: `${action === 'cancel' ? 'Cancellation' : 'Pause'} was requested after a side effect was dispatched; verify its outcome.`,
-        }));
-      }
+    if (action === 'resume') {
+      await this.event(row, { type: action, state: row.data.state });
+      return row;
     }
-    await this.event(row, { type: action, state: row.data.state });
+    this.active.get(id)?.controller.abort(new DOMException(action, 'AbortError'));
+    if (!before && await this.hasUnresolvedSideEffect(ownerId, id)) {
+      row = await this.change(ownerId, id, (task, revision) => ({
+        ...task,
+        state: 'unknown',
+        error: `${action === 'cancel' ? 'Cancellation' : 'Pause'} was requested after a side effect was dispatched; verify its outcome.`,
+        transition: this.recordTransition(id, revision, 'unknown', { type: action, state: 'unknown' }),
+      }));
+    }
+    await this.ensureTransitionEvent(row);
     return row;
   }
 
@@ -751,20 +770,26 @@ export class TaskService {
       );
     }
     if (!unresolved && decision.resolution !== 'abandon') await this.restoreReconciledParents(task, decision);
-    await this.fixedEvent(task, `${decision.receiptId}:audit`, {
-      type: 'reconcile',
-      receiptId: decision.receiptId,
+    const audit: TaskTransition = {
+      eventId: `${decision.receiptId}:audit`,
       state: targetState,
-      resolution: decision.resolution,
-      ...(decision.dispatchSequence !== undefined ? { dispatchSequence: decision.dispatchSequence } : {}),
-      ...(decision.toolCallId ? { toolCallId: decision.toolCallId } : {}),
-      ...(decision.toolOccurrenceId ? { toolOccurrenceId: decision.toolOccurrenceId } : {}),
-      ...(decision.actionHash ? { actionHash: decision.actionHash } : {}),
-      ...(decision.toolName ? { toolName: decision.toolName } : {}),
-      ...(decision.note ? { note: decision.note } : {}),
-      actor: decision.actor,
-      acceptedAt: decision.acceptedAt,
-    }, decision.acceptedAt);
+      at: decision.acceptedAt,
+      payload: {
+        type: 'reconcile',
+        receiptId: decision.receiptId,
+        state: targetState,
+        resolution: decision.resolution,
+        ...(decision.dispatchSequence !== undefined ? { dispatchSequence: decision.dispatchSequence } : {}),
+        ...(decision.toolCallId ? { toolCallId: decision.toolCallId } : {}),
+        ...(decision.toolOccurrenceId ? { toolOccurrenceId: decision.toolOccurrenceId } : {}),
+        ...(decision.actionHash ? { actionHash: decision.actionHash } : {}),
+        ...(decision.toolName ? { toolName: decision.toolName } : {}),
+        ...(decision.note ? { note: decision.note } : {}),
+        actor: decision.actor,
+        acceptedAt: decision.acceptedAt,
+      },
+    };
+    await this.fixedEvent(task, audit.eventId, audit.payload, audit.at);
     for (let attempt = 0; attempt < 16; attempt += 1) {
       task = await this.store.get<Task>('task', task.id, task.ownerId) ?? task;
       const current = task.data.reconciliation;
@@ -773,14 +798,19 @@ export class TaskService {
       }
       if (current.phase === 'complete') return task;
       const final = await this.reconciledTaskData(task, decision, targetState);
+      let reconciled: Entity<Task>;
       try {
-        return await this.store.put('task', task.id, task.ownerId, {
+        reconciled = await this.store.put('task', task.id, task.ownerId, {
           ...final,
           reconciliation: { ...decision, phase: 'complete' },
+          transition: audit,
         }, task.revision);
       } catch (error) {
         if (!(error instanceof DomainError && error.code === 'conflict')) throw error;
+        continue;
       }
+      await this.ensureTransitionEvent(reconciled);
+      return reconciled;
     }
     throw new DomainError('busy', 'Task reconciliation is busy; retry', 409);
   }
@@ -876,13 +906,21 @@ export class TaskService {
     }
   }
 
-  private async ensureFailedEvent(task: Entity<Task>): Promise<void> {
-    if (task.data.state !== 'failed') return;
-    await this.fixedEvent(task, `${task.id}:terminal:failed:${task.revision}`, {
-      type: 'failed',
-      taskRevision: task.revision,
-      error: task.data.error ?? 'Task execution failed',
-    }, task.updatedAt);
+  // Every stopped task version has one fixed transition event, so retries and other instances
+  // publish the same event instead of a duplicate.
+  private async ensureTransitionEvent(task: Entity<Task>): Promise<void> {
+    const transition = taskTransition(task);
+    if (transition) await this.fixedEvent(task, transition.eventId, transition.payload, transition.at);
+  }
+
+  // Records the event that announces a state in the write that enters it, keyed by the revision it replaces.
+  private recordTransition(
+    taskId: string,
+    revision: number,
+    state: TaskState,
+    payload: TaskTransition['payload'],
+  ): TaskTransition {
+    return { eventId: `${taskId}:transition:${revision}`, state, at: new Date(this.now()).toISOString(), payload };
   }
 
   private async repairFailedEvents(tasks: Array<Entity<Task>>): Promise<void> {
@@ -894,7 +932,7 @@ export class TaskService {
     const count = Math.min(failedEventRepairBatchSize, failed.length);
     const offset = this.failedEventRepairOffset % failed.length;
     for (let index = 0; index < count; index += 1) {
-      await this.ensureFailedEvent(failed[(offset + index) % failed.length]!);
+      await this.ensureTransitionEvent(failed[(offset + index) % failed.length]!);
     }
     this.failedEventRepairOffset = (offset + count) % failed.length;
   }
@@ -1009,11 +1047,13 @@ export class TaskService {
             state: unresolved ? 'unknown' : 'queued',
             workerId: undefined,
             leaseExpiresAt: undefined,
+            transition: undefined,
             ...(unresolved
               ? { error: 'Executor stopped after a side effect was dispatched; verify its outcome before continuing.' }
               : { error: undefined }),
           }, task.revision);
           if (recovered.data.state === 'unknown') {
+            await this.ensureTransitionEvent(recovered);
             await this.notify(recovered, taskNotification(recovered, 'task_unknown'), new Date(recovered.updatedAt));
           }
         } catch (error) {
@@ -1045,7 +1085,7 @@ export class TaskService {
           error: 'A dependency did not complete successfully.',
         }));
         await this.event(failed, { type: 'dependency_failed' });
-        await this.ensureFailedEvent(failed);
+        await this.ensureTransitionEvent(failed);
         await this.notify(failed, taskNotification(failed, 'task_failed'), new Date(failed.updatedAt));
         continue;
       }
@@ -1060,6 +1100,7 @@ export class TaskService {
           state: 'running',
           workerId: this.workerId,
           leaseExpiresAt: new Date(this.now() + (this.options.leaseMs ?? 60_000)).toISOString(),
+          transition: undefined,
         }, task.revision);
       } catch (error) {
         if (error instanceof DomainError && error.code === 'conflict') {
@@ -1262,7 +1303,7 @@ export class TaskService {
         }, `${task.id}:assistant`);
       }
       let transitioned = false;
-      const updated = await this.change(task.ownerId, task.id, (data) => {
+      const updated = await this.change(task.ownerId, task.id, (data, revision) => {
         transitioned = data.state === 'running' && data.workerId === this.workerId;
         return !transitioned
           ? data
@@ -1278,12 +1319,17 @@ export class TaskService {
               nextAttemptAt: undefined,
               workerId: undefined,
               leaseExpiresAt: undefined,
+              transition: state === 'waiting_for_children'
+                ? undefined
+                : this.recordTransition(task.id, revision, state, { type: state, text: result.text }),
             };
       });
       // A cancel, pause or lease takeover after the runner returned owns the task now.
       if (!transitioned) return;
-      await this.event(updated, { type: state, text: result.text });
-      if (state !== 'waiting_for_children') {
+      if (state === 'waiting_for_children') {
+        await this.event(updated, { type: state, text: result.text });
+      } else {
+        await this.ensureTransitionEvent(updated);
         const type = state === 'completed' ? 'task_completed' : 'approval_required';
         await this.notify(updated, taskNotification(updated, type), new Date(updated.updatedAt))
           .catch((notificationError) => this.options.onError?.(notificationError));
@@ -1376,12 +1422,14 @@ export class TaskService {
       if (code === 'identity_unavailable' && updated?.data.state === 'queued') {
         this.options.onError?.(error);
       }
+      if (updated) {
+        await this.ensureTransitionEvent(updated).catch((eventError) => this.options.onError?.(eventError));
+      }
       if (updated?.data.state === 'failed' || updated?.data.state === 'unknown') {
         const type = updated.data.state === 'failed' ? 'task_failed' : 'task_unknown';
         await this.notify(updated, taskNotification(updated, type), new Date(updated.updatedAt))
           .catch((notificationError) => this.options.onError?.(notificationError));
       }
-      if (updated?.data.state === 'failed') await this.ensureFailedEvent(updated);
     } finally {
       runtimeEvents.dispose();
       clearInterval(leaseTimer);
@@ -1494,6 +1542,7 @@ export class TaskService {
             state: 'waiting_for_children',
             error: undefined,
             reconciliationRestoration: marker,
+            transition: undefined,
           }, parent.revision);
           break;
         } catch (error) {
@@ -1768,6 +1817,37 @@ function reconciliationReceipt(taskId: string, decision: TaskReconciliationRecor
     actor: decision.actor,
     acceptedAt: decision.acceptedAt,
   };
+}
+
+// The fixed event that announces a stopped task version: the transition recorded with the state,
+// the established failed event, or a generic one for versions written without a recorded transition.
+function taskTransition(task: Entity<Task>): TaskTransition | undefined {
+  const state = task.data.state;
+  if (!stoppedStates.includes(state)) return undefined;
+  if (state === 'failed') {
+    return {
+      eventId: `${task.id}:terminal:failed:${task.revision}`,
+      state,
+      at: task.updatedAt,
+      payload: { type: 'failed', taskRevision: task.revision, error: task.data.error ?? 'Task execution failed' },
+    };
+  }
+  if (task.data.transition?.state === state) return task.data.transition;
+  return {
+    eventId: `${task.id}:state:${task.revision}`,
+    state,
+    at: task.updatedAt,
+    payload: {
+      type: 'transition',
+      state,
+      taskRevision: task.revision,
+      ...(task.data.error ? { error: task.data.error } : {}),
+    },
+  };
+}
+
+export function taskTransitionEventId(task: Entity<Task>): string | undefined {
+  return taskTransition(task)?.eventId;
 }
 
 function assertFixedEvent(
