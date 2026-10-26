@@ -1248,22 +1248,27 @@ export class TaskService {
           sequence: await this.nextMessageSequence(task.ownerId, conversation.id),
         }, `${task.id}:assistant`);
       }
-      const updated = await this.change(task.ownerId, task.id, (data) => data.state !== 'running'
-        || data.workerId !== this.workerId
-        ? data
-        : {
-            ...data,
-            state,
-            result: result.text,
-            pendingActions: result.pendingActions ?? [],
-            runtimeMessages: result.messages ?? data.runtimeMessages,
-            usage: result.usage ?? data.usage,
-            resultArtifactIds: resultArtifactIds.length ? resultArtifactIds : undefined,
-            error: undefined,
-            nextAttemptAt: undefined,
-            workerId: undefined,
-            leaseExpiresAt: undefined,
-          });
+      let transitioned = false;
+      const updated = await this.change(task.ownerId, task.id, (data) => {
+        transitioned = data.state === 'running' && data.workerId === this.workerId;
+        return !transitioned
+          ? data
+          : {
+              ...data,
+              state,
+              result: result.text,
+              pendingActions: result.pendingActions ?? [],
+              runtimeMessages: result.messages ?? data.runtimeMessages,
+              usage: result.usage ?? data.usage,
+              resultArtifactIds: resultArtifactIds.length ? resultArtifactIds : undefined,
+              error: undefined,
+              nextAttemptAt: undefined,
+              workerId: undefined,
+              leaseExpiresAt: undefined,
+            };
+      });
+      // A cancel, pause or lease takeover after the runner returned owns the task now.
+      if (!transitioned) return;
       await this.event(updated, { type: state, text: result.text });
       if (state !== 'waiting_for_children') {
         const type = state === 'completed' ? 'task_completed' : 'approval_required';

@@ -900,6 +900,58 @@ test('a task clears its device wait error after reconnecting and completing', as
   } finally { await service.close(); await store.close(); }
 });
 
+test('a cancellation after the runner returns does not record completion', async () => {
+  const store = new CancelBeforeCompletionStore(new SqliteStore());
+  const service = new TaskService(store, async () => ({ text: 'finished too late' }));
+  store.service = service;
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'cancel at the finish line');
+    await service.drain();
+
+    assert.equal((await store.get<Task>('task', task.id, principal.id))?.data.state, 'cancelled');
+    const types = (await service.events(principal.id, task.id)).map((event) => event.data.type);
+    assert.deepEqual(types, ['queued', 'cancel']);
+    const notifications = await store.scan<{ type: string }>('notification', principal.id);
+    assert.ok(!notifications.some((notification) => notification.data.type === 'task_completed'));
+  } finally { await service.close(); await store.close(); }
+});
+
+class CancelBeforeCompletionStore implements Store {
+  public service?: TaskService;
+
+  public constructor(private readonly delegate: Store) {}
+
+  public async create<T>(kind: string, ownerId: string, data: T, id?: string): Promise<Entity<T>> {
+    const service = this.service;
+    if (kind === 'message' && id?.endsWith(':assistant') && service) {
+      this.service = undefined;
+      await service.control(ownerId, id.slice(0, -':assistant'.length), 'cancel');
+    }
+    return this.delegate.create(kind, ownerId, data, id);
+  }
+
+  public get<T>(kind: string, id: string, ownerId: string): Promise<Entity<T> | undefined> {
+    return this.delegate.get(kind, id, ownerId);
+  }
+
+  public scan<T>(kind: string, ownerId?: string): Promise<Array<Entity<T>>> {
+    return this.delegate.scan(kind, ownerId);
+  }
+
+  public put<T>(kind: string, id: string, ownerId: string, data: T, revision: number): Promise<Entity<T>> {
+    return this.delegate.put(kind, id, ownerId, data, revision);
+  }
+
+  public remove(kind: string, id: string, ownerId: string, revision: number): Promise<boolean> {
+    return this.delegate.remove(kind, id, ownerId, revision);
+  }
+
+  public close(): Promise<void> {
+    return this.delegate.close();
+  }
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
