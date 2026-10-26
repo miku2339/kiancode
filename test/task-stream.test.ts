@@ -46,13 +46,14 @@ class DelayedCompletionEventStore implements Store {
   }
 }
 
-test('a task stream delivers the completion event persisted after the completed state', async () => {
-  const store = new DelayedCompletionEventStore(new SqliteStore(), 500);
+test('a task stream delivers the completion event persisted after the completed state', { timeout: 15_000 }, async () => {
+  const store = new DelayedCompletionEventStore(new SqliteStore(), 2_500);
   const server = await createServer({
     store,
     authenticate: developmentAuth(token),
     runner: async () => ({ text: 'streamed result' }),
   });
+  let streamTimeout: ReturnType<typeof setTimeout> | undefined;
   try {
     const thread = await store.create('conversation', owner.id, conversation);
     const task = await server.tasks.enqueue(owner, thread.id, 'finish while a client is watching');
@@ -66,13 +67,19 @@ test('a task stream delivers the completion event persisted after the completed 
       .filter((event) => event.data.type === 'completed');
     assert.equal(terminalEvents.length, 0, 'the completion event must still be pending when the stream opens');
 
-    const stream = await server.app.inject({ method: 'GET', url: `/v1/tasks/${task.id}/stream`, headers });
+    const stream = await Promise.race([
+      server.app.inject({ method: 'GET', url: `/v1/tasks/${task.id}/stream`, headers }),
+      new Promise<never>((_resolve, reject) => {
+        streamTimeout = setTimeout(() => reject(new Error('Timed out waiting for the terminal stream event')), 10_000);
+      }),
+    ]);
     await draining;
 
     assert.equal(stream.statusCode, 200, stream.body);
     assert.equal((stream.body.match(/event: completed/g) ?? []).length, 1, stream.body);
     assert.match(stream.body, /streamed result/);
   } finally {
+    if (streamTimeout) clearTimeout(streamTimeout);
     await server.close();
   }
 });

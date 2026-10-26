@@ -56,8 +56,8 @@ const agentSchema = z.object({
 
 const tickDegradedAfter = 3;
 const tickLogEvery = 60;
-// States that end a task stream, with the event types that announce each one. States reached
-// without an event (device waits, failure-path pauses or unknown outcomes) end after the grace period.
+// States that end a task stream, with the event types that announce each one. Durable terminal
+// states wait for their event; states that can be reached without one end after the grace period.
 const streamStopEvents: Partial<Record<TaskState, readonly string[]>> = {
   completed: ['completed', 'reconcile'],
   failed: ['failed'],
@@ -67,6 +67,7 @@ const streamStopEvents: Partial<Record<TaskState, readonly string[]>> = {
   waiting_for_device: [],
   paused: ['pause'],
 };
+const streamRequiredEventStates = new Set<TaskState>(['completed', 'failed', 'cancelled']);
 const streamStopGraceMs = 2_000;
 
 export interface ServerLoggerOptions {
@@ -584,7 +585,9 @@ export async function createServer(options: ServerOptions) {
         const expected = streamStopEvents[current.data.state];
         if (expected) {
           stoppedAt ??= Date.now();
-          if (expected.includes(events.at(-1)?.data.type ?? '') || Date.now() - stoppedAt >= streamStopGraceMs) break;
+          const delivered = expected.includes(events.at(-1)?.data.type ?? '');
+          if (delivered || (!streamRequiredEventStates.has(current.data.state)
+            && Date.now() - stoppedAt >= streamStopGraceMs)) break;
         } else {
           stoppedAt = undefined;
         }
