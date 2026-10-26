@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { DomainError } from '../contracts.js';
-import type { Memory } from '../domain.js';
+import type { Memory, TaskEvent } from '../domain.js';
 import {
   boundedMemoryLimit,
   decodeMemoryCursor,
@@ -24,6 +24,10 @@ function validTimestampSql(value: string): string {
   return `(${value} ~ '${memoryTimestampPattern}'
     AND ${value} !~ '^0000-' AND (${value} !~ '^[0-9]{4}-02-29T' OR ${value} ~ '${memoryLeapDayPattern}'))`;
 }
+
+// Fixed event ids (terminal, reconciliation) do not share the task id prefix, so events are found by their task field.
+const eventTaskIndex = `CREATE INDEX IF NOT EXISTS kiancode_entities_event_task
+  ON kiancode_entities(owner_id,(data->>'taskId'),(data->'sequence')) WHERE kind='event'`;
 
 export interface PostgresStoreOptions {
   schema?: string;
@@ -49,18 +53,23 @@ export class PostgresStore implements Store {
     // pg-pool removes failed idle clients; query failures still reach callers.
     pool.on('error', () => undefined);
     try {
-      const schema = await pool.query<{ table_exists: boolean; index_exists: boolean }>(`
+      const schema = await pool.query<{ table_exists: boolean; index_exists: boolean; event_index_exists: boolean }>(`
         SELECT to_regclass('kiancode_entities') IS NOT NULL AS table_exists,
-          to_regclass('kiancode_entities_owner_kind') IS NOT NULL AS index_exists
+          to_regclass('kiancode_entities_owner_kind') IS NOT NULL AS index_exists,
+          to_regclass('kiancode_entities_event_task') IS NOT NULL AS event_index_exists
       `);
       if (!schema.rows[0]?.table_exists) {
         await pool.query(`CREATE TABLE IF NOT EXISTS kiancode_entities (
           kind TEXT NOT NULL, id TEXT NOT NULL, owner_id TEXT NOT NULL,
           revision BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
           data JSONB NOT NULL, PRIMARY KEY(kind,id));
-          CREATE INDEX IF NOT EXISTS kiancode_entities_owner_kind ON kiancode_entities(owner_id,kind);`);
-      } else if (!schema.rows[0].index_exists) {
-        await pool.query('CREATE INDEX IF NOT EXISTS kiancode_entities_owner_kind ON kiancode_entities(owner_id,kind)');
+          CREATE INDEX IF NOT EXISTS kiancode_entities_owner_kind ON kiancode_entities(owner_id,kind);
+          ${eventTaskIndex};`);
+      } else {
+        if (!schema.rows[0].index_exists) {
+          await pool.query('CREATE INDEX IF NOT EXISTS kiancode_entities_owner_kind ON kiancode_entities(owner_id,kind)');
+        }
+        if (!schema.rows[0].event_index_exists) await pool.query(eventTaskIndex);
       }
       return new PostgresStore(pool);
     } catch (error) { await pool.end(); throw error; }
@@ -86,6 +95,13 @@ export class PostgresStore implements Store {
       ? await this.pool.query<Row>('SELECT * FROM kiancode_entities WHERE kind=$1 ORDER BY created_at,id', [kind])
       : await this.pool.query<Row>('SELECT * FROM kiancode_entities WHERE kind=$1 AND owner_id=$2 ORDER BY created_at,id', [kind, ownerId]);
     return result.rows.map(decode<T>);
+  }
+
+  async taskEvents(ownerId: string, taskId: string, after = 0): Promise<Array<Entity<TaskEvent>>> {
+    const result = await this.pool.query<Row>(`SELECT * FROM kiancode_entities
+      WHERE kind='event' AND owner_id=$1 AND data->>'taskId'=$2 AND data->'sequence' > to_jsonb($3::numeric)
+      ORDER BY data->'sequence',created_at,id`, [ownerId, taskId, after]);
+    return result.rows.map(decode<TaskEvent>);
   }
 
   async queryMemory(query: MemoryQuery): Promise<MemoryQueryPage> {

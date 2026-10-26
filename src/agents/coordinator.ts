@@ -4,7 +4,7 @@ import { accountTaskGrantMatches, narrowAccountTaskGrant } from '../account-task
 import { DomainError, type ExecutionStrategy, type Principal } from '../contracts.js';
 import type { AccountTaskGrant, Conversation, Message, Task, TaskEvent, TaskOrchestration, TaskState } from '../domain.js';
 import type { AgentProfile, RunUsage } from '../runtime/index.js';
-import type { Entity, Store } from '../storage/store.js';
+import { taskEvents, type Entity, type Store } from '../storage/store.js';
 import { BudgetLedger, type BudgetLimits } from './budget-ledger.js';
 
 export type ChildStrategy = Extract<ExecutionStrategy, 'single' | 'experts' | 'moa'>;
@@ -526,7 +526,7 @@ export class AgentCoordinator {
   public async results(ownerId: string, planId: string): Promise<OrchestrationResults> {
     const plan = await this.requirePlan(ownerId, planId);
     const tasks = await Promise.all(plan.data.childIds.map((id) => this.requireTask(ownerId, id)));
-    const events = await this.store.scan<TaskEvent>('event', ownerId);
+    const events = await this.tasksEvents(ownerId, plan.data.childIds);
     const unresolved = tasksWithUnresolvedSideEffects(events, plan.data.childIds);
     await this.cleanSlots(ownerId);
     const children = tasks.map((task): ChildResult => ({
@@ -600,8 +600,7 @@ export class AgentCoordinator {
     if (!plan.data.integrationBoundary && !canCreateBoundary) {
       throw new DomainError('integration_incomplete', 'Legacy integration has no safe event boundary and must be checked again', 409);
     }
-    const parentEvents = (await this.store.scan<TaskEvent>('event', ownerId))
-      .filter((event) => event.data.taskId === plan.data.parentTaskId);
+    const parentEvents = await taskEvents(this.store, ownerId, plan.data.parentTaskId);
     const cursor = await this.store.get<EventSequence>('event_sequence', plan.data.parentTaskId, ownerId);
     const parentEventSequence = Math.max(
       0,
@@ -668,7 +667,7 @@ export class AgentCoordinator {
     const plan = await this.requirePlan(ownerId, planId);
     const tasks = await Promise.all(plan.data.childIds.map((childId) => this.requireTask(ownerId, childId)));
     const approved = new Map(tasks.map((task) => [task.id, new Set(task.data.approvedActionHashes)]));
-    return collectChildSideEffects(await this.store.scan<TaskEvent>('event', ownerId), plan.data.childIds, approved);
+    return collectChildSideEffects(await this.tasksEvents(ownerId, plan.data.childIds), plan.data.childIds, approved);
   }
 
   public async verifyIntegration(ownerId: string, planId: string, _claimedEvidence?: string): Promise<Entity<OrchestrationPlan>> {
@@ -728,7 +727,7 @@ export class AgentCoordinator {
     if (boundary === undefined) {
       throw new DomainError('verification_failed', 'Delegated work is unverified because its integration event boundary is missing; re-run integration checks', 409);
     }
-    const events = await this.store.scan<TaskEvent>('event', ownerId);
+    const events = await this.tasksEvents(ownerId, [...plan.data.childIds, plan.data.parentTaskId]);
     const tasks = await Promise.all(plan.data.childIds.map((childId) => this.requireTask(ownerId, childId)));
     const approved = new Map(tasks.map((task) => [task.id, new Set(task.data.approvedActionHashes)]));
     const effects = collectChildSideEffects(events, plan.data.childIds, approved);
@@ -811,9 +810,7 @@ export class AgentCoordinator {
       }
       return accounted;
     };
-    const events = (await this.store.scan<TaskEvent>('event', ownerId))
-      .filter((event) => event.data.taskId === taskId)
-      .sort((left, right) => left.data.sequence - right.data.sequence);
+    const events = await taskEvents(this.store, ownerId, taskId);
     const modelEvents = events.filter((event) => event.data.type === 'model_call');
     if (modelEvents.length === 0) {
       validateUsage(finalUsage);
@@ -1353,6 +1350,11 @@ export class AgentCoordinator {
     const task = await this.store.get<Task>('task', id, ownerId);
     if (!task) throw new DomainError('not_found', 'Task not found', 404);
     return task;
+  }
+
+  private async tasksEvents(ownerId: string, taskIds: string[]): Promise<Array<Entity<TaskEvent>>> {
+    const events = await Promise.all([...new Set(taskIds)].map((taskId) => taskEvents(this.store, ownerId, taskId)));
+    return events.flat();
   }
 
   private async requirePlan(ownerId: string, id: string): Promise<Entity<OrchestrationPlan>> {

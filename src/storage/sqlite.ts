@@ -3,7 +3,7 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { DomainError } from '../contracts.js';
-import type { Memory } from '../domain.js';
+import type { Memory, TaskEvent } from '../domain.js';
 import { listMemoryRows, relevantMemory, type MemoryQuery, type MemoryQueryPage } from '../memory-query.js';
 import { serializeData } from './json.js';
 import { validMemoryTimestamp } from './memory.js';
@@ -32,7 +32,9 @@ export class SqliteStore implements Store {
         kind TEXT NOT NULL, id TEXT NOT NULL, owner_id TEXT NOT NULL,
         revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         data TEXT NOT NULL, PRIMARY KEY (kind, id)
-      ); CREATE INDEX IF NOT EXISTS entities_owner_kind ON entities(owner_id,kind);`);
+      ); CREATE INDEX IF NOT EXISTS entities_owner_kind ON entities(owner_id,kind);
+      CREATE INDEX IF NOT EXISTS entities_event_task ON entities(owner_id,json_extract(data,'$.taskId'),json_extract(data,'$.sequence'))
+        WHERE kind='event';`);
   }
 
   async create<T>(kind: string, ownerId: string, data: T, id: string = randomUUID()): Promise<Entity<T>> {
@@ -56,6 +58,13 @@ export class SqliteStore implements Store {
       ? this.db.prepare('SELECT * FROM entities WHERE kind=? ORDER BY created_at,id').all(kind)
       : this.db.prepare('SELECT * FROM entities WHERE kind=? AND owner_id=? ORDER BY created_at,id').all(kind, ownerId);
     return (rows as Row[]).map(decode<T>);
+  }
+
+  async taskEvents(ownerId: string, taskId: string, after = 0): Promise<Array<Entity<TaskEvent>>> {
+    const rows = this.db.prepare(`SELECT * FROM entities
+      WHERE kind='event' AND owner_id=? AND json_extract(data,'$.taskId')=? AND json_extract(data,'$.sequence')>?
+      ORDER BY json_extract(data,'$.sequence'),created_at,id`).all(ownerId, taskId, after);
+    return (rows as Row[]).map(decode<TaskEvent>);
   }
 
   async queryMemory(query: MemoryQuery): Promise<MemoryQueryPage> {
