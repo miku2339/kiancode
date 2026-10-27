@@ -257,7 +257,7 @@ test('a device retry on another instance repairs its pending stop transition bef
 });
 
 test('a durable task runs once for a repeated client request and records its result', async () => {
-  const store = new SqliteStore();
+  const store = new CompletionRaceStore();
   let calls = 0;
   const service = new TaskService(store, async ({ onEvent }) => {
     calls += 1;
@@ -274,6 +274,10 @@ test('a durable task runs once for a repeated client request and records its res
     assert.equal(calls, 1);
     assert.equal((await store.get<Task>('task', first.id, principal.id))?.data.state, 'completed');
     assert.equal((await store.scan('message', principal.id)).length, 2);
+    assert.deepEqual(store.assistantWriteStates, ['completed']);
+    assert.equal((await service.events(principal.id, first.id)).filter((event) => event.data.type === 'completed').length, 1);
+    const notifications = await store.scan<{ type: string }>('notification', principal.id);
+    assert.equal(notifications.filter((notification) => notification.data.type === 'task_completed').length, 1);
     await assert.rejects(service.enqueue({ ...principal, id: 'bob' }, thread.id, 'steal'), /not found/i);
   } finally { await service.close(); await store.close(); }
 });
@@ -1076,19 +1080,126 @@ test('a task clears its device wait error after reconnecting and completing', as
 });
 
 test('a cancellation after the runner returns does not record completion', async () => {
-  const store = new CancelBeforeCompletionStore(new SqliteStore());
+  const store = new CompletionRaceStore();
   const service = new TaskService(store, async () => ({ text: 'finished too late' }));
-  store.service = service;
+  store.beforeCompletion = async (ownerId, taskId) => { await service.control(ownerId, taskId, 'cancel'); };
   try {
     const thread = await store.create('conversation', principal.id, conversation);
     const task = await service.enqueue(principal, thread.id, 'cancel at the finish line');
     await service.drain();
 
     assert.equal((await store.get<Task>('task', task.id, principal.id))?.data.state, 'cancelled');
+    assert.equal(store.completionConflicts, 1);
+    assert.equal(await store.get('message', `${task.id}:assistant`, principal.id), undefined);
     const types = (await service.events(principal.id, task.id)).map((event) => event.data.type);
     assert.deepEqual(types, ['queued', 'cancel']);
     const notifications = await store.scan<{ type: string }>('notification', principal.id);
     assert.ok(!notifications.some((notification) => notification.data.type === 'task_completed'));
+  } finally { await service.close(); await store.close(); }
+});
+
+test('a pause during the completion CAS leaves no assistant message after a conflict reread', async () => {
+  const store = new CompletionRaceStore();
+  const service = new TaskService(store, async () => ({ text: 'paused before completion' }));
+  store.beforeCompletion = async (ownerId, taskId) => { await service.control(ownerId, taskId, 'pause'); };
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'pause at the finish line');
+    await service.drain();
+
+    assert.equal((await store.get<Task>('task', task.id, principal.id))?.data.state, 'paused');
+    assert.equal(store.completionConflicts, 1);
+    assert.equal(await store.get('message', `${task.id}:assistant`, principal.id), undefined);
+    assert.deepEqual((await service.events(principal.id, task.id)).map((event) => event.data.type), ['queued', 'pause']);
+    assert.equal((await store.scan('notification', principal.id)).length, 0);
+  } finally { await service.close(); await store.close(); }
+});
+
+test('a lease takeover during the completion CAS leaves the new executor no assistant message', async () => {
+  const store = new CompletionRaceStore();
+  const service = new TaskService(store, async () => ({ text: 'stale executor result' }));
+  store.beforeCompletion = async (ownerId, taskId) => {
+    const current = (await store.get<Task>('task', taskId, ownerId))!;
+    await store.put('task', taskId, ownerId, {
+      ...current.data,
+      workerId: 'replacement-executor',
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }, current.revision);
+  };
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'another executor takes the lease');
+    await service.drain();
+
+    const current = (await store.get<Task>('task', task.id, principal.id))!;
+    assert.equal(current.data.state, 'running');
+    assert.equal(current.data.workerId, 'replacement-executor');
+    assert.equal(store.completionConflicts, 1);
+    assert.equal(await store.get('message', `${task.id}:assistant`, principal.id), undefined);
+    assert.deepEqual((await service.events(principal.id, task.id)).map((event) => event.data.type), ['queued']);
+    assert.equal((await store.scan('notification', principal.id)).length, 0);
+  } finally { await service.close(); await store.close(); }
+});
+
+test('concurrent readers repair one completed assistant message after its publication failed', { timeout: 5_000 }, async () => {
+  const store = new CompletionRaceStore();
+  store.failAssistantWrites = true;
+  const errors: unknown[] = [];
+  const service = new TaskService(store, async () => ({ text: 'durable completed result' }), { onError: (error) => errors.push(error) });
+  const firstReader = new TaskService(store, async () => ({ text: 'unused' }));
+  const secondReader = new TaskService(store, async () => ({ text: 'unused' }));
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'complete before publishing the assistant message');
+    await service.drain();
+    const completed = (await store.get<Task>('task', task.id, principal.id))!;
+    assert.equal(completed.data.state, 'completed');
+    assert.equal(completed.data.result, 'durable completed result');
+    assert.equal(await store.get('message', `${task.id}:assistant`, principal.id), undefined);
+    assert.ok(errors.some((error) => String(error).includes('Assistant message storage failed')));
+
+    store.failAssistantWrites = false;
+    let arrivals = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    store.beforeAssistantWrite = async () => {
+      if (++arrivals === 2) { store.beforeAssistantWrite = undefined; release(); }
+      await barrier;
+    };
+    const results = await Promise.all([
+      firstReader.events(principal.id, task.id),
+      secondReader.events(principal.id, task.id),
+    ]);
+    assert.equal(arrivals, 2);
+    assert.equal(store.assistantConflicts, 1);
+    assert.ok(results.every((events) => events.filter((event) => event.data.type === 'completed').length === 1));
+    await firstReader.events(principal.id, task.id);
+    const messages = (await store.scan<Message>('message', principal.id)).filter((message) => message.data.role === 'assistant');
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0]!.id, `${task.id}:assistant`);
+    assert.equal(messages[0]!.data.content, completed.data.result);
+    assert.equal((await store.get<Task>('task', task.id, principal.id))!.revision, completed.revision);
+  } finally { await firstReader.close(); await secondReader.close(); await service.close(); await store.close(); }
+});
+
+test('completion preserves an existing fixed assistant message', async () => {
+  const store = new SqliteStore();
+  const service = new TaskService(store, async () => ({ text: 'runner result' }));
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'preserve an existing assistant message');
+    const existing = await store.create<Message>('message', principal.id, {
+      conversationId: thread.id,
+      role: 'assistant',
+      content: 'existing result',
+      taskId: task.id,
+      sequence: 2,
+    }, `${task.id}:assistant`);
+    await service.drain();
+    await service.events(principal.id, task.id);
+
+    assert.deepEqual(await store.get('message', existing.id, principal.id), existing);
+    assert.equal((await store.scan<Message>('message', principal.id)).filter((message) => message.data.role === 'assistant').length, 1);
   } finally { await service.close(); await store.close(); }
 });
 
@@ -1147,38 +1258,38 @@ class CancelOnSequenceReadStore implements Store {
   }
 }
 
-class CancelBeforeCompletionStore implements Store {
-  public service?: TaskService;
+class CompletionRaceStore extends SqliteStore {
+  public beforeCompletion?: (ownerId: string, taskId: string) => Promise<void>;
+  public beforeAssistantWrite?: () => Promise<void>;
+  public failAssistantWrites = false;
+  public completionConflicts = 0;
+  public assistantConflicts = 0;
+  public readonly assistantWriteStates: Array<Task['state'] | undefined> = [];
 
-  public constructor(private readonly delegate: Store) {}
-
-  public async create<T>(kind: string, ownerId: string, data: T, id?: string): Promise<Entity<T>> {
-    const service = this.service;
-    if (kind === 'message' && id?.endsWith(':assistant') && service) {
-      this.service = undefined;
-      await service.control(ownerId, id.slice(0, -':assistant'.length), 'cancel');
+  public override async create<T>(kind: string, ownerId: string, data: T, id?: string): Promise<Entity<T>> {
+    const assistant = kind === 'message' && id?.endsWith(':assistant');
+    if (assistant && id) {
+      this.assistantWriteStates.push((await super.get<Task>('task', id.slice(0, -':assistant'.length), ownerId))?.data.state);
+      if (this.failAssistantWrites) throw new Error('Assistant message storage failed');
+      await this.beforeAssistantWrite?.();
     }
-    return this.delegate.create(kind, ownerId, data, id);
+    try {
+      return await super.create(kind, ownerId, data, id);
+    } catch (error) {
+      if (assistant && error instanceof DomainError && error.code === 'conflict') this.assistantConflicts += 1;
+      throw error;
+    }
   }
 
-  public get<T>(kind: string, id: string, ownerId: string): Promise<Entity<T> | undefined> {
-    return this.delegate.get(kind, id, ownerId);
-  }
-
-  public scan<T>(kind: string, ownerId?: string): Promise<Array<Entity<T>>> {
-    return this.delegate.scan(kind, ownerId);
-  }
-
-  public put<T>(kind: string, id: string, ownerId: string, data: T, revision: number): Promise<Entity<T>> {
-    return this.delegate.put(kind, id, ownerId, data, revision);
-  }
-
-  public remove(kind: string, id: string, ownerId: string, revision: number): Promise<boolean> {
-    return this.delegate.remove(kind, id, ownerId, revision);
-  }
-
-  public close(): Promise<void> {
-    return this.delegate.close();
+  public override async put<T>(kind: string, id: string, ownerId: string, data: T, revision: number): Promise<Entity<T>> {
+    const hook = kind === 'task' && (data as Task).state === 'completed' ? this.beforeCompletion : undefined;
+    if (hook) { this.beforeCompletion = undefined; await hook(ownerId, id); }
+    try {
+      return await super.put(kind, id, ownerId, data, revision);
+    } catch (error) {
+      if (hook && error instanceof DomainError && error.code === 'conflict') this.completionConflicts += 1;
+      throw error;
+    }
   }
 }
 

@@ -905,7 +905,28 @@ export class TaskService {
   // publish the same event instead of a duplicate.
   private async ensureTransitionEvent(task: Entity<Task>): Promise<void> {
     const transition = taskTransition(task);
+    if (transition?.state === 'completed' && transition.payload.type === 'completed'
+      && typeof task.data.result === 'string') {
+      await this.ensureAssistantMessage(task, task.data.result);
+    }
     if (transition) await this.fixedEvent(task, transition.eventId, transition.payload, transition.at);
+  }
+
+  private async ensureAssistantMessage(task: Entity<Task>, content: string): Promise<void> {
+    const id = `${task.id}:assistant`;
+    if (await this.store.get('message', id, task.ownerId)) return;
+    try {
+      await this.store.create<Message>('message', task.ownerId, {
+        conversationId: task.data.conversationId,
+        role: 'assistant',
+        content,
+        taskId: task.id,
+        sequence: await this.nextMessageSequence(task.ownerId, task.data.conversationId),
+      }, id);
+    } catch (error) {
+      if (!(error instanceof DomainError && error.code === 'conflict')) throw error;
+      if (!await this.store.get('message', id, task.ownerId)) throw error;
+    }
   }
 
   // Records the event that announces a state in the write that enters it, keyed by the revision it replaces.
@@ -1289,15 +1310,6 @@ export class TaskService {
       const resultArtifactIds = state === 'completed'
         ? await this.confirmedResultArtifactIds(task.ownerId, task.id)
         : [];
-      if (state === 'completed' && !await this.store.get('message', `${task.id}:assistant`, task.ownerId)) {
-        await this.store.create<Message>('message', task.ownerId, {
-          conversationId: conversation.id,
-          role: 'assistant',
-          content: result.text,
-          taskId: task.id,
-          sequence: await this.nextMessageSequence(task.ownerId, conversation.id),
-        }, `${task.id}:assistant`);
-      }
       let transitioned = false;
       const updated = await this.change(task.ownerId, task.id, (data, revision) => {
         transitioned = data.state === 'running' && data.workerId === this.workerId;
