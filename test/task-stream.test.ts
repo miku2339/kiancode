@@ -312,6 +312,102 @@ test('another instance publishes a lost transition event once and ends the strea
   }
 });
 
+test('a task stream reconnects after its last received event without replaying it', { timeout: 15_000 }, async () => {
+  const store = new SqliteStore();
+  let releaseRunner!: () => void;
+  const runnerMayFinish = new Promise<void>((resolve) => { releaseRunner = resolve; });
+  let markRunnerStarted!: () => void;
+  const runnerStarted = new Promise<void>((resolve) => { markRunnerStarted = resolve; });
+  const server = await createServer({
+    store,
+    authenticate: developmentAuth(token),
+    runner: async () => {
+      markRunnerStarted();
+      await runnerMayFinish;
+      return { text: 'completed after reconnecting' };
+    },
+  });
+  const disconnected = new AbortController();
+  let draining: Promise<void> | undefined;
+  try {
+    const thread = await store.create('conversation', owner.id, conversation);
+    const task = await server.tasks.enqueue(owner, thread.id, 'reconnect while running');
+    draining = server.tasks.drain();
+    await runnerStarted;
+    const address = await server.app.listen({ host: '127.0.0.1', port: 0 });
+    const url = `${address}/v1/tasks/${task.id}/stream`;
+    const initial = await fetch(url, { headers, signal: disconnected.signal });
+    assert.equal(initial.status, 200);
+    const reader = initial.body!.getReader();
+    const first = await reader.read();
+    const received = streamedSequences(new TextDecoder().decode(first.value));
+    assert.equal(received.length, 1);
+    const lastReceived = received[0]!;
+    disconnected.abort();
+    await reader.cancel().catch(() => undefined);
+    releaseRunner();
+    await draining;
+
+    const reconnected = await fetch(url, { headers: { ...headers, 'last-event-id': String(lastReceived) }, signal: AbortSignal.timeout(2_000) });
+    const body = await reconnected.text();
+
+    assert.equal(reconnected.status, 200, body);
+    assert.ok(streamedSequences(body).every((sequence) => sequence > lastReceived), body);
+    assert.equal((body.match(/event: completed/g) ?? []).length, 1, body);
+    const lastCompleted = streamedSequences(body).at(-1)!;
+    const terminal = await fetch(url, { headers: { ...headers, 'last-event-id': String(lastCompleted) }, signal: AbortSignal.timeout(2_000) });
+    assert.equal(terminal.status, 200);
+    assert.equal(await terminal.text(), '');
+  } finally {
+    disconnected.abort();
+    releaseRunner();
+    await draining;
+    await server.close();
+  }
+});
+
+test('a task stream selects and validates its resume cursor', { timeout: 15_000 }, async (t) => {
+  const store = new SqliteStore();
+  const server = await createServer({ store, authenticate: developmentAuth(token), runner: async () => ({ text: 'cursor result' }) });
+  try {
+    const thread = await store.create('conversation', owner.id, conversation);
+    const task = await server.tasks.enqueue(owner, thread.id, 'read selected events');
+    await server.tasks.drain();
+    const cases: Array<{ name: string; after?: string; lastEventId?: string; status?: number; sequences?: number[] }> = [
+      { name: 'no cursor replays the history', sequences: [1, 2] },
+      { name: 'query cursor remains supported without a header', after: '1', sequences: [2] },
+      { name: 'a later header wins over an earlier query', after: '0', lastEventId: '1', sequences: [2] },
+      { name: 'a zero header wins over a later query', after: '2', lastEventId: '0', sequences: [1, 2] },
+      { name: 'a valid header wins over an invalid query', after: 'invalid', lastEventId: '1', sequences: [2] },
+      { name: 'a zero header wins over an invalid query', after: '-1', lastEventId: '0', sequences: [1, 2] },
+      { name: 'an acknowledged terminal event ends with no replay', after: '0', lastEventId: '2', sequences: [] },
+      { name: 'the maximum safe header cursor is accepted', after: '0', lastEventId: String(Number.MAX_SAFE_INTEGER), sequences: [] },
+      { name: 'an empty header uses the query cursor', after: '1', lastEventId: '', sequences: [2] },
+      { name: 'an empty header without a query replays the history', lastEventId: '', sequences: [1, 2] },
+      { name: 'an empty header preserves query validation', after: 'invalid', lastEventId: '', status: 400 },
+      { name: 'a negative header is rejected', lastEventId: '-1', status: 400 },
+      { name: 'a nonnumeric header is rejected', lastEventId: 'invalid', status: 400 },
+      { name: 'a fractional header is rejected', lastEventId: '1.5', status: 400 },
+      { name: 'an unsafe header integer is rejected', lastEventId: '9007199254740992', status: 400 },
+    ];
+    for (const entry of cases) {
+      await t.test(entry.name, async () => {
+        const query = entry.after === undefined ? '' : `?after=${encodeURIComponent(entry.after)}`;
+        const requestHeaders = entry.lastEventId === undefined ? headers : { ...headers, 'last-event-id': entry.lastEventId };
+        const stream = await server.app.inject({ method: 'GET', url: `/v1/tasks/${task.id}/stream${query}`, headers: requestHeaders });
+        assert.equal(stream.statusCode, entry.status ?? 200, stream.body);
+        if (entry.sequences) assert.deepEqual(streamedSequences(stream.body), entry.sequences, stream.body);
+      });
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+function streamedSequences(body: string): number[] {
+  return [...body.matchAll(/^id: (\d+)$/gm)].map((match) => Number(match[1]));
+}
+
 function streamedEvents(body: string): TaskEvent[] {
   return [...body.matchAll(/^data: (.+)$/gm)].map((match) => JSON.parse(match[1]!) as TaskEvent);
 }

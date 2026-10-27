@@ -549,8 +549,11 @@ export async function createServer(options: ServerOptions) {
       reply.raw.end(`id: 1\nevent: degraded\ndata: ${JSON.stringify({ type: task.state, payload: outageTask(task).data, degraded: true })}\n\n`);
       return;
     }
-    const query = z.object({ after: z.coerce.number().int().nonnegative().default(0) }).parse(request.query);
-    let sequence = query.after;
+    const cursor = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+    const lastEventId = request.headers['last-event-id'];
+    let sequence = lastEventId === undefined || lastEventId === ''
+      ? z.object({ after: z.coerce.number().pipe(cursor).default(0) }).parse(request.query).after
+      : z.string().regex(/^\d+$/).transform(Number).pipe(cursor).parse(lastEventId);
     reply.hijack();
     reply.raw.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache, no-transform', 'x-accel-buffering': 'no' });
     let closed = false;
