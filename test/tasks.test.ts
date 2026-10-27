@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { SqliteStore } from '../src/storage/sqlite.js';
-import { orderMessages, TaskService } from '../src/tasks.js';
+import { orderMessages, taskTransitionEventId, TaskService } from '../src/tasks.js';
 import type { Conversation, Message, Task, TaskEvent } from '../src/domain.js';
 import { DomainError, type Principal } from '../src/contracts.js';
 import { NotificationService } from '../src/notifications.js';
@@ -114,6 +114,147 @@ class TerminalEventRaceStore implements Store {
     return this.delegate.close();
   }
 }
+
+class TransitionFailureStore implements Store {
+  public failTransitions = true;
+  public delayDispatch = false;
+  public readonly dispatchReserved: Promise<void>;
+  private markDispatchReserved!: () => void;
+  private readonly dispatchMayCommit: Promise<void>;
+  private releaseDispatch!: () => void;
+  private readonly dispatchCommitted: Promise<void>;
+  private markDispatchCommitted!: () => void;
+
+  public constructor(private readonly delegate: Store) {
+    this.dispatchReserved = new Promise((resolve) => { this.markDispatchReserved = resolve; });
+    this.dispatchMayCommit = new Promise((resolve) => { this.releaseDispatch = resolve; });
+    this.dispatchCommitted = new Promise((resolve) => { this.markDispatchCommitted = resolve; });
+  }
+
+  public async create<T>(kind: string, ownerId: string, data: T, id?: string): Promise<Entity<T>> {
+    const event = data as TaskEvent;
+    if (kind === 'event' && event.type === 'tool_dispatched' && this.delayDispatch) {
+      this.markDispatchReserved();
+      await this.dispatchMayCommit;
+      const row = await this.delegate.create(kind, ownerId, data, id);
+      this.markDispatchCommitted();
+      return row;
+    }
+    if (kind === 'event' && this.failTransitions
+      && ['cancel', 'pause', 'transition'].includes(event.type)) {
+      throw new Error('Transition event storage failed');
+    }
+    return this.delegate.create(kind, ownerId, data, id);
+  }
+
+  public get<T>(kind: string, id: string, ownerId: string): Promise<Entity<T> | undefined> {
+    return this.delegate.get(kind, id, ownerId);
+  }
+
+  public scan<T>(kind: string, ownerId?: string): Promise<Array<Entity<T>>> {
+    return this.delegate.scan(kind, ownerId);
+  }
+
+  public async put<T>(kind: string, id: string, ownerId: string, data: T, revision: number): Promise<Entity<T>> {
+    const row = await this.delegate.put(kind, id, ownerId, data, revision);
+    if (kind === 'task' && (data as Task).state === 'cancelled' && this.delayDispatch) {
+      this.releaseDispatch();
+      await this.dispatchCommitted;
+    }
+    return row;
+  }
+
+  public remove(kind: string, id: string, ownerId: string, revision: number): Promise<boolean> {
+    return this.delegate.remove(kind, id, ownerId, revision);
+  }
+
+  public close(): Promise<void> {
+    this.releaseDispatch();
+    return this.delegate.close();
+  }
+}
+
+test('transition publication failures do not hide a dispatch racing with cancellation', { timeout: 5_000 }, async () => {
+  const store = new TransitionFailureStore(new SqliteStore());
+  store.delayDispatch = true;
+  const service = new TaskService(store, async ({ onEvent, signal }) => {
+    await onEvent({ type: 'tool_dispatched', toolCallId: 'external-1', sideEffect: 'external' });
+    await new Promise<never>((_resolve, reject) => {
+      if (signal.aborted) { reject(signal.reason); return; }
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+    return { text: 'unused' };
+  }, { reauthorize: async (value) => value });
+  const reader = new TaskService(store, async () => ({ text: 'unused' }));
+  let draining: Promise<void> | undefined;
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await service.enqueue(principal, thread.id, 'cancel during external dispatch');
+    draining = service.drain();
+    await store.dispatchReserved;
+    await assert.rejects(service.control(principal.id, task.id, 'cancel'), /Transition event storage failed/);
+    await draining;
+    store.failTransitions = false;
+    const events = await reader.events(principal.id, task.id);
+    assert.ok(events.some((row) => row.data.type === 'tool_dispatched'));
+    assert.ok(!events.some((row) => row.data.type === 'tool_result'));
+    assert.equal((await store.get<Task>('task', task.id, principal.id))?.data.state, 'unknown');
+  } finally {
+    await draining?.catch(() => undefined);
+    await reader.close();
+    await service.close();
+    await store.close();
+  }
+});
+
+test('resuming on another instance preserves a pending pause transition', async () => {
+  const store = new TransitionFailureStore(new SqliteStore());
+  const first = new TaskService(store, async () => ({ text: 'unused' }));
+  const second = new TaskService(store, async () => ({ text: 'unused' }));
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await first.enqueue(principal, thread.id, 'pause before resuming elsewhere');
+    await assert.rejects(first.control(principal.id, task.id, 'pause'), /Transition event storage failed/);
+    const paused = (await store.get<Task>('task', task.id, principal.id))!;
+    const transitionId = taskTransitionEventId(paused);
+    assert.equal(paused.data.state, 'paused');
+    assert.equal(await store.get('event', transitionId!, principal.id), undefined);
+
+    store.failTransitions = false;
+    assert.equal((await second.control(principal.id, task.id, 'resume')).data.state, 'queued');
+    await second.events(principal.id, task.id);
+    const events = await first.events(principal.id, task.id);
+    assert.deepEqual(events.map((row) => row.data.type), ['queued', 'pause', 'resume']);
+    assert.equal(events.filter((row) => row.id === transitionId).length, 1);
+  } finally { await first.close(); await second.close(); await store.close(); }
+});
+
+test('a device retry on another instance repairs its pending stop transition before claiming', async () => {
+  const store = new TransitionFailureStore(new SqliteStore());
+  let now = Date.now();
+  const first = new TaskService(store, async () => {
+    throw new DomainError('waiting_for_device', 'Device unavailable', 503);
+  }, { now: () => now });
+  const second = new TaskService(store, async () => ({ text: 'device reconnected' }), { now: () => now });
+  try {
+    const thread = await store.create('conversation', principal.id, conversation);
+    const task = await first.enqueue(principal, thread.id, 'retry after the device reconnects');
+    await first.drain();
+    const waiting = (await store.get<Task>('task', task.id, principal.id))!;
+    const transitionId = taskTransitionEventId(waiting);
+    assert.equal(waiting.data.state, 'waiting_for_device');
+    assert.equal(await store.get('event', transitionId!, principal.id), undefined);
+
+    store.failTransitions = false;
+    now += 10_001;
+    await second.drain();
+    assert.equal((await store.get<Task>('task', task.id, principal.id))?.data.state, 'completed');
+    await second.events(principal.id, task.id);
+    const events = await first.events(principal.id, task.id);
+    assert.deepEqual(events.map((row) => row.data.type), ['queued', 'transition', 'completed']);
+    assert.equal(events.filter((row) => row.id === transitionId).length, 1);
+  } finally { await first.close(); await second.close(); await store.close(); }
+});
 
 test('a durable task runs once for a repeated client request and records its result', async () => {
   const store = new SqliteStore();

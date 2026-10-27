@@ -1,16 +1,52 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { developmentAuth } from '../src/auth.js';
-import type { Principal } from '../src/contracts.js';
-import type { Conversation, Task, TaskEvent } from '../src/domain.js';
+import { DomainError, type Principal } from '../src/contracts.js';
+import type { Conversation, Task, TaskEvent, TaskState } from '../src/domain.js';
 import { createServer } from '../src/http/server.js';
 import { SqliteStore } from '../src/storage/sqlite.js';
 import type { Entity, Store } from '../src/storage/store.js';
+import { TaskService } from '../src/tasks.js';
 
 const token = 'task-stream-development-token-thirty-two-chars';
 const headers = { authorization: `Bearer ${token}` };
 const owner: Principal = { id: 'local-owner', level: 1, scopes: ['*'] };
 const conversation: Conversation = { title: 'Stream', scope: 'private', modelPolicy: 'cloud', strategy: 'single', mode: 'act', archived: false };
+
+// Fails the first transition event a writer publishes, as if its instance stopped after the state write.
+class LostTransitionEventStore implements Store {
+  private lost = false;
+
+  public constructor(private readonly delegate: Store) {}
+
+  public async create<T>(kind: string, ownerId: string, data: T, id?: string): Promise<Entity<T>> {
+    if (kind === 'event' && id?.includes(':transition:') && !this.lost) {
+      this.lost = true;
+      throw new Error('instance stopped before publishing the transition');
+    }
+    return this.delegate.create(kind, ownerId, data, id);
+  }
+
+  public get<T>(kind: string, id: string, ownerId: string): Promise<Entity<T> | undefined> {
+    return this.delegate.get(kind, id, ownerId);
+  }
+
+  public scan<T>(kind: string, ownerId?: string): Promise<Array<Entity<T>>> {
+    return this.delegate.scan(kind, ownerId);
+  }
+
+  public put<T>(kind: string, id: string, ownerId: string, data: T, revision: number): Promise<Entity<T>> {
+    return this.delegate.put(kind, id, ownerId, data, revision);
+  }
+
+  public remove(kind: string, id: string, ownerId: string, revision: number): Promise<boolean> {
+    return this.delegate.remove(kind, id, ownerId, revision);
+  }
+
+  public close(): Promise<void> {
+    return this.delegate.close();
+  }
+}
 
 class DelayedCompletionEventStore implements Store {
   public constructor(
@@ -46,6 +82,16 @@ class DelayedCompletionEventStore implements Store {
   }
 }
 
+class TaskReadBarrierStore extends SqliteStore {
+  public afterTaskRead?: (task: Entity<Task>) => Promise<void>;
+
+  public override async get<T>(kind: string, id: string, ownerId: string): Promise<Entity<T> | undefined> {
+    const row = await super.get<T>(kind, id, ownerId);
+    if (kind === 'task' && row) await this.afterTaskRead?.(row as Entity<Task>);
+    return row;
+  }
+}
+
 test('a task stream delivers the completion event persisted after the completed state', { timeout: 15_000 }, async () => {
   const store = new DelayedCompletionEventStore(new SqliteStore(), 2_500);
   const server = await createServer({
@@ -63,8 +109,8 @@ test('a task stream delivers the completion event persisted after the completed 
       if (Date.now() >= deadline) throw new Error('Timed out waiting for the completed state');
       await new Promise<void>((resolve) => setTimeout(resolve, 5));
     }
-    const terminalEvents = (await server.tasks.events(owner.id, task.id))
-      .filter((event) => event.data.type === 'completed');
+    const terminalEvents = (await store.scan<TaskEvent>('event', owner.id))
+      .filter((event) => event.data.taskId === task.id && event.data.type === 'completed');
     assert.equal(terminalEvents.length, 0, 'the completion event must still be pending when the stream opens');
 
     const stream = await Promise.race([
@@ -107,6 +153,72 @@ test('a cancelled task stream ends when a later event follows its cancellation',
   }
 });
 
+test('a task stream follows a task resumed after its stopped snapshot was read', { timeout: 15_000 }, async () => {
+  const store = new TaskReadBarrierStore();
+  const server = await createServer({
+    store,
+    authenticate: developmentAuth(token),
+    runner: async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      return { text: 'completed after concurrent resume' };
+    },
+  });
+  const other = new TaskService(store, async () => ({ text: 'unused' }));
+  let draining: Promise<void> | undefined;
+  try {
+    const thread = await store.create('conversation', owner.id, conversation);
+    const task = await server.tasks.enqueue(owner, thread.id, 'resume while streaming');
+    await server.tasks.control(owner.id, task.id, 'pause');
+    let reads = 0;
+    store.afterTaskRead = async (snapshot) => {
+      // The first read checks access; the next supplies the stream's stopped snapshot.
+      if (++reads !== 2) return;
+      store.afterTaskRead = undefined;
+      assert.equal(snapshot.data.state, 'paused');
+      await other.control(owner.id, task.id, 'resume', [], owner);
+      draining = server.tasks.drain();
+    };
+
+    const stream = await streamWithin(server, task.id, 10_000);
+
+    assert.equal(stream.statusCode, 200, stream.body);
+    assert.match(stream.body, /event: resume/);
+    assert.equal((stream.body.match(/event: completed/g) ?? []).length, 1, stream.body);
+    assert.match(stream.body, /completed after concurrent resume/);
+  } finally {
+    store.afterTaskRead = undefined;
+    await draining;
+    await other.close();
+    await server.close();
+  }
+});
+
+test('a task stream ends when metadata changes preserve its stopped transition', { timeout: 15_000 }, async () => {
+  const store = new TaskReadBarrierStore();
+  const server = await createServer({ store, authenticate: developmentAuth(token), runner: async () => ({ text: 'unused' }) });
+  try {
+    const thread = await store.create('conversation', owner.id, conversation);
+    const task = await server.tasks.enqueue(owner, thread.id, 'pause while streaming');
+    await server.tasks.control(owner.id, task.id, 'pause');
+    let reads = 0;
+    store.afterTaskRead = async (snapshot) => {
+      if (++reads !== 2) return;
+      store.afterTaskRead = undefined;
+      await store.put('task', task.id, owner.id, { ...snapshot.data, prompt: 'updated prompt' }, snapshot.revision);
+    };
+
+    const started = Date.now();
+    const stream = await streamWithin(server, task.id, 10_000);
+
+    assert.equal(stream.statusCode, 200, stream.body);
+    assert.ok(Date.now() - started < 1_000, `the paused stream waited ${Date.now() - started}ms`);
+    assert.equal((stream.body.match(/event: pause/g) ?? []).length, 1, stream.body);
+  } finally {
+    store.afterTaskRead = undefined;
+    await server.close();
+  }
+});
+
 test('an earlier reconciliation does not end a completed stream before its completion event', { timeout: 15_000 }, async () => {
   const store = new DelayedCompletionEventStore(new SqliteStore(), 2_500);
   const server = await createServer({
@@ -134,6 +246,75 @@ test('an earlier reconciliation does not end a completed stream before its compl
     await server.close();
   }
 });
+
+for (const [code, state] of [
+  ['outcome_unknown', 'unknown'],
+  ['grant_expired', 'paused'],
+  ['waiting_for_device', 'waiting_for_device'],
+] as const) {
+  test(`a task stream ends at once when a failed run leaves the task ${state}`, { timeout: 15_000 }, async () => {
+    const store = new SqliteStore();
+    const server = await createServer({
+      store,
+      authenticate: developmentAuth(token),
+      runner: async () => {
+        throw new DomainError(code, `runner stopped with ${code}`, 409);
+      },
+    });
+    try {
+      const thread = await store.create('conversation', owner.id, conversation);
+      const task = await server.tasks.enqueue(owner, thread.id, `stop as ${state}`);
+      await server.tasks.drain();
+      assert.equal((await store.get<Task>('task', task.id, owner.id))?.data.state, state);
+
+      const started = Date.now();
+      const stream = await streamWithin(server, task.id, 10_000);
+
+      assert.equal(stream.statusCode, 200, stream.body);
+      assert.ok(Date.now() - started < 1_000, `the ${state} stream waited ${Date.now() - started}ms`);
+      const transitions = streamedEvents(stream.body).filter((event) => event.type === 'transition');
+      assert.equal(transitions.length, 1, stream.body);
+      assert.equal((transitions[0]!.payload as { state?: TaskState }).state, state);
+    } finally {
+      await server.close();
+    }
+  });
+}
+
+test('another instance publishes a lost transition event once and ends the stream', { timeout: 15_000 }, async () => {
+  const store = new LostTransitionEventStore(new SqliteStore());
+  const first = await createServer({ store, authenticate: developmentAuth(token), runner: async () => ({ text: 'unused' }) });
+  const second = await createServer({ store, authenticate: developmentAuth(token), runner: async () => ({ text: 'unused' }) });
+  try {
+    const thread = await store.create('conversation', owner.id, conversation);
+    const task = await first.tasks.enqueue(owner, thread.id, 'cancel while the first instance stops');
+    await assert.rejects(first.tasks.control(owner.id, task.id, 'cancel'), /instance stopped/);
+    assert.equal((await store.get<Task>('task', task.id, owner.id))?.data.state, 'cancelled');
+
+    const started = Date.now();
+    const [stream] = await Promise.all([
+      streamWithin(second, task.id, 10_000),
+      first.tasks.events(owner.id, task.id),
+      second.tasks.events(owner.id, task.id),
+    ]);
+    await first.tasks.events(owner.id, task.id);
+
+    assert.equal(stream.statusCode, 200, stream.body);
+    assert.ok(Date.now() - started < 1_000, `the cancelled stream waited ${Date.now() - started}ms`);
+    assert.equal((stream.body.match(/event: cancel/g) ?? []).length, 1, stream.body);
+    const cancellations = (await store.scan<TaskEvent>('event', owner.id))
+      .filter((event) => event.data.taskId === task.id && event.data.type === 'cancel');
+    assert.equal(cancellations.length, 1);
+    assert.deepEqual(cancellations[0]!.data.payload, { type: 'cancel', state: 'cancelled' });
+  } finally {
+    await first.close();
+    await second.close();
+  }
+});
+
+function streamedEvents(body: string): TaskEvent[] {
+  return [...body.matchAll(/^data: (.+)$/gm)].map((match) => JSON.parse(match[1]!) as TaskEvent);
+}
 
 async function appendEvent(
   store: Store,
