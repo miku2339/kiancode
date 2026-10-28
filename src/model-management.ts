@@ -202,11 +202,37 @@ export class ModelManagement {
       if (text.message.content.trim() !== 'MODEL_READY') throw new DomainError('model_probe_failed', 'The model did not complete the text probe', 422);
       if (capabilities.includes('tools')) {
         model.capabilities = ['tools'];
-        const tool: ToolDefinition = { name: 'probe.echo', description: 'Return the supplied value unchanged.', inputSchema: { type: 'object', properties: { value: { type: 'string', const: 'TOOL_READY' } }, required: ['value'], additionalProperties: false }, requiredCapabilities: [], sideEffect: 'read', async execute() { return { content: 'TOOL_READY' }; } };
-        const messages: ChatRequest['messages'] = [{ role: 'user', content: 'Call probe.echo with value TOOL_READY, then repeat its returned value exactly.' }];
+        const expectedArguments = {
+          value: 'TOOL_READY',
+          path: '驗收/日本語-🙂.txt',
+          content: '臺灣・日本語🙂\n',
+          emptyContent: '',
+          noNewlineContent: '沒有結尾換行',
+          doubleNewlineContent: '兩個換行\n\n',
+          crlfContent: 'CRLF\r\n',
+        };
+        const tool: ToolDefinition = {
+          name: 'probe.echo', description: 'Return value after receiving the exact raw string fields.',
+          inputSchema: {
+            type: 'object',
+            properties: Object.fromEntries(Object.entries(expectedArguments).map(([name, value]) => [name, { type: 'string', const: value }])),
+            required: Object.keys(expectedArguments), additionalProperties: false,
+          },
+          requiredCapabilities: [], sideEffect: 'read',
+          async execute() { return { content: 'TOOL_READY' }; },
+        };
+        const messages: ChatRequest['messages'] = [{
+          role: 'user',
+          content: `Call probe.echo using exactly these individual string fields. Decode the JSON escapes into raw characters, preserving Unicode, empty strings, and every line ending without trimming, normalization, or JSON-wrapping a field. After reading the tool result, repeat its returned value exactly.\n${JSON.stringify(expectedArguments)}`,
+        }];
         const first = await request(messages, [tool]);
         const call = first.message.toolCalls?.[0];
-        if (first.message.toolCalls?.length !== 1 || call?.name !== tool.name || JSON.stringify(call.arguments) !== JSON.stringify({ value: 'TOOL_READY' })) throw new DomainError('model_probe_failed', 'The model did not complete the tool probe', 422);
+        const args = call?.arguments;
+        if (first.message.toolCalls?.length !== 1 || call?.name !== tool.name || !args || Array.isArray(args)
+          || Object.keys(args).length !== Object.keys(expectedArguments).length
+          || Object.entries(expectedArguments).some(([name, value]) => !Object.hasOwn(args, name) || args[name] !== value)) {
+          throw new DomainError('model_probe_failed', 'The model did not complete the tool probe', 422);
+        }
         const result = await request([...messages, first.message, { role: 'tool', toolCallId: call.id, content: 'TOOL_READY' }]);
         if (result.message.content.trim() !== 'TOOL_READY') throw new DomainError('model_probe_failed', 'The model did not incorporate the tool result', 422);
         verified.push('tools');

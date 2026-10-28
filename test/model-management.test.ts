@@ -17,13 +17,22 @@ const other: Principal = { ...owner, id: 'two' };
 const settings: ProviderSettings = { name: 'Test', type: 'openai-compatible', locality: 'cloud', baseUrl: 'https://models.example/v1', enabled: true };
 const modelSettings: ModelSettings = { providerId: 'custom', model: 'model', enabled: false, priority: 0, architecture: 'moe' };
 const reply = (content: string) => ({ message: { role: 'assistant' as const, content }, usage: { inputTokens: 11, outputTokens: 4 } });
+const toolProbeArguments = {
+  value: 'TOOL_READY',
+  path: '驗收/日本語-🙂.txt',
+  content: '臺灣・日本語🙂\n',
+  emptyContent: '',
+  noNewlineContent: '沒有結尾換行',
+  doubleNewlineContent: '兩個換行\n\n',
+  crlfContent: 'CRLF\r\n',
+};
 const verifiedResponse = async (request: ChatRequest) => {
   if (request.messages[0]?.content === 'Reply exactly MODEL_READY.') {
     await request.onToken?.('MODEL_READY');
     return reply('MODEL_READY');
   }
   if (request.messages.at(-1)?.role === 'tool') return reply('TOOL_READY');
-  if (request.tools.length) return { ...reply(''), message: { role: 'assistant' as const, content: '', toolCalls: [{ id: 'call', name: 'probe.echo', arguments: { value: 'TOOL_READY' } }] } };
+  if (request.tools.length) return { ...reply(''), message: { role: 'assistant' as const, content: '', toolCalls: [{ id: 'call', name: 'probe.echo', arguments: { ...toolProbeArguments } }] } };
   if (request.messages[0]?.attachments?.length) return reply('RED');
   return reply('answer');
 };
@@ -100,6 +109,103 @@ test('failed capability probe disables the candidate and records a safe failure 
   await assert.rejects(service.probe(owner, 'model'), code('model_probe_failed'));
   assert.equal((await service.models(owner.id))[0]?.lastProbeError, 'model_probe_failed');
   assert.equal((await store.scan<{ state: string }>('model_probe'))[0]?.data.state, 'finished');
+});
+
+test('the tools probe checks primitive Unicode and raw string fields in the existing three calls', async (t) => {
+  const calls: ChatRequest[] = [];
+  const { store, service } = setup({ createProvider: (provider) => ({
+    ...provider,
+    async chat(request) {
+      calls.push(request);
+      if (!request.tools.length) return verifiedResponse(request);
+      assert.equal(request.tools[0]?.name, 'probe.echo');
+      const schema = request.tools[0]!.inputSchema;
+      assert.equal(schema.type, 'object');
+      assert.equal(schema.additionalProperties, false);
+      assert.deepEqual([...(schema.required as string[])].sort(), Object.keys(toolProbeArguments).sort());
+      const properties = schema.properties as Record<string, Record<string, unknown>>;
+      for (const [name, value] of Object.entries(toolProbeArguments)) {
+        assert.deepEqual(properties[name], { type: 'string', const: value });
+      }
+      assert.equal(Object.keys(properties).length, 7);
+      const prompt = request.messages[0]!.content;
+      assert.ok(prompt.includes('"content":"臺灣・日本語🙂\\n"'));
+      assert.ok(prompt.includes('"emptyContent":""'));
+      assert.ok(prompt.includes('"doubleNewlineContent":"兩個換行\\n\\n"'));
+      assert.ok(prompt.includes('"crlfContent":"CRLF\\r\\n"'));
+      return {
+        ...reply(''),
+        message: {
+          role: 'assistant', content: '',
+          toolCalls: [{ id: 'raw-call', name: 'probe.echo', arguments: Object.fromEntries(Object.entries(toolProbeArguments).reverse()) }],
+        },
+      };
+    },
+  }) });
+  t.after(() => store.close());
+  await service.saveProvider(owner, 'custom', settings, 0);
+  await service.saveModel(owner, 'model', modelSettings, 0);
+  assert.deepEqual((await service.probe(owner, 'model', ['tools'])).capabilities, ['text', 'streaming', 'tools']);
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[0]?.tools, []);
+  assert.equal(calls[2]?.messages.at(-1)?.role, 'tool');
+  assert.equal(calls[2]?.messages.at(-1)?.content, 'TOOL_READY');
+  await service.saveModel(owner, 'model', { ...modelSettings, enabled: true }, 2);
+  assert.equal((await service.models(owner.id))[0]?.enabled, true);
+});
+
+test('the tools probe rejects corrupted raw string arguments and disables a previously verified model', async (t) => {
+  const cases: Array<{ name: string; corrupt: (args: Record<string, unknown>) => void }> = [
+    { name: 'trimmed content LF', corrupt: (args) => { if (typeof args.content === 'string') args.content = args.content.trimEnd(); } },
+    { name: 'missing empty field', corrupt: (args) => { delete args.emptyContent; } },
+    { name: 'changed Unicode path', corrupt: (args) => { if (typeof args.path === 'string') args.path = args.path.replace('驗收', '验收'); } },
+    { name: 'appended no-newline LF', corrupt: (args) => { if (typeof args.noNewlineContent === 'string') args.noNewlineContent += '\n'; } },
+    { name: 'collapsed double LF', corrupt: (args) => { if (typeof args.doubleNewlineContent === 'string') args.doubleNewlineContent = args.doubleNewlineContent.replace('\n\n', '\n'); } },
+    { name: 'normalized CRLF', corrupt: (args) => { if (typeof args.crlfContent === 'string') args.crlfContent = args.crlfContent.replace('\r\n', '\n'); } },
+    { name: 'JSON-wrapped content', corrupt: (args) => { if (typeof args.content === 'string') args.content = JSON.stringify({ text: args.content }); } },
+    { name: 'additional field', corrupt: (args) => { args.extra = 'unexpected'; } },
+    { name: 'nonempty empty field', corrupt: (args) => { if ('emptyContent' in args) args.emptyContent = ' '; } },
+    { name: 'wrong result value', corrupt: (args) => { args.value = 'WRONG'; } },
+    { name: 'non-string content', corrupt: (args) => { if ('content' in args) args.content = 42; } },
+  ];
+  for (const { name, corrupt } of cases) {
+    await t.test(name, async (t) => {
+      let corrupting = false;
+      const { store, service } = setup({ createProvider: (provider) => ({
+        ...provider,
+        async chat(request) {
+          if (!request.tools.length) return verifiedResponse(request);
+          const required = request.tools[0]!.inputSchema.required;
+          assert.ok(Array.isArray(required));
+          const args: Record<string, unknown> = {};
+          for (const key of required) {
+            assert.equal(typeof key, 'string');
+            assert.ok(Object.hasOwn(toolProbeArguments, key));
+            args[key] = toolProbeArguments[key as keyof typeof toolProbeArguments];
+          }
+          if (corrupting) corrupt(args);
+          return {
+            ...reply(''),
+            message: { role: 'assistant', content: '', toolCalls: [{ id: 'raw-call', name: 'probe.echo', arguments: args }] },
+          };
+        },
+      }) });
+      t.after(() => store.close());
+      await prepare(service);
+      assert.equal((await service.models(owner.id))[0]?.enabled, true);
+      const previousCalls = (await service.usage(owner.id))[0]!.calls;
+      corrupting = true;
+      await assert.rejects(service.probe(owner, 'model', ['tools']), code('model_probe_failed'));
+      const candidate = (await service.models(owner.id))[0]!;
+      assert.equal(candidate.enabled, false);
+      assert.deepEqual(candidate.capabilities, []);
+      assert.equal(candidate.verificationRequired, true);
+      assert.equal(candidate.lastProbeError, 'model_probe_failed');
+      assert.equal((await service.usage(owner.id))[0]!.calls, previousCalls + 2);
+      assert.equal((await store.scan<{ state: string }>('model_probe')).every((row) => row.data.state === 'finished'), true);
+      await assert.rejects(service.saveModel(owner, 'model', { ...modelSettings, enabled: true }, candidate.revision), code('model_probe_required'));
+    });
+  }
 });
 
 test('concurrent calls reserve quota durably before dispatch, separately for each owner', async (t) => {
