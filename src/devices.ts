@@ -3,7 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { bearer, requireScope, tokenHash } from './auth.js';
+import { bearer, requireOwner, requireScope, tokenHash } from './auth.js';
 import { DomainError, notDispatched, type Principal, type ToolContext, type ToolDefinition, type ToolResult } from './contracts.js';
 import type { DeviceJob, DeviceJobResult, DevicePairRequest, InlineDeviceArtifact } from './connectors/device.js';
 import type { Entity, Store } from './storage/store.js';
@@ -21,6 +21,10 @@ interface Device { name: string; capabilities: string[]; reportedCapabilities: s
 interface Pairing { ownerId: string; capabilities: string[]; workspaceIds: string[]; expiresAt: string; usedAt?: string }
 interface Credential { ownerId: string; deviceId: string }
 interface Job { job: DeviceJob; state: 'queued' | 'dispatched' | DeviceJobResult['status']; result?: ToolResult; error?: string }
+export interface DeviceModelAccessStatus {
+  data: Entity<Device>;
+  activeJobs: { queued: number; dispatched: number };
+}
 const internalOwner = '_device_credentials';
 const deviceParams = z.object({ id: z.string().min(1).max(200) });
 
@@ -52,6 +56,36 @@ export class DeviceService {
   }
 
   async list(ownerId: string) { return this.store.scan<Device>('device', ownerId); }
+
+  async modelAccess(principal: Principal, deviceId: string): Promise<DeviceModelAccessStatus> {
+    requireOwner(principal);
+    requireScope(principal, 'device:write');
+    const device = await this.store.get<Device>('device', deviceId, principal.id);
+    if (!device || device.data.revokedAt) throw new DomainError('not_found', 'Active device not found', 404);
+    const activeJobs = { queued: 0, dispatched: 0 };
+    for (const row of await this.store.scan<Job>('device_job', principal.id)) {
+      if (row.data.job.deviceId !== deviceId) continue;
+      if (row.data.state === 'queued' || row.data.state === 'dispatched') activeJobs[row.data.state] += 1;
+    }
+    return { data: device, activeJobs };
+  }
+
+  async updateModelAccess(principal: Principal, deviceId: string, revision: number, enabled: boolean): Promise<Entity<Device>> {
+    if (enabled) requireScope(principal, 'model:generate');
+    const { data: device, activeJobs } = await this.modelAccess(principal, deviceId);
+    if (device.revision !== revision) throw new DomainError('conflict', 'Device configuration has changed', 409);
+    if (!device.data.paused || activeJobs.queued > 0 || activeJobs.dispatched > 0) {
+      throw new DomainError('device_busy', 'Pause the idle device before changing model access', 409);
+    }
+    const capabilities = device.data.capabilities.filter((capability) => capability !== 'model:generate');
+    if (enabled) capabilities.push('model:generate');
+    return this.store.put('device', device.id, principal.id, {
+      ...device.data,
+      capabilities,
+      reportedCapabilities: enabled ? device.data.reportedCapabilities
+        : device.data.reportedCapabilities.filter((capability) => capability !== 'model:generate'),
+    }, revision);
+  }
 
   async createPairing(principal: Principal, capabilities: string[], workspaceIds: string[]) {
     requireScope(principal, 'device:write');
@@ -111,10 +145,23 @@ export class DeviceService {
   }
 
   async poll(device: Entity<Device>): Promise<{ jobs: DeviceJob[] }> {
-    if (device.data.paused) return { jobs: [] };
+    const current = await this.store.get<Device>('device', device.id, device.ownerId);
+    if (!current || current.data.revokedAt) return { jobs: [] };
     const jobs: DeviceJob[] = [];
     for (const row of await this.store.scan<Job>('device_job', device.ownerId)) {
       if (row.data.job.deviceId !== device.id || row.data.state !== 'queued') continue;
+      const authorized = await this.store.get<Device>('device', device.id, device.ownerId);
+      if (!authorized || authorized.data.revokedAt) break;
+      if (row.data.job.requiredCapabilities.includes('model:generate') && !authorized.data.capabilities.includes('model:generate')) {
+        try {
+          await this.store.put('device_job', row.id, row.ownerId, {
+            ...row.data, state: 'cancelled', error: 'Local model access was removed before dispatch',
+          }, row.revision);
+        } catch (error) { if (!(error instanceof DomainError && error.code === 'conflict')) throw error; }
+        continue;
+      }
+      if (authorized.data.paused) continue;
+      if (row.data.job.requiredCapabilities.includes('model:generate') && !authorized.data.reportedCapabilities.includes('model:generate')) continue;
       if (Date.parse(row.data.job.expiresAt) <= this.now()) {
         await this.store.put('device_job', row.id, row.ownerId, { ...row.data, state: 'cancelled', error: 'Expired before dispatch' }, row.revision);
         continue;
@@ -127,6 +174,10 @@ export class DeviceService {
       }
       const job = { ...row.data.job, dispatchedAt: new Date(this.now()).toISOString() };
       try {
+        const ready = await this.store.get<Device>('device', device.id, device.ownerId);
+        if (!ready || ready.data.paused || ready.data.revokedAt) continue;
+        if (job.requiredCapabilities.includes('model:generate') && (!ready.data.capabilities.includes('model:generate')
+          || !ready.data.reportedCapabilities.includes('model:generate'))) continue;
         const dispatched = await this.store.put<Job>(
           'device_job',
           row.id,
@@ -348,6 +399,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function registerDeviceRoutes(app: FastifyInstance, devices: DeviceService, principal: (request: FastifyRequest) => Principal) {
   const authenticate = (request: FastifyRequest) => devices.authenticate(request.headers.authorization, deviceParams.parse(request.params).id);
   app.get('/v1/devices', async (request) => ({ data: await devices.list(principal(request).id) }));
+  app.get('/v1/devices/:id/model-access', async (request) => devices.modelAccess(principal(request), deviceParams.parse(request.params).id));
+  app.patch('/v1/devices/:id/model-access', async (request) => {
+    const body = z.object({ revision: z.number().int().positive(), enabled: z.boolean() }).strict().parse(request.body);
+    return { data: await devices.updateModelAccess(principal(request), deviceParams.parse(request.params).id, body.revision, body.enabled) };
+  });
   app.post('/v1/pairings', async (request, reply) => {
     const body = z.object({ capabilities: z.array(z.string().min(1).max(100)).max(40), workspaceIds: z.array(z.string().min(1).max(200)).max(40).default([]) }).strict().parse(request.body);
     return reply.code(201).send(await devices.createPairing(principal(request), body.capabilities, body.workspaceIds));
